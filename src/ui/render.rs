@@ -3,9 +3,10 @@
 //! Layout:
 //! ┌─ Header (2 lines) ───────────────────────────────────────┐
 //! │ BTC / price to beat / countdown / market title           │
-//! ├─ Main (split 60/40) ───────────────────────────────────────┤
+//! ├─ Main (split 62/38, min height capped by layout) ────────┤
 //! │   Order book        │   Positions                         │
-//! ├─ Fills (8 rows) ──────────────────────────────────────────┤
+//! ├─ Open orders (8 lines, same as Fills) ────────────────────┤
+//! ├─ Fills (8 lines) ─────────────────────────────────────────┤
 //! ├─ Help / status (3 rows) ──────────────────────────────────┤
 //! └────────────────────────────────────────────────────────────┘
 
@@ -20,15 +21,17 @@ pub fn draw(f: &mut Frame, s: &AppState) {
     let area = f.area();
     let chunks = Layout::vertical([
         Constraint::Length(4), // header
-        Constraint::Min(12),   // main
+        Constraint::Min(8),    // main — book + positions (less vertical space than before)
+        Constraint::Length(8), // open orders
         Constraint::Length(8), // fills
         Constraint::Length(3), // help
     ]).split(area);
 
     draw_header(f, chunks[0], s);
     draw_main(f, chunks[1], s);
-    draw_fills(f, chunks[2], s);
-    draw_help(f, chunks[3], s);
+    draw_open_orders(f, chunks[2], s);
+    draw_fills(f, chunks[3], s);
+    draw_help(f, chunks[4], s);
 
     if let InputMode::LimitModal { outcome, side, field } = s.input_mode {
         draw_limit_modal(f, area, s, outcome, side, field);
@@ -210,6 +213,34 @@ fn render_position_line(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcom
     f.render_widget(Paragraph::new(lines), area);
 }
 
+// ── Open orders ─────────────────────────────────────────────────────
+fn draw_open_orders(f: &mut Frame, area: Rect, s: &AppState) {
+    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .title(" Open Orders ");
+    let rows: Vec<Row> = s.open_orders.iter().take(6).map(|o| {
+        let side_cell = Cell::from(match o.side { crate::trading::Side::Buy => "BUY", _ => "SELL" })
+            .style(Style::default().fg(match o.side { crate::trading::Side::Buy => Color::Green, _ => Color::Red }));
+        Row::new(vec![
+            side_cell,
+            Cell::from(o.outcome.as_str()).style(Style::default().fg(
+                match o.outcome { Outcome::Up => Color::Green, Outcome::Down => Color::Red }
+            )),
+            Cell::from(format!("{:.3}", o.price)),
+            Cell::from(format!("{:.2}", o.remaining)),
+        ])
+    }).collect();
+    let widths = [
+        Constraint::Length(5),  // side
+        Constraint::Length(5),  // outcome
+        Constraint::Length(8),  // price
+        Constraint::Length(10), // remaining
+    ];
+    let header = Row::new(["side", "out", "price", "left"])
+        .style(Style::default().fg(Color::DarkGray));
+    let table = Table::new(rows, widths).header(header).block(block).column_spacing(1);
+    f.render_widget(table, area);
+}
+
 // ── Fills ───────────────────────────────────────────────────────────
 fn draw_fills(f: &mut Frame, area: Rect, s: &AppState) {
     let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
@@ -261,7 +292,7 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
     let keys = Line::from(vec![
         Span::styled("size ", Style::default().fg(Color::DarkGray)),
         size_span,
-        Span::raw(" buy$·sell sh "),
+        Span::raw(" "),
         key("u", "buy UP"), sep(),
         key("d", "buy DOWN"), sep(),
         key("U", "sell UP"), sep(),

@@ -170,6 +170,29 @@ struct TradesPage {
     next_cursor: String,
 }
 
+/// `GET /data/orders` — open orders for the authenticated user (L2 auth), paginated like trades.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClobOpenOrder {
+    #[serde(default)]
+    #[allow(dead_code)] // returned by API; reserved for future (e.g. cancel-by-id)
+    pub id: String,
+    #[serde(alias = "assetId")]
+    pub asset_id: String,
+    pub side: String,
+    pub price: String,
+    #[serde(alias = "originalSize", default)]
+    pub original_size: String,
+    #[serde(alias = "sizeMatched", default)]
+    pub size_matched: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrdersPage {
+    data: Vec<ClobOpenOrder>,
+    #[serde(alias = "nextCursor")]
+    next_cursor: String,
+}
+
 /// Cursor sentinels — `clob-client-v2` `constants.ts`.
 const TRADES_INITIAL_CURSOR: &str = "MA==";
 const TRADES_END_CURSOR: &str = "LTE=";
@@ -592,6 +615,52 @@ impl TradingClient {
         Ok(out)
     }
 
+    /// Open orders for `condition_id` (Gamma `conditionId` / CLOB `market`).
+    pub async fn fetch_open_orders_for_market(&mut self, condition_id: &str) -> Result<Vec<ClobOpenOrder>> {
+        let creds = self.ensure_creds().await?;
+        let path = "/data/orders";
+        let mut cursor = TRADES_INITIAL_CURSOR.to_string();
+        let mut out = Vec::new();
+        loop {
+            let ts = chrono::Utc::now().timestamp();
+            let mut url = url::Url::parse(&format!("{CLOB_HOST}{path}"))
+                .context("parse /data/orders URL")?;
+            url.query_pairs_mut()
+                .append_pair("market", condition_id)
+                .append_pair("next_cursor", &cursor);
+            let l2_sig = l2_hmac(&creds.secret, ts, "GET", path, "")?;
+            let resp = self
+                .http
+                .get(url.as_str())
+                .header("POLY_ADDRESS", format!("{:#x}", self.signer.address()))
+                .header("POLY_API_KEY", &creds.api_key)
+                .header("POLY_PASSPHRASE", &creds.passphrase)
+                .header("POLY_TIMESTAMP", ts.to_string())
+                .header("POLY_SIGNATURE", l2_sig)
+                .send()
+                .await
+                .context("GET /data/orders")?;
+            let status = resp.status();
+            let txt = resp.text().await.context("reading /data/orders body")?;
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "CLOB GET /data/orders failed: {} — {}",
+                    status,
+                    snip(&txt)
+                ));
+            }
+            let page: OrdersPage = serde_json::from_str(&txt)
+                .with_context(|| format!("decode /data/orders: {}", snip(&txt)))?;
+            out.extend(page.data);
+            if page.next_cursor == TRADES_END_CURSOR || page.next_cursor.is_empty() {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        debug!(market = %condition_id, n = out.len(), "fetch_open_orders_for_market");
+        Ok(out)
+    }
+
     /// Build + sign an order and POST it to the CLOB.
     pub async fn place_order(&mut self, args: OrderArgs, order_type: OrderType)
         -> Result<PostOrderResponse>
@@ -606,6 +675,7 @@ impl TradingClient {
             args.price,
             &args.tick_size,
             args.buy_notional_usdc,
+            order_type,
         );
 
         // 2. Salt — must fit in JS `Number` (see `orderToJsonV1` / `orderToJsonV2` `parseInt`).
@@ -861,6 +931,17 @@ impl TradingClient {
 }
 
 /// Polymarket `ROUNDING_CONFIG` (`roundingConfig.ts`): `(price_dec, size_dec)` for price / share rounding.
+/// Nearest tick (e.g. 0.51269 + tick 0.01 → 0.51). Avoids float drift on `n * tick`.
+fn snap_price_to_nearest_tick(price: f64, tick: &str) -> f64 {
+    let tick_f = tick.trim().parse::<f64>().unwrap_or(0.01);
+    let (price_dec, _) = round_cfg_from_tick(tick);
+    if !price.is_finite() || tick_f <= 0.0 {
+        return price;
+    }
+    let n = (price / tick_f).round();
+    round_down_f64(n * tick_f, price_dec)
+}
+
 fn round_cfg_from_tick(tick: &str) -> (u32, u32) {
     let x = tick.trim().parse::<f64>().unwrap_or(0.01);
     if (x - 0.1).abs() < 1e-6 {
@@ -905,22 +986,56 @@ fn amounts_for(
     price: f64,
     tick: &str,
     buy_notional_usdc: Option<f64>,
+    order_type: OrderType,
 ) -> (U256, U256) {
     const USDC_DECIMALS: u32 = 2;
     const SHARE_DECIMALS_MAX: u32 = 4;
 
     let (price_dec, size_dec) = round_cfg_from_tick(tick);
     let share_dec = size_dec.min(SHARE_DECIMALS_MAX);
-    // Limit price must not be **more passive** than the book after tick rounding:
-    // BUY: ceil to tick so implied USDC/shares ≥ visible ask (matches TS aggressive rounding).
-    // SELL: floor to tick so min USDC/shares ≤ visible bid — `round_normal` could lift0.527→0.53
-    // and cause FAK "no orders found to match" when the best bid is below that rounded price.
-    let raw_price = match side {
-        Side::Buy => round_up_f64(price, price_dec),
-        Side::Sell => round_down_f64(price, price_dec),
+    let is_limit = matches!(order_type, OrderType::Gtc | OrderType::Gtd);
+
+    // GTC/GTD: snap to tick first so EIP-712 amounts imply a tick-valid price (CLOB rejects
+    // e.g. 0.5126903553299492 vs tick 0.01). FAK/FOK: aggressive rounding vs the book.
+    let raw_price = if is_limit {
+        snap_price_to_nearest_tick(price, tick)
+    } else {
+        match side {
+            Side::Buy => round_up_f64(price, price_dec),
+            Side::Sell => round_down_f64(price, price_dec),
+        }
     };
+    let price_micros: u64 = ((raw_price * 1_000_000.0).round() as i64).clamp(0, i64::MAX) as u64;
 
     match side {
+        // Limit BUY: USDC (maker) and shares (taker) from integer micros so implied price matches tick.
+        Side::Buy if is_limit => {
+            let floor_notional = buy_notional_usdc
+                .filter(|n| n.is_finite() && *n > 0.0)
+                .map(|n| round_down_f64(n, USDC_DECIMALS))
+                .unwrap_or_else(|| round_up_f64(size_shares * raw_price, USDC_DECIMALS));
+
+            if !size_shares.is_finite() || size_shares <= 0.0 || !floor_notional.is_finite() || floor_notional <= 0.0
+            {
+                return (U256::ZERO, U256::ZERO);
+            }
+
+            let scale = 10_i64.pow(share_dec.min(6) as u32);
+            let mut taker_ticks = ((size_shares * scale as f64).ceil() as i64).max(1);
+            let mut guard = 0u32;
+            while guard < 50_000 {
+                let raw_taker = taker_ticks as f64 / scale as f64;
+                let tm = (raw_taker * 1_000_000.0).round() as u64;
+                let mm = (tm as u128 * price_micros as u128 + 999_999) / 1_000_000;
+                let raw_maker = mm as f64 / 1_000_000.0;
+                if raw_maker + 1e-9 >= floor_notional {
+                    return (human_to_base_units_6(raw_maker), human_to_base_units_6(raw_taker));
+                }
+                taker_ticks += 1;
+                guard += 1;
+            }
+            (U256::ZERO, U256::ZERO)
+        }
         Side::Buy => {
             // Rounding shares down then USDC down can wipe a cent (e.g. 1 USDC → $0.99 vs $1 min).
             let floor_notional = buy_notional_usdc
@@ -950,6 +1065,13 @@ fn amounts_for(
                 taker_ticks += 1;
                 guard += 1;
             }
+            (human_to_base_units_6(raw_maker), human_to_base_units_6(raw_taker))
+        }
+        Side::Sell if is_limit => {
+            let raw_maker = round_down_f64(size_shares, share_dec);
+            let maker_micros = (raw_maker * 1_000_000.0).round() as u64;
+            let taker_micros = (maker_micros as u128 * price_micros as u128) / 1_000_000;
+            let raw_taker = taker_micros as f64 / 1_000_000.0;
             (human_to_base_units_6(raw_maker), human_to_base_units_6(raw_taker))
         }
         Side::Sell => {

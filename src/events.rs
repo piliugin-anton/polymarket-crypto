@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{AppState, InputMode, LimitField, Outcome};
+use crate::app::{AppState, InputMode, LimitField, Outcome, MIN_LIMIT_ORDER_SHARES};
 use crate::trading::Side;
 
 #[derive(Debug)]
@@ -121,6 +121,17 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
             let size  = state.limit_size_input.parse::<f64>();
             match (price, size) {
                 (Ok(p), Ok(sz)) if (0.01..=0.99).contains(&p) && sz > 0.0 => {
+                    let shares = match side {
+                        Side::Buy => sz / p,
+                        Side::Sell => sz,
+                    };
+                    if shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+                        state.status_line = format!(
+                            "limit: min {:.0} shares (≈{:.2} now)",
+                            MIN_LIMIT_ORDER_SHARES, shares
+                        );
+                        return Action::None;
+                    }
                     state.input_mode = InputMode::Normal;
                     Action::PlaceLimit { outcome, side, price: p, size_usdc: sz }
                 }

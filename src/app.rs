@@ -14,8 +14,11 @@ use std::collections::VecDeque;
 
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
 use crate::gamma::ActiveMarket;
-use crate::trading::{ClobTrade, Side, OrderType};
+use crate::trading::{ClobOpenOrder, ClobTrade, Side, OrderType};
 use tracing::debug;
+
+/// Minimum outcome shares for a limit (GTC) order — enforced in the UI before submit.
+pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
 
 // ── Public event enum ───────────────────────────────────────────────
 
@@ -32,6 +35,8 @@ pub enum AppEvent {
         /// Newest first, capped before send — merged into `fills` (session panel).
         fills_bootstrap: Vec<Fill>,
     },
+    /// Resting orders for the active market (`GET /data/orders`).
+    OpenOrdersLoaded { orders: Vec<OpenOrderRow> },
     Key(crossterm::event::KeyEvent),
     OrderAck { side: Side, outcome: Outcome, qty: f64, price: f64 },
     OrderErr(String),
@@ -79,6 +84,16 @@ impl Position {
     }
 }
 
+/// One row in the Open orders panel (current market only).
+#[derive(Debug, Clone)]
+pub struct OpenOrderRow {
+    pub side:    Side,
+    pub outcome: Outcome,
+    pub price:   f64,
+    /// Unfilled size (shares).
+    pub remaining: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Fill {
     pub ts:      DateTime<Utc>,
@@ -114,6 +129,8 @@ pub struct AppState {
     pub realized_pnl:   f64,
 
     pub fills:          VecDeque<Fill>,
+    /// Resting limit orders on the active market (from CLOB).
+    pub open_orders:    Vec<OpenOrderRow>,
     pub status_line:    String,
 
     /// When Gamma omits the opening USD level in the market text, we latch the
@@ -137,6 +154,7 @@ impl AppState {
             book_up: None, book_down: None,
             position_up: Default::default(), position_down: Default::default(),
             realized_pnl: 0.0, fills: VecDeque::with_capacity(64),
+            open_orders: Vec::new(),
             status_line: "Waiting for market data…".into(),
             latched_price_to_beat: None,
             default_size_usdc,
@@ -252,6 +270,7 @@ impl AppState {
                 self.book_up = None; self.book_down = None;
                 self.position_up = Default::default();
                 self.position_down = Default::default();
+                self.open_orders.clear();
             }
             AppEvent::PositionsLoaded {
                 position_up,
@@ -274,6 +293,9 @@ impl AppState {
                     self.position_down.shares,
                     self.position_down.avg_entry,
                 );
+            }
+            AppEvent::OpenOrdersLoaded { orders } => {
+                self.open_orders = orders;
             }
             AppEvent::OrderAck { side, outcome, qty, price } => {
                 let realized = self.position_mut(outcome).apply_fill(side, qty, price);
@@ -315,6 +337,50 @@ fn parse_clob_side(s: &str) -> Option<Side> {
         "SELL" => Some(Side::Sell),
         _ => None,
     }
+}
+
+/// Map `GET /data/orders` rows to UI rows for the UP/DOWN token pair.
+pub fn open_orders_from_clob(
+    rows: Vec<ClobOpenOrder>,
+    up_token_id: &str,
+    down_token_id: &str,
+) -> Vec<OpenOrderRow> {
+    let mut out = Vec::new();
+    for o in rows {
+        let outcome = if o.asset_id == up_token_id {
+            Outcome::Up
+        } else if o.asset_id == down_token_id {
+            Outcome::Down
+        } else {
+            continue;
+        };
+        let Some(side) = parse_clob_side(&o.side) else { continue };
+        let orig = o.original_size.parse::<f64>().unwrap_or(f64::NAN);
+        let matched = o.size_matched.parse::<f64>().unwrap_or(0.0);
+        let price = o.price.parse::<f64>().unwrap_or(f64::NAN);
+        let remaining = orig - matched;
+        if !remaining.is_finite() || remaining <= 1e-9 {
+            continue;
+        }
+        if !price.is_finite() || price <= 0.0 {
+            continue;
+        }
+        out.push(OpenOrderRow {
+            side,
+            outcome,
+            price,
+            remaining,
+        });
+    }
+    out.sort_by(|a, b| {
+        let ord_o = match (a.outcome, b.outcome) {
+            (Outcome::Up, Outcome::Up) | (Outcome::Down, Outcome::Down) => std::cmp::Ordering::Equal,
+            (Outcome::Up, Outcome::Down) => std::cmp::Ordering::Less,
+            (Outcome::Down, Outcome::Up) => std::cmp::Ordering::Greater,
+        };
+        ord_o.then_with(|| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    out
 }
 
 fn merge_chain_balance(replay: Position, balance: f64) -> Position {
@@ -447,7 +513,7 @@ pub fn resolve_market_order(
 mod tests {
     use super::*;
     use crate::feeds::clob_ws::{BookLevel, BookSnapshot};
-    use crate::trading::ClobTrade;
+    use crate::trading::{ClobOpenOrder, ClobTrade};
 
     fn trade(
         id: &str,
@@ -465,6 +531,35 @@ mod tests {
             price: price.to_string(),
             match_time: match_time.to_string(),
         }
+    }
+
+    #[test]
+    fn open_orders_from_clob_filters_and_sorts() {
+        let up = "111";
+        let down = "222";
+        let rows = vec![
+            ClobOpenOrder {
+                id: String::new(),
+                asset_id: down.to_string(),
+                side: "SELL".into(),
+                price: "0.55".into(),
+                original_size: "4".into(),
+                size_matched: "1".into(),
+            },
+            ClobOpenOrder {
+                id: String::new(),
+                asset_id: up.to_string(),
+                side: "BUY".into(),
+                price: "0.40".into(),
+                original_size: "10".into(),
+                size_matched: "0".into(),
+            },
+        ];
+        let out = open_orders_from_clob(rows, up, down);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].outcome, Outcome::Up);
+        assert_eq!(out[1].outcome, Outcome::Down);
+        assert!((out[1].remaining - 3.0).abs() < 1e-9);
     }
 
     #[test]

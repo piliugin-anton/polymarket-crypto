@@ -1,4 +1,4 @@
-# btc5m-bot
+# Polymarket "Bitcoin Up or Down 5m" trading terminal
 
 A Rust TUI for trading Polymarket's 5-minute **Bitcoin Up or Down** prediction
 markets. Colors the live Chainlink BTC/USD price green/red against each

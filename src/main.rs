@@ -22,7 +22,10 @@ mod trading;
 mod ui;
 
 use anyhow::{Context, Result};
-use app::{hydrate_positions_from_trades, AppEvent, AppState, Outcome, resolve_market_order};
+use app::{
+    hydrate_positions_from_trades, open_orders_from_clob, AppEvent, AppState, Outcome,
+    resolve_market_order, MIN_LIMIT_ORDER_SHARES,
+};
 use config::Config;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream},
@@ -132,11 +135,13 @@ async fn main() -> Result<()> {
     let tx_for_books = tx.clone();
     let trading_for_positions = trading.clone();
     tokio::spawn(async move {
-        let mut current: Option<tokio::task::JoinHandle<()>> = None;
+        let mut book_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut orders_poll: Option<tokio::task::JoinHandle<()>> = None;
         while let Some(m) = market_rx.recv().await {
-            if let Some(h) = current.take() { h.abort(); }
+            if let Some(h) = book_handle.take() { h.abort(); }
+            if let Some(h) = orders_poll.take() { h.abort(); }
             let token_ids = vec![m.up_token_id.clone(), m.down_token_id.clone()];
-            current = Some(feeds::clob_ws::spawn(token_ids, clob_forwarder(tx_for_books.clone())));
+            book_handle = Some(feeds::clob_ws::spawn(token_ids, clob_forwarder(tx_for_books.clone())));
             let _ = tx_for_books.send(AppEvent::MarketRoll(m.clone())).await;
 
             let t = trading_for_positions.clone();
@@ -180,7 +185,47 @@ async fn main() -> Result<()> {
                         fills_bootstrap,
                     })
                     .await;
+
+                let oo = match cli.fetch_open_orders_for_market(&condition_id).await {
+                    Ok(rows) => open_orders_from_clob(rows, &up_id, &down_id),
+                    Err(e) => {
+                        debug!(error = %e, market = %condition_id, "fetch /data/orders failed");
+                        vec![]
+                    }
+                };
+                let _ = txp.send(AppEvent::OpenOrdersLoaded { orders: oo }).await;
             });
+
+            let t2 = trading_for_positions.clone();
+            let txp2 = tx_for_books.clone();
+            let up2 = m.up_token_id.clone();
+            let down2 = m.down_token_id.clone();
+            let cond2 = m.condition_id.clone();
+            orders_poll = Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval.tick().await;
+                loop {
+                    let mut cli = t2.lock().await;
+                    if cli.ensure_creds().await.is_err() {
+                        drop(cli);
+                        interval.tick().await;
+                        continue;
+                    }
+                    match cli.fetch_open_orders_for_market(&cond2).await {
+                        Ok(rows) => {
+                            let orders = open_orders_from_clob(rows, &up2, &down2);
+                            drop(cli);
+                            let _ = txp2.send(AppEvent::OpenOrdersLoaded { orders }).await;
+                        }
+                        Err(e) => {
+                            drop(cli);
+                            debug!(error = %e, market = %cond2, "poll /data/orders failed");
+                        }
+                    }
+                    interval.tick().await;
+                }
+            }));
         }
     });
 
@@ -355,9 +400,15 @@ fn dispatch_action(
         Action::CancelAll        => {
             let t  = trading.clone();
             let tx = tx.clone();
+            let market = state.market.clone();
             tokio::spawn(async move {
                 match t.lock().await.cancel_all().await {
-                    Ok(_)  => { let _ = tx.send(AppEvent::OrderErr("all open orders cancelled".into())).await; }
+                    Ok(_) => {
+                        let _ = tx.send(AppEvent::OrderErr("all open orders cancelled".into())).await;
+                        if let Some(m) = market {
+                            spawn_open_orders_refresh(t.clone(), tx.clone(), m);
+                        }
+                    }
                     Err(e) => { let _ = tx.send(AppEvent::OrderErr(format!("cancel failed: {e}"))).await; }
                 }
             });
@@ -389,12 +440,41 @@ fn dispatch_action(
                 Side::Buy => (size_usdc / price).max(0.01),
                 Side::Sell => size_usdc.max(0.01),
             };
+            if shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+                forward_order_err(
+                    tx,
+                    format!("limit: min {MIN_LIMIT_ORDER_SHARES} shares (got {shares:.2})"),
+                );
+                return;
+            }
             let buy_notional = matches!(side, Side::Buy).then_some(size_usdc);
             spawn_order(
                 trading.clone(), tx.clone(), market, outcome, side, shares, price, OrderType::Gtc, buy_notional,
             );
         }
     }
+}
+
+fn spawn_open_orders_refresh(
+    trading: Arc<Mutex<TradingClient>>,
+    tx: mpsc::Sender<AppEvent>,
+    market: gamma::ActiveMarket,
+) {
+    let condition_id = market.condition_id.clone();
+    let up_id = market.up_token_id.clone();
+    let down_id = market.down_token_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut cli = trading.lock().await;
+        if cli.ensure_creds().await.is_err() {
+            return;
+        }
+        let Ok(rows) = cli.fetch_open_orders_for_market(&condition_id).await else {
+            return;
+        };
+        let orders = open_orders_from_clob(rows, &up_id, &down_id);
+        let _ = tx.send(AppEvent::OpenOrdersLoaded { orders }).await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -410,6 +490,7 @@ fn spawn_order(
     buy_notional_usdc: Option<f64>,
 ) {
     tokio::spawn(async move {
+        let market_for_refresh = market.clone();
         let token_id = match outcome {
             Outcome::Up   => market.up_token_id,
             Outcome::Down => market.down_token_id,
@@ -450,6 +531,7 @@ fn spawn_order(
                     let _ = tx.send(AppEvent::OrderAck {
                         side, outcome, qty: shares, price,
                     }).await;
+                    spawn_open_orders_refresh(trading.clone(), tx.clone(), market_for_refresh);
                 } else {
                     let msg = resp.error.unwrap_or_else(|| format!("status={:?}", resp.status));
                     let _ = tx.send(AppEvent::OrderErr(msg)).await;
