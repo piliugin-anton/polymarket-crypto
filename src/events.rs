@@ -12,7 +12,7 @@ use crate::trading::Side;
 pub enum Action {
     None,
     Quit,
-    /// Market: BUY `size_usdc` = USDC to spend; SELL = **shares** to close.
+    /// Market: USDC notional (BUY spend). SELL dumps full tracked position; USDC only if position is 0.
     PlaceMarket { outcome: Outcome, side: Side, size_usdc: f64 },
     /// Limit: BUY size = USDC notional; SELL size = **shares**.
     PlaceLimit  { outcome: Outcome, side: Side, price: f64, size_usdc: f64 },

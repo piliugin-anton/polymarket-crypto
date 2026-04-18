@@ -430,8 +430,14 @@ pub fn resolve_market_order(
         Side::Sell => {
             let bid = state.best_bid(outcome)?;
             let price = clamp_prob(bid * (1.0 - slip));
-            // `size` = shares to sell (maker leg is outcome tokens; must not treat as USDC).
-            let shares = size.max(0.01);
+            // Dump **entire** tracked position (fills + CLOB sync). USDC field only sizes the
+            // order when we have no inventory in-app (e.g. before balance sync).
+            let held = state.position(outcome).shares.max(0.0);
+            let want = (size / bid).max(0.01);
+            let shares = if held > 1e-9 { held } else { want };
+            if !shares.is_finite() || shares <= 0.0 {
+                return None;
+            }
             Some((shares, price, OrderType::Fak))
         }
     }
@@ -440,6 +446,7 @@ pub fn resolve_market_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feeds::clob_ws::{BookLevel, BookSnapshot};
     use crate::trading::ClobTrade;
 
     fn trade(
@@ -473,6 +480,36 @@ mod tests {
         assert!((pu.avg_entry - 0.55).abs() < 1e-6);
         assert!(pd.shares.abs() < 1e-9);
         assert_eq!(fills.len(), 2);
+    }
+
+    #[test]
+    fn market_sell_sells_full_tracked_position_ignores_small_usdc_ticket() {
+        let mut state = AppState::new(5.0);
+        state.book_up = Some(BookSnapshot {
+            asset_id: "1".into(),
+            bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
+            asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
+        });
+        state.position_up.shares = 7.25;
+        // $1 ticket → would be 2 shares via USDC/bid; we still exit the full 7.25 sh.
+        let (shares, price, _) =
+            resolve_market_order(&state, Outcome::Up, Side::Sell, 1.0, 0).unwrap();
+        assert!((shares - 7.25).abs() < 1e-9);
+        assert!((price - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn market_sell_without_position_uses_usdc_over_bid() {
+        let mut state = AppState::new(5.0);
+        state.book_up = Some(BookSnapshot {
+            asset_id: "1".into(),
+            bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
+            asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
+        });
+        state.position_up = Position::default();
+        let (shares, _, _) =
+            resolve_market_order(&state, Outcome::Up, Side::Sell, 10.0, 0).unwrap();
+        assert!((shares - 20.0).abs() < 1e-9);
     }
 
     #[test]

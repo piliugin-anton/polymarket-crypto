@@ -51,7 +51,7 @@ pub struct Config {
     /// EOA address derived from `private_key` — filled by `signer.address()`.
     pub signer_address: Address,
     pub sig_type: SignatureType,
-    /// Default size: USDC for BUY; **shares** for SELL (`DEFAULT_SIZE_USDC` env name is historical).
+    /// Default USDC ticket for **market BUY** (`DEFAULT_SIZE_USDC`). Market SELL uses full in-app position when known.
     pub default_size_usdc: f64,
     /// Max fill slippage for market FAK orders, in basis points (widens buy ceiling / sell floor).
     pub market_slippage_bps: u32,
