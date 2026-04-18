@@ -143,98 +143,238 @@ impl TradingClient {
 
         let ts: i64   = chrono::Utc::now().timestamp();
         let nonce: u64 = 0;
-        let sig  = self.sign_clob_auth(ts, nonce).await?;
-        let addr = format!("{:#x}", self.signer.address());
+        let auth = self.compute_clob_auth(ts, nonce).await?;
 
-        let headers = [
-            ("POLY_ADDRESS",   addr.clone()),
-            ("POLY_SIGNATURE", sig.clone()),
-            ("POLY_TIMESTAMP", ts.to_string()),
-            ("POLY_NONCE",     nonce.to_string()),
-        ];
+        tracing::debug!(
+            addr = %auth.address, ts, nonce,
+            digest  = %auth.digest,
+            sig     = %auth.signature,
+            "L1 auth material computed",
+        );
 
         // 1) Try derive (GET) — returns existing creds if they exist.
-        let mut req = self.http.get(format!("{CLOB_HOST}/auth/derive-api-key"));
-        for (k, v) in &headers { req = req.header(*k, v); }
-        let resp = req.send().await.context("GET /auth/derive-api-key")?;
+        let (get_status, get_body) = self.send_auth(
+            reqwest::Method::GET, "/auth/derive-api-key", &auth,
+        ).await?;
+        tracing::info!(
+            status = %get_status,
+            body   = %snip(&get_body),
+            "GET /auth/derive-api-key",
+        );
 
-        if resp.status().is_success() {
-            let creds: ApiCreds = resp.json().await.context("decoding derived creds")?;
+        if get_status.is_success() {
+            let creds: ApiCreds = serde_json::from_str(&get_body)
+                .with_context(|| format!("decoding derived creds: {}", snip(&get_body)))?;
+            tracing::info!(
+                api_key_prefix = &creds.api_key[..std::cmp::min(8, creds.api_key.len())],
+                "derived existing CLOB API creds",
+            );
             self.creds = Some(creds.clone());
             return Ok(creds);
         }
 
-        // 2) No creds yet — create them.
-        let mut req = self.http.post(format!("{CLOB_HOST}/auth/api-key"));
-        for (k, v) in &headers { req = req.header(*k, v); }
-        let resp = req.send().await.context("POST /auth/api-key")?;
-        let status = resp.status();
-        let body   = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("could not create API key: {status} — {body}"));
+        // 2) Fallback: create fresh creds.
+        let (post_status, post_body) = self.send_auth(
+            reqwest::Method::POST, "/auth/api-key", &auth,
+        ).await?;
+        tracing::info!(
+            status = %post_status,
+            body   = %snip(&post_body),
+            "POST /auth/api-key",
+        );
+
+        if post_status.is_success() {
+            let creds: ApiCreds = serde_json::from_str(&post_body)
+                .with_context(|| format!("decoding created creds: {}", snip(&post_body)))?;
+            tracing::info!(
+                api_key_prefix = &creds.api_key[..std::cmp::min(8, creds.api_key.len())],
+                "created new CLOB API creds",
+            );
+            self.creds = Some(creds.clone());
+            return Ok(creds);
         }
-        let creds: ApiCreds = serde_json::from_str(&body).context("decoding created creds")?;
-        self.creds = Some(creds.clone());
-        Ok(creds)
+
+        // Both endpoints rejected — emit the full forensic record at error
+        // level so it's visible regardless of RUST_LOG setting.
+        tracing::error!(
+            get_status   = %get_status,
+            get_body     = %get_body,
+            post_status  = %post_status,
+            post_body    = %post_body,
+            address      = %auth.address,
+            timestamp    = auth.timestamp,
+            digest       = %auth.digest,
+            signature    = %auth.signature,
+            "CLOB auth rejected by both endpoints",
+        );
+        Err(anyhow!(
+            "CLOB auth failed. GET /auth/derive-api-key → {} \"{}\". POST /auth/api-key → {} \"{}\". Run `btc5m-bot debug-auth` for a full dump.",
+            get_status, snip(&get_body), post_status, snip(&post_body),
+        ))
     }
 
-    /// Sign the `ClobAuth` EIP-712 struct (used to derive/create API keys).
-    ///
-    /// ⚠ The struct has a field literally named `address`, which the `sol!` macro
-    /// can't represent (Solidity treats `address` as a reserved keyword). We
-    /// therefore compute the typeHash and structHash by hand so the EIP-712
-    /// digest matches what Polymarket's server expects:
-    ///
-    /// ```text
-    /// ClobAuth(address address,string timestamp,uint256 nonce,string message)
-    /// ```
-    async fn sign_clob_auth(&self, ts: i64, nonce: u64) -> Result<String> {
+    /// Send one of the L1-authed auth endpoints. Returns `(status, body)`.
+    async fn send_auth(
+        &self,
+        method: reqwest::Method,
+        path:   &str,
+        auth:   &ClobAuthDebug,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let url = format!("{CLOB_HOST}{path}");
+        let req = self.http.request(method, &url)
+            .header("POLY_ADDRESS",   &auth.address)
+            .header("POLY_SIGNATURE", &auth.signature)
+            .header("POLY_TIMESTAMP", auth.timestamp.to_string())
+            .header("POLY_NONCE",     auth.nonce.to_string());
+        let resp = req.send().await.with_context(|| format!("{url}"))?;
+        let status = resp.status();
+        let body   = resp.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// Full breakdown of the L1 auth material. Used by `ensure_creds` and
+    /// by the `debug-auth` diagnostic subcommand.
+    async fn compute_clob_auth(&self, ts: i64, nonce: u64) -> Result<ClobAuthDebug> {
         use alloy_primitives::keccak256;
 
-        // ── domain ───────────────────────────────────────────────────
-        // We still use alloy's helper for the domain separator since it
-        // doesn't hit the keyword problem.
+        // Domain separator via alloy's helper (the domain struct has no
+        // reserved-keyword issue).
         let dom = eip712_domain! {
             name:     "ClobAuthDomain",
             version:  "1",
             chain_id: POLYGON_CHAIN_ID,
         };
-        let domain_separator: B256 = dom.separator();
+        let domain_sep: B256 = dom.separator();
 
-        // ── struct hash (manual) ─────────────────────────────────────
+        // `ClobAuth(address address,string timestamp,uint256 nonce,string message)`
+        // — computed by hand because `address` is reserved in the sol! macro.
         let type_hash = keccak256(
             b"ClobAuth(address address,string timestamp,uint256 nonce,string message)"
         );
         let ts_str  = ts.to_string();
         let message = "This message attests that I control the given wallet";
 
-        // abi.encode(typeHash, address, keccak256(ts), nonce, keccak256(msg))
-        // = 5 × 32 bytes, big-endian, left-padded
         let mut buf = Vec::with_capacity(32 * 5);
         buf.extend_from_slice(type_hash.as_slice());
-        // address → left-padded to 32 bytes
         buf.extend_from_slice(&[0u8; 12]);
         buf.extend_from_slice(self.signer.address().as_slice());
-        // timestamp is a `string` → keccak of the UTF-8 bytes
         buf.extend_from_slice(keccak256(ts_str.as_bytes()).as_slice());
-        // nonce as uint256 big-endian
         let mut nonce_be = [0u8; 32];
         nonce_be[24..].copy_from_slice(&nonce.to_be_bytes());
         buf.extend_from_slice(&nonce_be);
-        // message
         buf.extend_from_slice(keccak256(message.as_bytes()).as_slice());
         let struct_hash = keccak256(&buf);
 
-        // ── digest = keccak256(0x19 0x01 ‖ domainSep ‖ structHash) ──
         let mut digest_in = [0u8; 2 + 32 + 32];
         digest_in[0] = 0x19;
         digest_in[1] = 0x01;
-        digest_in[2..34].copy_from_slice(domain_separator.as_slice());
+        digest_in[2..34].copy_from_slice(domain_sep.as_slice());
         digest_in[34..].copy_from_slice(struct_hash.as_slice());
         let digest: B256 = keccak256(&digest_in);
 
         let sig = self.signer.sign_hash(&digest).await?;
-        Ok(format!("0x{}", hex::encode(sig.as_bytes())))
+
+        Ok(ClobAuthDebug {
+            address:     format!("{:#x}", self.signer.address()),
+            timestamp:   ts,
+            nonce,
+            type_hash:   hex::encode(type_hash),
+            domain_sep:  hex::encode(domain_sep),
+            struct_hash: hex::encode(struct_hash),
+            digest:      hex::encode(digest),
+            signature:   format!("0x{}", hex::encode(sig.as_bytes())),
+        })
+    }
+
+    /// One-shot diagnostic flow — prints every intermediate to stdout and
+    /// attempts both auth endpoints, exiting after. Invoked via
+    /// `btc5m-bot debug-auth`.
+    pub async fn debug_auth_flow(&mut self) -> Result<()> {
+        println!("\n━━━ Polymarket CLOB auth diagnostic ━━━\n");
+
+        let signer_addr = self.signer.address();
+        let funder = self.config.funder;
+        let sig_type = self.config.sig_type as u8;
+
+        println!("signer (EOA) : {signer_addr:#x}");
+        println!("funder       : {funder:#x}");
+        println!("sig_type     : {sig_type} ({:?})", self.config.sig_type);
+        println!("proxy        : {}", crate::net::proxy_env().as_deref().unwrap_or("<none>"));
+        println!("CLOB host    : {CLOB_HOST}\n");
+
+        // Sanity checks for common misconfigurations.
+        if signer_addr == funder && sig_type != 0 {
+            println!("⚠  POLYMARKET_FUNDER equals your signer address but POLYMARKET_SIG_TYPE={sig_type}.");
+            println!("   For a plain EOA wallet set POLYMARKET_SIG_TYPE=0.");
+            println!("   For a Safe proxy, POLYMARKET_FUNDER must be the Safe address (not the EOA).\n");
+        }
+        if signer_addr != funder && sig_type == 0 {
+            println!("⚠  POLYMARKET_FUNDER differs from your signer but POLYMARKET_SIG_TYPE=0 (EOA).");
+            println!("   If the funder is a Gnosis Safe you own, set POLYMARKET_SIG_TYPE=2.\n");
+        }
+
+        let ts = chrono::Utc::now().timestamp();
+        let auth = self.compute_clob_auth(ts, 0).await?;
+
+        println!("L1 auth material:");
+        println!("  timestamp    {}  ({})", auth.timestamp,
+            chrono::DateTime::<chrono::Utc>::from_timestamp(auth.timestamp, 0)
+                .map(|d| d.to_rfc3339()).unwrap_or_default());
+        println!("  nonce        {}", auth.nonce);
+        println!("  type_hash    0x{}", auth.type_hash);
+        println!("  domain_sep   0x{}", auth.domain_sep);
+        println!("  struct_hash  0x{}", auth.struct_hash);
+        println!("  digest       0x{}", auth.digest);
+        println!("  signature    {}\n", auth.signature);
+
+        // Request 1: GET derive
+        println!("→ GET {CLOB_HOST}/auth/derive-api-key");
+        let (s, b) = self.send_auth(reqwest::Method::GET, "/auth/derive-api-key", &auth).await?;
+        println!("← {} {}", s.as_u16(), s.canonical_reason().unwrap_or(""));
+        println!("  {}\n", b.trim());
+        if s.is_success() {
+            let creds: ApiCreds = serde_json::from_str(&b)?;
+            println!("✓ existing credentials derived — you're set up correctly.");
+            println!("  apiKey     {}", creds.api_key);
+            return Ok(());
+        }
+
+        // Request 2: POST create
+        println!("→ POST {CLOB_HOST}/auth/api-key");
+        let (s2, b2) = self.send_auth(reqwest::Method::POST, "/auth/api-key", &auth).await?;
+        println!("← {} {}", s2.as_u16(), s2.canonical_reason().unwrap_or(""));
+        println!("  {}\n", b2.trim());
+        if s2.is_success() {
+            let creds: ApiCreds = serde_json::from_str(&b2)?;
+            println!("✓ new credentials created — subsequent runs will derive these.");
+            println!("  apiKey     {}", creds.api_key);
+            return Ok(());
+        }
+
+        // Neither worked. Print a tailored troubleshooting hint.
+        println!("✗ both endpoints failed.  Likely causes:");
+        println!();
+        match s.as_u16() {
+            401 => println!("  401 on derive → L1 signature does not recover to POLY_ADDRESS."),
+            _ => {}
+        }
+        match s2.as_u16() {
+            401 => println!("  401 on create → L1 signature does not recover to POLY_ADDRESS."),
+            403 => println!("  403 on create → wallet is recognised but not permitted (region block?)."),
+            404 => println!("  404 on create → endpoint path wrong for your cluster."),
+            _ => {}
+        }
+        if b.contains("timestamp") || b2.contains("timestamp") {
+            println!("  Possible clock skew — `sudo ntpdate pool.ntp.org` or equivalent.");
+        }
+        if b.contains("signature") || b2.contains("signature")
+           || b.contains("address") || b2.contains("address") {
+            println!("  Signature/address mismatch — verify POLYMARKET_PK corresponds to POLY_ADDRESS.");
+        }
+        println!("  If you've never used this wallet on polymarket.com, log in there first.");
+        println!("  Compare the signature above against py-clob-client with the same ts/nonce.");
+
+        Err(anyhow!("CLOB auth diagnostic failed"))
     }
 
     /// Build + sign an order and POST it to the CLOB.
@@ -395,4 +535,24 @@ fn l2_hmac(secret_b64: &str, ts: i64, method: &str, path: &str, body: &str) -> R
     mac.update(body.as_bytes());
     let sig = mac.finalize().into_bytes();
     Ok(base64::engine::general_purpose::URL_SAFE.encode(sig))
+}
+
+/// Intermediate values produced during L1 auth signing — useful for diagnostics.
+#[derive(Debug, Clone)]
+pub struct ClobAuthDebug {
+    pub address:     String,
+    pub timestamp:   i64,
+    pub nonce:       u64,
+    pub type_hash:   String,
+    pub domain_sep:  String,
+    pub struct_hash: String,
+    pub digest:      String,
+    pub signature:   String,
+}
+
+/// Shorten long response bodies for log output.
+fn snip(s: &str) -> String {
+    let one_line: String = s.chars().filter(|&c| c != '\n' && c != '\r').collect();
+    if one_line.chars().count() <= 200 { one_line }
+    else { one_line.chars().take(200).collect::<String>() + "…" }
 }

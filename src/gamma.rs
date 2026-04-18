@@ -8,12 +8,25 @@
 //!   btc-updown-5m-<unix-timestamp-of-window-start>
 //!
 //! Each market has a single event with two outcome tokens (Up / Down).
+//!
+//! Discovery uses `GET /events?slug=btc-updown-5m-{ts}` (one event per slug).
+//! Gamma’s `/events` filter is `tag_id` (numeric), not `tag_slug` — listing by a
+//! bogus tag string returned no `btc-updown-5m-*` rows.
+//!
+//! **Price to beat (opening USD)** — prefer Polymarket’s
+//! [`crate::config::POLYMARKET_CRYPTO_PRICE_URL`] (`openPrice`), then description
+//! parsing, then the app’s RTDS latch.
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
+use tracing::debug;
+use url::Url;
 
-use crate::config::GAMMA_HOST;
+use crate::config::{GAMMA_HOST, POLYMARKET_CRYPTO_PRICE_URL};
+
+/// Five-minute window length in seconds (matches Polymarket BTC 5m slugs).
+const BTC_5M_WINDOW_SEC: i64 = 300;
 
 /// What the rest of the app needs to know about a market.
 #[derive(Debug, Clone)]
@@ -25,9 +38,12 @@ pub struct ActiveMarket {
     pub down_token_id:  String,
     pub tick_size:      String,   // e.g. "0.01"
     pub neg_risk:       bool,
-    pub price_to_beat:  Option<f64>, // parsed from the rules/description
+    pub price_to_beat:  Option<f64>, // Polymarket crypto-price API, else description, else RTDS latch in app
     pub opens_at:       DateTime<Utc>,
     pub closes_at:      DateTime<Utc>,
+    /// UTC `Z` strings passed as `eventStartTime` / `endDate` to Polymarket crypto-price (debug / TUI).
+    pub crypto_price_query_start_utc: String,
+    pub crypto_price_query_end_utc:   String,
 }
 
 // ── Raw Gamma JSON shapes ───────────────────────────────────────────
@@ -41,6 +57,12 @@ struct RawEvent {
     #[serde(default, rename = "startDate")] start_date: Option<String>,
     #[serde(default, rename = "endDate")]   end_date:   Option<String>,
     #[serde(default)] markets:   Vec<RawMarket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CryptoPriceResponse {
+    #[serde(default, rename = "openPrice")]
+    open_price: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,38 +94,44 @@ impl GammaClient {
 
     /// Find the 5-min BTC market whose trading window contains `now`.
     ///
-    /// Strategy: list recent `btc-updown-5m-*` events, pick the one where
-    /// `start_date <= now < end_date`. Falls back to the nearest upcoming one.
+    /// Strategy: align `now` to the 5-minute grid, then request
+    /// `/events?slug=btc-updown-5m-{unix}` for that window and neighbors.
+    /// Pick the event where `start <= now < end`, else the next upcoming window.
     pub async fn find_current_btc_5m(&self) -> Result<ActiveMarket> {
-        // The Gamma /events endpoint accepts a `slug` *prefix* via `slug=` +
-        // a tag filter; the most reliable approach is actually to query the
-        // `crypto` tag filtered for 5-minute BTC.
-        //
-        // We hit `/events` with the series filter and pick by timestamp.
-        let url = format!(
-            "{GAMMA_HOST}/events?tag_slug=crypto-5m&active=true&closed=false&limit=50&order=startDate"
-        );
-
-        let resp: Vec<RawEvent> = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("gamma /events request failed")?
-            .error_for_status()?
-            .json()
-            .await
-            .context("gamma /events decode failed")?;
-
         let now = Utc::now();
+        let now_ts = now.timestamp();
+        let base = (now_ts / BTC_5M_WINDOW_SEC) * BTC_5M_WINDOW_SEC;
 
-        // Filter to BTC updown events
-        let mut candidates: Vec<_> = resp
-            .into_iter()
-            .filter(|e| e.slug.starts_with("btc-updown-5m-"))
-            .collect();
+        let mut candidates: Vec<RawEvent> = Vec::new();
+        for off in [
+            0,
+            BTC_5M_WINDOW_SEC,
+            -BTC_5M_WINDOW_SEC,
+            2 * BTC_5M_WINDOW_SEC,
+            -2 * BTC_5M_WINDOW_SEC,
+        ] {
+            let ts = base + off;
+            let slug = format!("btc-updown-5m-{ts}");
+            let url = format!("{GAMMA_HOST}/events?slug={slug}");
+            debug!(%url, "gamma: fetch event by slug");
 
-        // Sort by start date
+            let resp: Vec<RawEvent> = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("gamma GET {url} failed"))?
+                .error_for_status()
+                .with_context(|| format!("gamma GET {url} bad status"))?
+                .json()
+                .await
+                .with_context(|| format!("gamma GET {url} decode failed"))?;
+
+            if let Some(e) = resp.into_iter().next() {
+                candidates.push(e);
+            }
+        }
+
         candidates.sort_by_key(|e| e.start_date.clone().unwrap_or_default());
 
         let event = candidates
@@ -114,61 +142,158 @@ impl GammaClient {
                     _ => false,
                 }
             })
-            // Fall back to the next upcoming one
             .or_else(|| {
                 candidates.iter().find(|e| {
                     parse_ts(e.start_date.as_deref()).map_or(false, |s| s >= now)
                 })
             })
-            .ok_or_else(|| anyhow!("no active or upcoming btc-updown-5m-* event found"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "no active or upcoming btc-updown-5m-* event (tried windows around unix {base})"
+                )
+            })?;
 
-        let m = event
-            .markets
-            .iter()
-            .find(|m| !m.closed)
-            .ok_or_else(|| anyhow!("event has no open markets"))?;
-
-        // Parse the two token ids out of the JSON-encoded-string field
-        let token_ids: Vec<String> = serde_json::from_str(&m.clob_token_ids)
-            .context("parsing clobTokenIds")?;
-        if token_ids.len() < 2 {
-            return Err(anyhow!("expected 2 token ids, got {}", token_ids.len()));
-        }
-        let outcomes: Vec<String> = serde_json::from_str(&m.outcomes)
-            .unwrap_or_else(|_| vec!["Up".into(), "Down".into()]);
-
-        // First outcome is usually "Up" but we match explicitly just in case.
-        let (up_token_id, down_token_id) = if outcomes
-            .first()
-            .map(|s| s.eq_ignore_ascii_case("up"))
-            .unwrap_or(true)
+        let mut m = active_market_from_raw_event(event)?;
+        let (win_start, win_end) = utc_five_minute_window_bounds(&m.slug, m.opens_at);
+        m.opens_at = win_start;
+        m.closes_at = win_end;
+        let event_start = format_crypto_price_query_time(win_start);
+        let end_date = format_crypto_price_query_time(win_end);
+        m.crypto_price_query_start_utc = event_start.clone();
+        m.crypto_price_query_end_utc = end_date.clone();
+        if let Some(open) = self
+            .fetch_polymarket_btc_open_price(&event_start, &end_date)
+            .await
         {
-            (token_ids[0].clone(), token_ids[1].clone())
-        } else {
-            (token_ids[1].clone(), token_ids[0].clone())
-        };
-
-        let price_to_beat = extract_price_to_beat(&m.description);
-        let tick_size = m
-            .tick_size_f
-            .map(|v| format!("{v:.2}"))
-            .unwrap_or_else(|| "0.01".into());
-
-        Ok(ActiveMarket {
-            condition_id:   m.condition_id.clone(),
-            question:       m.question.clone(),
-            slug:           m.slug.clone(),
-            up_token_id,
-            down_token_id,
-            tick_size,
-            neg_risk:       m.neg_risk,
-            price_to_beat,
-            opens_at:  parse_ts(m.start_date.as_deref().or(event.start_date.as_deref()))
-                .unwrap_or_else(Utc::now),
-            closes_at: parse_ts(m.end_date.as_deref().or(event.end_date.as_deref()))
-                .unwrap_or_else(Utc::now),
-        })
+            m.price_to_beat = Some(open);
+        }
+        Ok(m)
     }
+
+    /// `GET /api/crypto/crypto-price` — `openPrice` for this 5-minute window.
+    async fn fetch_polymarket_btc_open_price(
+        &self,
+        event_start: &str,
+        end_date: &str,
+    ) -> Option<f64> {
+        let mut u = Url::parse(POLYMARKET_CRYPTO_PRICE_URL).expect("POLYMARKET_CRYPTO_PRICE_URL");
+        u.query_pairs_mut()
+            .append_pair("symbol", "BTC")
+            .append_pair("eventStartTime", event_start)
+            .append_pair("variant", "fiveminute")
+            .append_pair("endDate", end_date);
+        let res = self.http.get(u.as_str()).send()
+            .await
+            .map_err(|e| {
+                debug!(error = %e, url = %u, "polymarket crypto-price request failed");
+                e
+            })
+            .ok()?;
+
+        if !res.status().is_success() {
+            debug!(
+                status = %res.status(),
+                url = %u,
+                "polymarket crypto-price bad status",
+            );
+            return None;
+        }
+
+        let body: CryptoPriceResponse = res.json().await.map_err(|e| {
+            debug!(error = %e, "polymarket crypto-price decode failed");
+            e
+        }).ok()?;
+
+        if let Some(p) = body.open_price {
+            debug!(
+                open_price = p,
+                start = %event_start,
+                end = %end_date,
+                "polymarket crypto-price openPrice",
+            );
+        }
+        body.open_price
+    }
+}
+
+/// Polymarket `/api/crypto/crypto-price` query times use **UTC with `Z`** suffix
+/// (e.g. `2026-04-18T18:50:00Z`), matching the site’s API URLs.
+fn format_crypto_price_query_time(utc: DateTime<Utc>) -> String {
+    utc.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// 5m BTC windows start on the UTC clock at :00, :05, …, :55 (epoch slice of 300s).
+///
+/// Prefer the **`btc-updown-5m-{unix}`** slug (authoritative window start); otherwise
+/// floor Gamma `opens_at` down to a 300s boundary. End is always start + 5 minutes.
+fn utc_five_minute_window_bounds(slug: &str, opens_at: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    const STEP: i64 = BTC_5M_WINDOW_SEC;
+    let start = if let Some(tail) = slug.strip_prefix("btc-updown-5m-") {
+        if let Ok(ts) = tail.parse::<i64>() {
+            DateTime::<Utc>::from_timestamp(ts, 0).unwrap_or(opens_at)
+        } else {
+            floor_utc_to_five_minutes(opens_at)
+        }
+    } else {
+        floor_utc_to_five_minutes(opens_at)
+    };
+    let end = start + Duration::seconds(STEP);
+    (start, end)
+}
+
+fn floor_utc_to_five_minutes(t: DateTime<Utc>) -> DateTime<Utc> {
+    let floored = (t.timestamp() / BTC_5M_WINDOW_SEC) * BTC_5M_WINDOW_SEC;
+    DateTime::<Utc>::from_timestamp(floored, 0).unwrap_or(t)
+}
+
+/// Maps a Gamma `RawEvent` + its first open market to [`ActiveMarket`].
+fn active_market_from_raw_event(event: &RawEvent) -> Result<ActiveMarket> {
+    let m = event
+        .markets
+        .iter()
+        .find(|m| !m.closed)
+        .ok_or_else(|| anyhow!("event has no open markets"))?;
+
+    let token_ids: Vec<String> = serde_json::from_str(&m.clob_token_ids)
+        .context("parsing clobTokenIds")?;
+    if token_ids.len() < 2 {
+        return Err(anyhow!("expected 2 token ids, got {}", token_ids.len()));
+    }
+    let outcomes: Vec<String> = serde_json::from_str(&m.outcomes)
+        .unwrap_or_else(|_| vec!["Up".into(), "Down".into()]);
+
+    let (up_token_id, down_token_id) = if outcomes
+        .first()
+        .map(|s| s.eq_ignore_ascii_case("up"))
+        .unwrap_or(true)
+    {
+        (token_ids[0].clone(), token_ids[1].clone())
+    } else {
+        (token_ids[1].clone(), token_ids[0].clone())
+    };
+
+    let price_to_beat = extract_price_to_beat(&m.description); // overridden in find_current_btc_5m when API returns openPrice
+    let tick_size = m
+        .tick_size_f
+        .map(|v| format!("{v:.2}"))
+        .unwrap_or_else(|| "0.01".into());
+
+    Ok(ActiveMarket {
+        condition_id: m.condition_id.clone(),
+        question:     m.question.clone(),
+        slug:         m.slug.clone(),
+        up_token_id,
+        down_token_id,
+        tick_size,
+        neg_risk:    m.neg_risk,
+        price_to_beat,
+        opens_at: parse_ts(m.start_date.as_deref().or(event.start_date.as_deref()))
+            .unwrap_or_else(Utc::now),
+        closes_at: parse_ts(m.end_date.as_deref().or(event.end_date.as_deref()))
+            .unwrap_or_else(Utc::now),
+        crypto_price_query_start_utc: String::new(),
+        crypto_price_query_end_utc:   String::new(),
+    })
 }
 
 impl Default for GammaClient {
@@ -189,15 +314,39 @@ fn parse_ts(s: Option<&str>) -> Option<DateTime<Utc>> {
 /// colour logic will fall back to comparing against the market implied
 /// probability (YES price vs 0.50).
 fn extract_price_to_beat(desc: &str) -> Option<f64> {
-    // Very loose extraction: find "$NNNN(.NN)"  near the word "price".
+    // Prefer text near "price to beat" / "opening" (older Gamma copy).
     let lower = desc.to_ascii_lowercase();
-    let anchor = lower.find("price to beat").or_else(|| lower.find("opening"))?;
-    let tail = &desc[anchor..];
-    let dollar = tail.find('$')?;
-    let rest = &tail[dollar + 1..];
-    let num: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
-        .collect();
-    num.replace(',', "").parse().ok()
+    if let Some(anchor) = lower
+        .find("price to beat")
+        .or_else(|| lower.find("opening"))
+        .or_else(|| lower.find("beginning of that range"))
+    {
+        let tail = &desc[anchor..];
+        if let Some(dollar) = tail.find('$') {
+            let rest = &tail[dollar + 1..];
+            let num: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+                .collect();
+            if let Ok(v) = num.replace(',', "").parse::<f64>() {
+                if v > 1.0 {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    // Newer events often omit a dollar figure in `description`; if Polymarket
+    // adds any "$87,123" style reference, grab the first BTC-plausible value.
+    for seg in desc.split('$').skip(1) {
+        let num: String = seg
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+            .collect();
+        if let Ok(v) = num.replace(',', "").parse::<f64>() {
+            if (10_000.0..2_000_000.0).contains(&v) {
+                return Some(v);
+            }
+        }
+    }
+    None
 }

@@ -71,6 +71,38 @@ when it closes.
 feed Polymarket resolves against, so the header color is consistent with
 what decides your position.
 
+## Debugging
+
+Every run writes a log to `./btc5m-bot.log` (override with `BTC5M_LOG_PATH`).
+Default log level is `debug` — every HTTP response body, every WS subscribe
+message, every EIP-712 digest is captured there. `tail -f btc5m-bot.log` in
+another pane while the TUI runs.
+
+If CLOB auth fails, the TUI's status line will scroll through the error
+chain over ~10 seconds. For the definitive dump, quit the TUI and run:
+
+```sh
+./target/release/btc5m-bot debug-auth
+```
+
+That prints everything: the signer address, the funder, the proxy status,
+the EIP-712 type hash, domain separator, struct hash, final digest, the
+signature, then hits both `/auth/derive-api-key` and `/auth/api-key` and
+shows the exact status + body you got back. If the digest looks right but
+the server still says 401, the problem is usually one of:
+
+- **Signer address doesn't match POLY_ADDRESS** — check that your
+  `POLYMARKET_PK` is for the right EOA. The `debug-auth` output shows the
+  address derived from your key.
+- **Clock skew** — `date -u` vs a known reference. Off by more than ~10s
+  and the server rejects.
+- **Wallet never set up on Polymarket** — log into polymarket.com with
+  this EOA at least once to deploy the Safe; `create_or_derive_api_key`
+  can't synthesise creds for a wallet the platform has never seen.
+- **Proxy stripping headers** — some corporate/SOCKS proxies rewrite the
+  `POLY_*` custom headers. Try a different proxy or a direct connection
+  from a permitted region.
+
 ## Geo-restricted? Use a proxy
 
 Polymarket blocks a broad set of IPs at the edge. If `cargo run` shows no BTC
@@ -92,6 +124,40 @@ ciphertext. A residential or datacenter proxy in any non-blocked region
 works — Polymarket only inspects the peer IP, not headers.
 
 You'll see `proxy=…` in the startup log line when it's active.
+
+## Troubleshooting CLOB credentials
+
+If you see `could not derive CLOB API credentials` in the startup log, run:
+
+```sh
+./target/release/btc5m-bot debug-auth
+```
+
+This skips the TUI, runs the L1 auth flow with verbose output, and prints
+every intermediate value (typeHash, domainSeparator, structHash, digest,
+signature) alongside the actual HTTP status and body returned by
+`GET /auth/derive-api-key` and `POST /auth/api-key`. Common patterns:
+
+| what `debug-auth` shows | diagnosis |
+|---|---|
+| `401 Unauthorized` on both, body mentions *signature* or *address* | `ecrecover(digest, sig)` returned a different address from `POLY_ADDRESS`. Either the typeHash is wrong (shouldn't be after the v0.1 fix), or `POLYMARKET_PK` doesn't match the account you think it does. |
+| `401 Unauthorized`, body mentions *timestamp* | clock skew > ~10 s. Run `sudo ntpdate pool.ntp.org` (or `w32tm /resync` on Windows). |
+| `403 Forbidden` on create | proxy is in a region Polymarket still blocks, or the wallet tripped their compliance layer. Try a different proxy region. |
+| `404 Not Found` on derive, `200 OK` on create | your wallet had no prior API keys; now it does. The TUI will work on next launch. |
+| `200 OK` on derive but TUI still errors | the creds are fine — the next failure is probably L2 (HMAC), likely a base64 decoding mismatch on the secret. |
+| `warning: POLYMARKET_FUNDER equals your signer…` | misconfigured `sig_type`. EOA wallets need `sig_type=0` and `funder=eoa`. Safe users need `sig_type=2` and `funder=safe_address`. |
+
+**Wallet never used on polymarket.com**: if this EOA/Safe has never placed a
+trade through the web UI, the backend may have no record of it and will
+reject API-key creation with a 403. Log in once at polymarket.com with the
+same wallet, deposit $1 USDC, then re-run `debug-auth`.
+
+**Comparing against py-clob-client**: the gold standard for verification is
+to point the Python client at the same wallet with the same timestamp and
+nonce, then compare the resulting `POLY_SIGNATURE` byte-for-byte against
+what `debug-auth` prints. If they differ, the issue is in our signing; if
+they match and Python works but Rust doesn't, the issue is in our HTTP
+layer (headers, proxy, TLS).
 
 ## Setup
 

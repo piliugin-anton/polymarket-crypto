@@ -1,18 +1,29 @@
 //! Polymarket RTDS — Chainlink BTC/USD feed.
 //!
 //! No authentication required. We subscribe to the `crypto_prices_chainlink`
-//! topic with `symbol=btc/usd` and emit a `PriceTick` on every update.
+//! topic with filter `symbol=btc/usd` and emit a `PriceTick` on every update.
 //!
-//! The public doc is at <https://docs.polymarket.com/developers/RTDS/RTDS-crypto-prices>.
+//! RTDS expects `action` + a **`subscriptions`** array, and Chainlink filters
+//! must be a **JSON string** (e.g. `"{\"symbol\":\"btc/usd\"}"`), not a nested
+//! object — see <https://docs.polymarket.com/developers/RTDS/RTDS-crypto-prices>.
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::config::RTDS_WS_URL;
+
+fn snip(txt: &str, max: usize) -> String {
+    let t = txt.trim();
+    if t.len() <= max {
+        t.to_string()
+    } else {
+        format!("{}…", &t[..max])
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct PriceTick {
@@ -60,18 +71,30 @@ async fn run_once(tx: &mpsc::Sender<PriceTick>) -> Result<()> {
         .await
         .context("connect to Polymarket RTDS")?;
 
-    // Subscribe to the Chainlink crypto topic.
-    let sub = serde_json::json!({
-        "action":     "subscribe",
-        "topic":      "crypto_prices_chainlink",
-        "type":       "*",
-        "filters":    { "symbol": "btc/usd" },
-    });
-    ws.send(Message::Text(sub.to_string().into())).await?;
+    info!(url = %RTDS_WS_URL, "RTDS (Chainlink) connected");
 
-    // Heartbeat loop — server closes idle connections after ~5s.
+    // Documented shape: filters is a string containing JSON, inside `subscriptions`.
+    let filters = serde_json::to_string(&serde_json::json!({ "symbol": "btc/usd" }))
+        .expect("static json");
+    let sub = serde_json::json!({
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": "crypto_prices_chainlink",
+                "type": "*",
+                "filters": filters,
+            }
+        ]
+    });
+    let sub_txt = sub.to_string();
+    info!(payload = %snip(&sub_txt, 200), "RTDS subscribe sent");
+    ws.send(Message::Text(sub_txt.into())).await?;
+
+    // Heartbeat — docs: PING every 5s.
     let mut ping_iv = tokio::time::interval(std::time::Duration::from_secs(5));
-    ping_iv.tick().await; // consume the immediate first tick
+    ping_iv.tick().await;
+
+    let mut first_text = true;
 
     loop {
         tokio::select! {
@@ -82,20 +105,33 @@ async fn run_once(tx: &mpsc::Sender<PriceTick>) -> Result<()> {
                 let msg = match msg {
                     Some(Ok(m)) => m,
                     Some(Err(e)) => return Err(e.into()),
-                    None => return Ok(()),
+                    None => {
+                        info!("RTDS stream ended");
+                        return Ok(());
+                    }
                 };
                 match msg {
                     Message::Text(txt) => {
-                        // Server sends "PONG" as plain text — ignore.
                         if txt.trim() == "PONG" { continue; }
+                        if first_text {
+                            info!(
+                                len = txt.len(),
+                                snippet = %snip(&txt, 240),
+                                "RTDS first text frame"
+                            );
+                            first_text = false;
+                        }
                         match serde_json::from_str::<Envelope>(&txt) {
                             Ok(env) if env.topic == "crypto_prices_chainlink" => {
                                 if let Some(p) = env.payload {
-                                    // Live update
+                                    let sym_ok = p.symbol.is_empty()
+                                        || p.symbol.eq_ignore_ascii_case("btc/usd");
+                                    if !sym_ok {
+                                        continue;
+                                    }
                                     if let (Some(v), Some(ts)) = (p.value, p.timestamp) {
                                         let _ = tx.send(PriceTick { price: v, timestamp_ms: ts }).await;
                                     }
-                                    // Snapshot catch-up on subscribe
                                     if let Some(last) = p.data.last() {
                                         let _ = tx.send(PriceTick {
                                             price: last.value,
@@ -105,11 +141,20 @@ async fn run_once(tx: &mpsc::Sender<PriceTick>) -> Result<()> {
                                 }
                             }
                             Ok(_) => {}
-                            Err(e) => debug!(%e, raw = %txt, "failed to parse RTDS message"),
+                            Err(e) => warn!(
+                                %e,
+                                raw = %snip(&txt, 400),
+                                "RTDS message JSON parse failed"
+                            ),
                         }
                     }
-                    Message::Close(_) => return Ok(()),
-                    _ => {}
+                    Message::Close(f) => {
+                        info!(?f, "RTDS peer closed");
+                        return Ok(());
+                    }
+                    other => {
+                        tracing::debug!(?other, "RTDS non-text frame");
+                    }
                 }
             }
         }

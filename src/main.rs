@@ -40,13 +40,26 @@ use trading::{OrderArgs, OrderType, Side, TradingClient};
 #[tokio::main]
 async fn main() -> Result<()> {
     // ── setup ────────────────────────────────────────────────────────
+    // stderr gets hidden once crossterm enters the alternate screen, and
+    // any warn! / error! we emit during the TUI phase vanishes. Write the
+    // log to ./btc5m-bot.log so it's always inspectable post-mortem.
+    let log_path = std::env::var("BTC5M_LOG_PATH").unwrap_or_else(|_| "./btc5m-bot.log".into());
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .context(format!("open log file {log_path}"))?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "btc5m_bot=info,warn".into())
+                .unwrap_or_else(|_| "btc5m_bot=debug,warn".into())
         )
-        .with_writer(std::io::stderr)
+        .with_writer(std::sync::Mutex::new(log_file))
+        .with_ansi(false)
         .init();
+
+    eprintln!("▸ btc5m-bot — logging to {log_path}");
+    eprintln!("▸ if credentials or data don't appear, run: btc5m-bot debug-auth");
 
     let cfg = Config::from_env().context("loading config")?;
     info!(
@@ -55,6 +68,25 @@ async fn main() -> Result<()> {
         proxy  = %net::proxy_env().as_deref().unwrap_or("<none>"),
         "config loaded",
     );
+
+    // ── subcommand dispatch (no TUI) ─────────────────────────────────
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("debug-auth") => {
+            let mut t = TradingClient::new(cfg.clone())?;
+            return t.debug_auth_flow().await;
+        }
+        Some("help") | Some("-h") | Some("--help") => {
+            println!("Usage: btc5m-bot [SUBCOMMAND]\n");
+            println!("Without a subcommand, launches the interactive TUI.\n");
+            println!("Subcommands:");
+            println!("  debug-auth    Run the CLOB L1 auth flow and dump all intermediate");
+            println!("                values (useful for debugging 401/403 errors).");
+            println!("  help          Show this help.");
+            return Ok(());
+        }
+        _ => {}
+    }
 
     // Shared event channel — generous buffer so bursts from the book WS don't drop
     let (tx, mut rx) = mpsc::channel::<AppEvent>(512);
@@ -68,13 +100,26 @@ async fn main() -> Result<()> {
     // mutate it without passing ownership around.
     let trading = Arc::new(Mutex::new(TradingClient::new(cfg.clone())?));
 
-    // Best-effort: derive creds on startup (fails silently if offline —
-    // user will see the error on first order attempt instead).
+    // Best-effort: derive creds on startup. On failure we push the full
+    // error into the TUI status line AND the log file — stderr alone is
+    // invisible once the alternate screen is active.
     {
-        let t = trading.clone();
+        let t  = trading.clone();
+        let tx = tx.clone();
         tokio::spawn(async move {
             if let Err(e) = t.lock().await.ensure_creds().await {
                 warn!(error = %e, "could not derive CLOB API credentials yet");
+                // Send each line of the error separately so the full chain
+                // scrolls through the status line — anyhow's chain has rich
+                // detail that gets lost if we only show the top-level msg.
+                let msg = format!("{e:#}");
+                for line in msg.lines().take(6) {
+                    let _ = tx.send(AppEvent::OrderErr(line.to_string())).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+                let _ = tx.send(AppEvent::OrderErr(
+                    "run `btc5m-bot debug-auth` for the full auth dump".into()
+                )).await;
             }
         });
     }

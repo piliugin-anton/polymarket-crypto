@@ -1,8 +1,8 @@
 //! Ratatui draw routine — all in one function for clarity.
 //!
 //! Layout:
-//! ┌─ Header (3 rows) ─────────────────────────────────────────┐
-//! │ BTC / price to beat / countdown                           │
+//! ┌─ Header (2 lines) ───────────────────────────────────────┐
+//! │ BTC / price to beat / countdown / market title           │
 //! ├─ Main (split 60/40) ───────────────────────────────────────┤
 //! │   Order book        │   Positions                         │
 //! ├─ Fills (8 rows) ──────────────────────────────────────────┤
@@ -58,15 +58,6 @@ fn draw_header(f: &mut Frame, area: Rect, s: &AppState) {
         .map(|c| format!("{:02}:{:02}", c / 60, c % 60))
         .unwrap_or_else(|| "—".into());
 
-    let market_line = match &s.market {
-        Some(m) => format!(
-            "{}   {}  closes in {}  |  tick {}  neg_risk={}",
-            truncate(&m.question, 50), cd_label(&cd), cd, m.tick_size, m.neg_risk,
-        ),
-        None => "Loading market…".into(),
-    };
-    let _ = market_line; // used below
-
     // Line 1: big coloured price
     let line1 = Line::from(vec![
         Span::styled("BTC/USD (Chainlink)  ", Style::default().fg(Color::DarkGray)),
@@ -100,8 +91,6 @@ fn draw_header(f: &mut Frame, area: Rect, s: &AppState) {
     let p = Paragraph::new(vec![line1, line2]).block(block).wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
-
-fn cd_label(_: &str) -> &'static str { "·" }
 
 // ── Main (book + positions) ─────────────────────────────────────────
 fn draw_main(f: &mut Frame, area: Rect, s: &AppState) {

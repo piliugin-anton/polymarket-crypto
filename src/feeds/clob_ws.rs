@@ -10,9 +10,18 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::CLOB_WS_URL;
+
+fn snip_frame(txt: &str, max: usize) -> String {
+    let t = txt.trim();
+    if t.len() <= max {
+        t.to_string()
+    } else {
+        format!("{}…", &t[..max])
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct BookLevel {
@@ -74,12 +83,18 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
         .await
         .context("connect to Polymarket CLOB WS")?;
 
-    // Market channel subscribe message
+    info!(url = %CLOB_WS_URL, n = token_ids.len(), "CLOB WS connected");
+
+    // Market channel subscribe message (see Polymarket WSS docs — `type` + `assets_ids`).
     let sub = serde_json::json!({
         "type":          "market",
         "assets_ids":    token_ids,
     });
     ws.send(Message::Text(sub.to_string().into())).await?;
+    for (i, id) in token_ids.iter().enumerate() {
+        let prefix: String = id.chars().take(12).collect();
+        info!(i, token_id_prefix = %prefix, "CLOB WS subscribe token");
+    }
 
     // Keep local book state so price_change events can be applied
     use std::collections::{BTreeMap, HashMap};
@@ -90,6 +105,10 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(10));
     ping.tick().await;
 
+    let mut first_text_logged = false;
+    let mut first_non_text_logged = false;
+    let mut n_frames = 0u64;
+
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -99,21 +118,52 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                 let m = match m {
                     Some(Ok(m)) => m,
                     Some(Err(e)) => return Err(e.into()),
-                    None => return Ok(()),
+                    None => {
+                        info!(n_frames, "CLOB WS stream ended");
+                        return Ok(());
+                    }
                 };
                 let txt = match m {
                     Message::Text(t) => t,
-                    Message::Close(_) => return Ok(()),
-                    _ => continue,
+                    Message::Close(f) => {
+                        info!(?f, "CLOB WS peer closed");
+                        return Ok(());
+                    }
+                    other => {
+                        if !first_non_text_logged {
+                            info!(?other, "CLOB WS first non-text frame");
+                            first_non_text_logged = true;
+                        }
+                        continue;
+                    }
                 };
                 if txt.trim() == "PONG" { continue; }
+
+                n_frames += 1;
+                if !first_text_logged {
+                    info!(
+                        len = txt.len(),
+                        snippet = %snip_frame(&txt, 240),
+                        "CLOB WS first text payload (book / price_change / …)"
+                    );
+                    first_text_logged = true;
+                }
 
                 // CLOB sends arrays of events sometimes; handle both shapes.
                 let events: Vec<RawEvent> = match serde_json::from_str::<Vec<RawEvent>>(&txt) {
                     Ok(v) => v,
-                    Err(_) => match serde_json::from_str::<RawEvent>(&txt) {
+                    Err(arr_err) => match serde_json::from_str::<RawEvent>(&txt) {
                         Ok(e) => vec![e],
-                        Err(_) => continue,
+                        Err(obj_err) => {
+                            warn!(
+                                len = txt.len(),
+                                snippet = %snip_frame(&txt, 280),
+                                arr_err = %arr_err,
+                                obj_err = %obj_err,
+                                "CLOB WS text not parsed as book events — check schema / topic",
+                            );
+                            continue;
+                        }
                     }
                 };
 

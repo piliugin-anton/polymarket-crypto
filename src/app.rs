@@ -97,6 +97,12 @@ pub struct AppState {
     pub fills:          VecDeque<Fill>,
     pub status_line:    String,
 
+    /// When Gamma omits the opening USD level in the market text, we latch the
+    /// Chainlink oracle reading: first tick whose `payload.timestamp` is at or
+    /// after [`ActiveMarket::opens_at`] (5m window boundary). Matches Polymarket
+    /// RTDS docs + community notes (same oracle stream as resolution).
+    latched_price_to_beat: Option<f64>,
+
     pub default_size_usdc: f64,
     pub size_input:        String, // buffer while editing size
     pub limit_price_input: String,
@@ -113,6 +119,7 @@ impl AppState {
             position_up: Default::default(), position_down: Default::default(),
             realized_pnl: 0.0, fills: VecDeque::with_capacity(64),
             status_line: "Waiting for market data…".into(),
+            latched_price_to_beat: None,
             default_size_usdc,
             size_input: format!("{default_size_usdc:.2}"),
             limit_price_input: String::new(),
@@ -122,7 +129,12 @@ impl AppState {
     }
 
     // ── Queries ─────────────────────────────────────────────────────
-    pub fn price_to_beat(&self) -> Option<f64> { self.market.as_ref().and_then(|m| m.price_to_beat) }
+    pub fn price_to_beat(&self) -> Option<f64> {
+        self.market
+            .as_ref()
+            .and_then(|m| m.price_to_beat)
+            .or(self.latched_price_to_beat)
+    }
 
     /// BTC colour: green when we're at/above the opening price (UP winning),
     /// red when strictly below.
@@ -193,6 +205,15 @@ impl AppState {
             AppEvent::Price(p) => {
                 self.btc_price    = Some(p.price);
                 self.btc_price_ts = chrono::DateTime::<Utc>::from_timestamp_millis(p.timestamp_ms as i64);
+                if let Some(m) = &self.market {
+                    if m.price_to_beat.is_none() && self.latched_price_to_beat.is_none() {
+                        let open_ms = m.opens_at.timestamp_millis().max(0) as u64;
+                        // Require oracle time ≥ window open (per RTDS payload timestamps).
+                        if p.timestamp_ms >= open_ms {
+                            self.latched_price_to_beat = Some(p.price);
+                        }
+                    }
+                }
             }
             AppEvent::Book(b) => {
                 if let Some(m) = &self.market {
@@ -205,6 +226,7 @@ impl AppState {
                 // via Polymarket and show up as realized once winnings redeem.
                 // We keep realized_pnl but zero out live positions for the new market.
                 self.status_line = format!("New market: {}", m.question);
+                self.latched_price_to_beat = None;
                 self.market = Some(m);
                 self.book_up = None; self.book_down = None;
                 self.position_up = Default::default();
