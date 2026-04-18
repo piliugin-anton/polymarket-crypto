@@ -79,7 +79,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
         "type":          "market",
         "assets_ids":    token_ids,
     });
-    ws.send(Message::Text(sub.to_string())).await?;
+    ws.send(Message::Text(sub.to_string().into())).await?;
 
     // Keep local book state so price_change events can be applied
     use std::collections::{BTreeMap, HashMap};

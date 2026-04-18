@@ -84,7 +84,6 @@ impl Config {
             .unwrap_or(200); // 2% default slippage tolerance on market orders
 
         // Derive signer address using alloy
-        use alloy_signer::Signer as _;
         let signer: alloy_signer_local::PrivateKeySigner = private_key.parse()
             .context("Could not parse POLYMARKET_PK as a private key")?;
         let signer_address = signer.address();

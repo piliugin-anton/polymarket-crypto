@@ -67,7 +67,7 @@ async fn run_once(tx: &mpsc::Sender<PriceTick>) -> Result<()> {
         "type":       "*",
         "filters":    { "symbol": "btc/usd" },
     });
-    ws.send(Message::Text(sub.to_string())).await?;
+    ws.send(Message::Text(sub.to_string().into())).await?;
 
     // Heartbeat loop — server closes idle connections after ~5s.
     let mut ping_iv = tokio::time::interval(std::time::Duration::from_secs(5));

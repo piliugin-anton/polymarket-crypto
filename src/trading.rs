@@ -36,7 +36,7 @@ use sha2::Sha256;
 use std::str::FromStr;
 
 use crate::config::{
-    Config, SignatureType, CTF_EXCHANGE, CLOB_HOST, NEG_RISK_CTF_EXCHANGE, POLYGON_CHAIN_ID,
+    Config, CTF_EXCHANGE, CLOB_HOST, NEG_RISK_CTF_EXCHANGE, POLYGON_CHAIN_ID,
     usdc_to_base,
 };
 
