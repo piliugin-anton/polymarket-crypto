@@ -17,6 +17,7 @@ mod config;
 mod events;
 mod feeds;
 mod gamma;
+mod net;
 mod trading;
 mod ui;
 
@@ -48,7 +49,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env().context("loading config")?;
-    info!(signer = %cfg.signer_address, funder = %cfg.funder, "config loaded");
+    info!(
+        signer = %cfg.signer_address,
+        funder = %cfg.funder,
+        proxy  = %net::proxy_env().as_deref().unwrap_or("<none>"),
+        "config loaded",
+    );
 
     // Shared event channel — generous buffer so bursts from the book WS don't drop
     let (tx, mut rx) = mpsc::channel::<AppEvent>(512);

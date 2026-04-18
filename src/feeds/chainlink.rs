@@ -56,7 +56,7 @@ pub fn spawn(tx: mpsc::Sender<PriceTick>) -> tokio::task::JoinHandle<()> {
 }
 
 async fn run_once(tx: &mpsc::Sender<PriceTick>) -> Result<()> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(RTDS_WS_URL)
+    let (mut ws, _) = crate::net::ws_connect(RTDS_WS_URL)
         .await
         .context("connect to Polymarket RTDS")?;
 

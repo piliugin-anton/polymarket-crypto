@@ -71,6 +71,28 @@ when it closes.
 feed Polymarket resolves against, so the header color is consistent with
 what decides your position.
 
+## Geo-restricted? Use a proxy
+
+Polymarket blocks a broad set of IPs at the edge. If `cargo run` shows no BTC
+price, no order book, and Gamma errors in the log, you're almost certainly
+being blocked. Set `POLYMARKET_PROXY` in `.env` and everything — REST
+(Gamma, CLOB REST) plus WebSockets (Chainlink RTDS, CLOB book) — will
+tunnel through it:
+
+```
+POLYMARKET_PROXY=http://user:pass@proxy.example.com:8080   # HTTP(S)
+POLYMARKET_PROXY=socks5://127.0.0.1:1080                   # SOCKS5
+```
+
+For HTTP proxies the bot sends a `CONNECT` for each WebSocket before doing
+TLS + the WS handshake. For SOCKS5 it uses `tokio-socks` to do the
+handshake and then treats the tunnel as a plain TCP stream. TLS (via
+`rustls` with `webpki-roots`) happens at the origin so your proxy only sees
+ciphertext. A residential or datacenter proxy in any non-blocked region
+works — Polymarket only inspects the peer IP, not headers.
+
+You'll see `proxy=…` in the startup log line when it's active.
+
 ## Setup
 
 ### Prerequisites

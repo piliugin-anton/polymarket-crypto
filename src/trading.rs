@@ -36,7 +36,7 @@ use sha2::Sha256;
 use std::str::FromStr;
 
 use crate::config::{
-    Config, CTF_EXCHANGE, CLOB_HOST, NEG_RISK_CTF_EXCHANGE, POLYGON_CHAIN_ID,
+    Config, SignatureType, CTF_EXCHANGE, CLOB_HOST, NEG_RISK_CTF_EXCHANGE, POLYGON_CHAIN_ID,
     usdc_to_base,
 };
 
@@ -128,10 +128,7 @@ impl TradingClient {
         let signer: PrivateKeySigner = config.private_key.parse()
             .context("parsing private key")?;
         Ok(Self {
-            http: reqwest::Client::builder()
-                .user_agent("btc5m-bot/0.1")
-                .timeout(std::time::Duration::from_secs(10))
-                .build()?,
+            http: crate::net::reqwest_client()?,
             signer,
             creds: None,
             config,
@@ -182,28 +179,61 @@ impl TradingClient {
     }
 
     /// Sign the `ClobAuth` EIP-712 struct (used to derive/create API keys).
+    ///
+    /// ⚠ The struct has a field literally named `address`, which the `sol!` macro
+    /// can't represent (Solidity treats `address` as a reserved keyword). We
+    /// therefore compute the typeHash and structHash by hand so the EIP-712
+    /// digest matches what Polymarket's server expects:
+    ///
+    /// ```text
+    /// ClobAuth(address address,string timestamp,uint256 nonce,string message)
+    /// ```
     async fn sign_clob_auth(&self, ts: i64, nonce: u64) -> Result<String> {
-        sol! {
-            struct ClobAuth {
-                address addr;
-                string  timestamp;
-                uint256 nonce;
-                string  message;
-            }
-        }
+        use alloy_primitives::keccak256;
+
+        // ── domain ───────────────────────────────────────────────────
+        // We still use alloy's helper for the domain separator since it
+        // doesn't hit the keyword problem.
         let dom = eip712_domain! {
             name:     "ClobAuthDomain",
             version:  "1",
             chain_id: POLYGON_CHAIN_ID,
         };
-        let msg = ClobAuth {
-            addr:      self.signer.address(),
-            timestamp: ts.to_string(),
-            nonce:     U256::from(nonce),
-            message:   "This message attests that I control the given wallet".into(),
-        };
-        let hash = msg.eip712_signing_hash(&dom);
-        let sig  = self.signer.sign_hash(&hash).await?;
+        let domain_separator: B256 = dom.separator();
+
+        // ── struct hash (manual) ─────────────────────────────────────
+        let type_hash = keccak256(
+            b"ClobAuth(address address,string timestamp,uint256 nonce,string message)"
+        );
+        let ts_str  = ts.to_string();
+        let message = "This message attests that I control the given wallet";
+
+        // abi.encode(typeHash, address, keccak256(ts), nonce, keccak256(msg))
+        // = 5 × 32 bytes, big-endian, left-padded
+        let mut buf = Vec::with_capacity(32 * 5);
+        buf.extend_from_slice(type_hash.as_slice());
+        // address → left-padded to 32 bytes
+        buf.extend_from_slice(&[0u8; 12]);
+        buf.extend_from_slice(self.signer.address().as_slice());
+        // timestamp is a `string` → keccak of the UTF-8 bytes
+        buf.extend_from_slice(keccak256(ts_str.as_bytes()).as_slice());
+        // nonce as uint256 big-endian
+        let mut nonce_be = [0u8; 32];
+        nonce_be[24..].copy_from_slice(&nonce.to_be_bytes());
+        buf.extend_from_slice(&nonce_be);
+        // message
+        buf.extend_from_slice(keccak256(message.as_bytes()).as_slice());
+        let struct_hash = keccak256(&buf);
+
+        // ── digest = keccak256(0x19 0x01 ‖ domainSep ‖ structHash) ──
+        let mut digest_in = [0u8; 2 + 32 + 32];
+        digest_in[0] = 0x19;
+        digest_in[1] = 0x01;
+        digest_in[2..34].copy_from_slice(domain_separator.as_slice());
+        digest_in[34..].copy_from_slice(struct_hash.as_slice());
+        let digest: B256 = keccak256(&digest_in);
+
+        let sig = self.signer.sign_hash(&digest).await?;
         Ok(format!("0x{}", hex::encode(sig.as_bytes())))
     }
 

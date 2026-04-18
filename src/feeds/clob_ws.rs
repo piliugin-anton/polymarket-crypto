@@ -70,7 +70,7 @@ pub fn spawn(token_ids: Vec<String>, tx: mpsc::Sender<BookSnapshot>) -> tokio::t
 }
 
 async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Result<()> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(CLOB_WS_URL)
+    let (mut ws, _) = crate::net::ws_connect(CLOB_WS_URL)
         .await
         .context("connect to Polymarket CLOB WS")?;
 
