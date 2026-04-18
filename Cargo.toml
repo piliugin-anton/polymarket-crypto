@@ -6,14 +6,14 @@ rust-version = "1.80"
 
 [dependencies]
 # ── async runtime + IO ──────────────────────────────────────────────
-tokio             = { version = "1.42", features = ["full"] }
+tokio             = { version = "1.52", features = ["full"] }
 # Pinned to 0.21 where Message::Text still holds String — 0.23+ switched to
 # Utf8Bytes and broke a lot of straightforward ws code.
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 futures-util      = "0.3"
 
 # ── http (rustls, no openssl) ───────────────────────────────────────
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
 
 # ── serde ───────────────────────────────────────────────────────────
 serde      = { version = "1", features = ["derive"] }
@@ -21,12 +21,12 @@ serde_json = "1"
 
 # ── TUI ─────────────────────────────────────────────────────────────
 ratatui   = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # ── ethereum / EIP-712 signing ──────────────────────────────────────
 alloy-primitives    = { version = "0.8", features = ["serde"] }
-alloy-signer        = "0.8"
-alloy-signer-local  = "0.8"
+alloy-signer        = "0.7"
+alloy-signer-local  = "0.7"
 alloy-sol-types     = "0.8"
 
 # ── auth (HMAC-SHA256 for CLOB L2) ──────────────────────────────────
@@ -36,10 +36,10 @@ base64    = "0.22"
 
 # ── misc ────────────────────────────────────────────────────────────
 anyhow            = "1"
-thiserror         = "1"
+thiserror         = "2"
 chrono            = { version = "0.4", features = ["serde"] }
 uuid              = { version = "1", features = ["v4"] }
-rand              = "0.8"
+rand              = "0.9"
 dotenvy           = "0.15"
 tracing           = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
