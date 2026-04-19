@@ -31,7 +31,8 @@ use app::{
 use config::Config;
 use crossterm::{
     event::{
-        Event as CtEvent, EventStream, KeyCode, KeyEventKind,
+        DisableFocusChange, EnableFocusChange, Event as CtEvent, EventStream, KeyCode,
+        KeyEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -293,7 +294,9 @@ async fn main() -> Result<()> {
     let mut out = stdout();
     // Do not enable mouse capture: we don't handle mouse events, and SGR mouse mode can make some
     // terminals (e.g. embedded IDE terminal) deliver keyboard only after the pane is clicked.
-    execute!(out, EnterAlternateScreen)?;
+    // Focus events are opt-in (`EnableFocusChange`); without them, `FocusGained` never fires after
+    // hide/show and we cannot re-apply raw mode (see crossterm::event module docs).
+    execute!(out, EnterAlternateScreen, EnableFocusChange)?;
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
 
@@ -347,7 +350,7 @@ async fn main() -> Result<()> {
 
     // ── teardown ─────────────────────────────────────────────────────
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    execute!(term.backend_mut(), DisableFocusChange, LeaveAlternateScreen)?;
     term.show_cursor()?;
 
     if let Err(e) = &result { error!(error = %e, "exited with error"); }
@@ -442,6 +445,8 @@ fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
                         }
                     }
                     CtEvent::Resize(_, _) => {
+                        // Some terminals emit resize when a pane is restored but not `FocusGained`.
+                        tty_restore_raw_mode();
                         let _ = tx.try_send(AppEvent::Tick); // redraw; never block crossterm reader
                     }
                     CtEvent::FocusGained => {
