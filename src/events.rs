@@ -3,7 +3,7 @@
 //! `handle_key` returns an `Action` the runtime should dispatch. Keeping this
 //! pure (no I/O) makes the key logic unit-testable.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::app::{AppState, InputMode, LimitField, Outcome, MIN_LIMIT_ORDER_SHARES};
 use crate::trading::Side;
@@ -36,6 +36,10 @@ pub fn handle_key(state: &mut AppState, k: KeyEvent) -> Action {
 }
 
 fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
+    // Avoid placing repeated market orders when a key is held (we now forward `Repeat`).
+    if k.kind == KeyEventKind::Repeat {
+        return Action::None;
+    }
     let size = state.current_size();
     match k.code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
@@ -77,6 +81,7 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
 fn edit_size_mode(state: &mut AppState, k: KeyEvent) -> Action {
     match k.code {
         // Many terminals send CR/LF (`\r` / `\n`) for Return instead of `KeyCode::Enter`.
+        // With keyboard-event kinds enabled, confirm on `Press` or `Release` (see `spawn_key_reader`).
         KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') | KeyCode::Esc => {
             // Validate: keep old value if parse fails
             if state.size_input.parse::<f64>().is_err() {
@@ -157,6 +162,9 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
             Action::None
         }
         KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+            if k.kind == KeyEventKind::Repeat {
+                return Action::None;
+            }
             let price = state.limit_price_input.parse::<f64>();
             let size  = state.limit_size_input.parse::<f64>();
             match (price, size) {
@@ -198,5 +206,27 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
             Action::None
         }
         _ => Action::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn normal_mode_ignores_key_repeat() {
+        let mut state = AppState::new(5.0);
+        let ev = KeyEvent::new_with_kind(KeyCode::Char('u'), KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert!(matches!(handle_key(&mut state, ev), Action::None));
+    }
+
+    #[test]
+    fn edit_size_accepts_enter_release() {
+        let mut state = AppState::new(5.0);
+        state.input_mode = InputMode::EditSize;
+        let ev = KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+        assert!(matches!(handle_key(&mut state, ev), Action::None));
+        assert!(matches!(state.input_mode, InputMode::Normal));
     }
 }

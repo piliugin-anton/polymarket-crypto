@@ -548,6 +548,9 @@ mod tests {
             size: size.to_string(),
             price: price.to_string(),
             match_time: match_time.to_string(),
+            taker_order_id: None,
+            maker_orders: vec![],
+            trader_side: None,
         }
     }
 

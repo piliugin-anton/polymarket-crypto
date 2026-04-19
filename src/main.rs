@@ -30,7 +30,9 @@ use app::{
 };
 use config::Config;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -71,7 +73,8 @@ async fn main() -> Result<()> {
         signer = %cfg.signer_address,
         funder = %cfg.funder,
         proxy  = %net::proxy_env().as_deref().unwrap_or("<none>"),
-        "config loaded",
+        market_buy_take_profit_bps = cfg.market_buy_take_profit_bps,
+        "config loaded (take-profit after market BUY is active only if market_buy_take_profit_bps > 0)",
     );
 
     // ── subcommand dispatch (no TUI) ─────────────────────────────────
@@ -401,21 +404,60 @@ fn spawn_ticker(tx: mpsc::Sender<AppEvent>) {
 fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
     tokio::spawn(async move {
         let mut stream = EventStream::new();
-        while let Some(Ok(ev)) = stream.next().await {
-            match ev {
-                CtEvent::Key(k) if k.kind == crossterm::event::KeyEventKind::Press => {
-                    if matches!(k.code, KeyCode::Char('x') | KeyCode::Char('X')) {
-                        info!(
-                            modifiers = ?k.modifiers,
-                            "key reader: x/X KeyEvent (Press) — forwarding to main loop"
-                        );
+        loop {
+            if tx.is_closed() {
+                break;
+            }
+            match stream.next().await {
+                Some(Ok(ev)) => match ev {
+                    CtEvent::Key(k) => {
+                        // Crossterm only sets `kind` on Unix when the terminal uses the kitty-style
+                        // keyboard protocol (`REPORT_EVENT_TYPES`). Some terminals then emit **only**
+                        // `Release` for Return — we would never leave `InputMode::EditSize` and `u`/`d`
+                        // would be swallowed there. Forward `Press`/`Repeat` always, and `Release`
+                        // only for Enter (Return).
+                        let forward = matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                            || (k.kind == KeyEventKind::Release && k.code == KeyCode::Enter);
+                        if !forward {
+                            continue;
+                        }
+                        if matches!(k.code, KeyCode::Char('x') | KeyCode::Char('X')) {
+                            info!(
+                                modifiers = ?k.modifiers,
+                                "key reader: x/X KeyEvent (Press) — forwarding to main loop"
+                            );
+                        }
+                        if tx.send(AppEvent::Key(k)).await.is_err() {
+                            break;
+                        }
                     }
-                    if tx.send(AppEvent::Key(k)).await.is_err() { break; }
+                    CtEvent::Resize(_, _) => {
+                        let _ = tx.try_send(AppEvent::Tick); // redraw; never block crossterm reader
+                    }
+                    CtEvent::FocusGained => {
+                        // After minimize / tab away, some terminals drop raw mode or the event
+                        // stream returns transient I/O errors; restore tty state and redraw.
+                        if let Err(e) = enable_raw_mode() {
+                            debug!(error = %e, "enable_raw_mode after FocusGained (may be ok if not a TTY)");
+                        }
+                        let _ = tx.try_send(AppEvent::Tick);
+                    }
+                    CtEvent::FocusLost => {}
+                    _ => {}
+                },
+                Some(Err(e)) => {
+                    warn!(
+                        error = %e,
+                        "crossterm event read failed (e.g. terminal hide/show); recreating stream"
+                    );
+                    stream = EventStream::new();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                CtEvent::Resize(_, _) => {
-                    let _ = tx.try_send(AppEvent::Tick); // redraw; never block crossterm reader
+                None => {
+                    warn!("crossterm EventStream ended; recreating");
+                    stream = EventStream::new();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                _ => {}
             }
         }
     });
@@ -557,6 +599,7 @@ fn dispatch_action(
                 buy_notional,
                 0,
                 cfg.market_buy_take_profit_bps,
+                false,
             );
         }
         Action::PlaceLimit { outcome, side, price, size_usdc } => {
@@ -598,6 +641,7 @@ fn dispatch_action(
                 buy_notional,
                 exp_secs,
                 0,
+                false,
             );
         }
     }
@@ -638,8 +682,19 @@ fn spawn_order(
     buy_notional_usdc: Option<f64>,
     expiration_unix_secs: u64,
     take_profit_bps: u32,
+    // If true: GTD limit sell placed after a market buy (take-profit); used for targeted logging.
+    is_take_profit_placement: bool,
 ) {
     tokio::spawn(async move {
+        if is_take_profit_placement {
+            info!(
+                outcome = ?outcome,
+                req_shares = shares,
+                limit_price = price,
+                gtd_expiration_unix_secs = expiration_unix_secs,
+                "take-profit GTD: request task started (POST /order next)",
+            );
+        }
         let market_for_refresh = market.clone();
         let token_id = match outcome {
             Outcome::Up   => market.up_token_id,
@@ -658,10 +713,70 @@ fn spawn_order(
         let mut cli = trading.lock().await;
         match cli.place_order(args, otype).await {
             Ok(resp) => {
+                match otype {
+                    OrderType::Fak => {
+                        debug!(
+                            outcome = ?outcome,
+                            side = ?side,
+                            req_shares = shares,
+                            limit_price = price,
+                            buy_notional_usdc = ?buy_notional_usdc,
+                            take_profit_bps,
+                            success = resp.success,
+                            status = ?resp.status,
+                            order_id = ?resp.order_id,
+                            making_amount = ?resp.making_amount,
+                            taking_amount = ?resp.taking_amount,
+                            error_msg = ?resp.error,
+                            parsed_buy_fill = ?match side {
+                                Side::Buy => resp.matched_buy_fill_shares_and_avg_price(),
+                                Side::Sell => None,
+                            },
+                            "CLOB FAK (market) order response"
+                        );
+                    }
+                    OrderType::Gtd => {
+                        if is_take_profit_placement {
+                            info!(
+                                outcome = ?outcome,
+                                side = ?side,
+                                req_shares = shares,
+                                limit_price = price,
+                                gtd_expiration_unix_secs = expiration_unix_secs,
+                                success = resp.success,
+                                status = ?resp.status,
+                                order_id = ?resp.order_id,
+                                making_amount = ?resp.making_amount,
+                                taking_amount = ?resp.taking_amount,
+                                error_msg = ?resp.error,
+                                "CLOB take-profit GTD (limit sell) order response"
+                            );
+                        } else {
+                            debug!(
+                                outcome = ?outcome,
+                                side = ?side,
+                                req_shares = shares,
+                                limit_price = price,
+                                buy_notional_usdc = ?buy_notional_usdc,
+                                gtd_expiration_unix_secs = expiration_unix_secs,
+                                success = resp.success,
+                                status = ?resp.status,
+                                order_id = ?resp.order_id,
+                                making_amount = ?resp.making_amount,
+                                taking_amount = ?resp.taking_amount,
+                                error_msg = ?resp.error,
+                                parsed_buy_fill = ?resp.matched_buy_fill_shares_and_avg_price(),
+                                "CLOB GTD (limit) order response"
+                            );
+                        }
+                    }
+                    _ => {}
+                }
                 // HTTP 200 may still have `success: false`; resting limits often use `status: "live"`.
                 let ok_ui = resp.success
                     || resp.status.as_ref().is_some_and(|s| {
                         s.eq_ignore_ascii_case("matched")
+                            || s.eq_ignore_ascii_case("delayed")
                             || s.eq_ignore_ascii_case("live")
                             || s.eq_ignore_ascii_case("open")
                     });
@@ -675,18 +790,47 @@ fn spawn_order(
                         && matches!(side, Side::Buy)
                         && otype == OrderType::Fak
                     {
-                        let fill = resp.matched_buy_fill_shares_and_avg_price().or_else(|| {
-                            resp.status.as_deref().and_then(|s| {
-                                s.eq_ignore_ascii_case("matched").then_some((shares, price))
-                            })
-                        });
-                        let Some((sell_shares, entry_px)) = fill else {
+                        info!(
+                            take_profit_bps,
+                            outcome = ?outcome,
+                            "take-profit: market BUY succeeded; evaluating GTD limit sell",
+                        );
+                        let Some((sell_shares, entry_px, amounts_from_api)) =
+                            resp.take_profit_fill_for_market_buy(shares, price)
+                        else {
+                            info!(
+                                outcome = ?outcome,
+                                success = resp.success,
+                                status = ?resp.status,
+                                "take-profit: skipped — could not estimate fill (see StatusInfo in TUI)",
+                            );
+                            let _ = tx
+                                .send(AppEvent::StatusInfo(
+                                    "take-profit skipped: no fill amounts and order not in an \
+                                     executable state (unexpected for FAK)"
+                                        .into(),
+                                ))
+                                .await;
                             return;
                         };
+                        if !amounts_from_api {
+                            let _ = tx
+                                .send(AppEvent::StatusInfo(
+                                    "take-profit: CLOB omitted fill amounts; using order size \
+                                     and limit price as fill estimate"
+                                        .into(),
+                                ))
+                                .await;
+                        }
                         let tp_px = clamp_prob(
                             entry_px * (1.0 + take_profit_bps as f64 / 10_000.0),
                         );
                         if sell_shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+                            info!(
+                                sell_shares,
+                                min_shares = MIN_LIMIT_ORDER_SHARES,
+                                "take-profit: skipped — fill below min limit order size",
+                            );
                             let _ = tx
                                 .send(AppEvent::StatusInfo(format!(
                                     "take-profit skipped: fill {sell_shares:.2} sh < min {:.0} sh",
@@ -699,33 +843,130 @@ fn spawn_order(
                             ) {
                                 Ok(s) => s,
                                 Err(e) => {
+                                    warn!(error = %e, "take-profit: skipped — GTD expiration computation failed");
                                     let _ = tx
                                         .send(AppEvent::OrderErr(format!("take-profit limit: {e}")))
                                         .await;
                                     return;
                                 }
                             };
-                            spawn_order(
-                                trading.clone(),
-                                tx.clone(),
-                                market_for_refresh,
-                                outcome,
-                                Side::Sell,
+                            info!(
                                 sell_shares,
-                                tp_px,
-                                OrderType::Gtd,
-                                None,
-                                exp_secs,
-                                0,
+                                entry_px,
+                                tp_limit_px = tp_px,
+                                gtd_expiration_unix_secs = exp_secs,
+                                outcome = ?outcome,
+                                "take-profit: scheduling GTD limit SELL (spawn_order)",
                             );
+                            let tp_token_id = match outcome {
+                                Outcome::Up => market_for_refresh.up_token_id.clone(),
+                                Outcome::Down => market_for_refresh.down_token_id.clone(),
+                            };
+                            match cli
+                                .wait_for_take_profit_sell_shares(
+                                    &market_for_refresh.condition_id,
+                                    &tp_token_id,
+                                    sell_shares,
+                                    MIN_LIMIT_ORDER_SHARES,
+                                    resp.order_id.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok(tp_sell_shares) => {
+                                    spawn_order(
+                                        trading.clone(),
+                                        tx.clone(),
+                                        market_for_refresh,
+                                        outcome,
+                                        Side::Sell,
+                                        tp_sell_shares,
+                                        tp_px,
+                                        OrderType::Gtd,
+                                        None,
+                                        exp_secs,
+                                        0,
+                                        true,
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        outcome = ?outcome,
+                                        "take-profit: skipped — conditional balance not ready in time"
+                                    );
+                                    let _ = tx
+                                        .send(AppEvent::OrderErr(format!("take-profit: {e}")))
+                                        .await;
+                                }
+                            }
                         }
                     }
                 } else {
                     let msg = resp.error.unwrap_or_else(|| format!("status={:?}", resp.status));
+                    if is_take_profit_placement {
+                        warn!(
+                            outcome = ?outcome,
+                            side = ?side,
+                            order_type = ?otype,
+                            success = resp.success,
+                            status = ?resp.status,
+                            order_id = ?resp.order_id,
+                            error_msg = %msg,
+                            "CLOB take-profit GTD order rejected (HTTP OK, error in response body)"
+                        );
+                    } else {
+                        warn!(
+                            outcome = ?outcome,
+                            side = ?side,
+                            order_type = ?otype,
+                            success = resp.success,
+                            status = ?resp.status,
+                            order_id = ?resp.order_id,
+                            error_msg = %msg,
+                            "CLOB order rejected (HTTP OK, error in response body)"
+                        );
+                    }
                     let _ = tx.send(AppEvent::OrderErr(msg)).await;
                 }
             }
             Err(e) => {
+                if is_take_profit_placement {
+                    warn!(
+                        error = %e,
+                        outcome = ?outcome,
+                        side = ?side,
+                        req_shares = shares,
+                        limit_price = price,
+                        gtd_expiration_unix_secs = expiration_unix_secs,
+                        "CLOB take-profit GTD order request failed"
+                    );
+                } else {
+                    match otype {
+                        OrderType::Fak => {
+                            debug!(
+                                error = %e,
+                                outcome = ?outcome,
+                                side = ?side,
+                                req_shares = shares,
+                                limit_price = price,
+                                take_profit_bps,
+                                "CLOB FAK (market) order request failed"
+                            );
+                        }
+                        OrderType::Gtd => {
+                            debug!(
+                                error = %e,
+                                outcome = ?outcome,
+                                side = ?side,
+                                req_shares = shares,
+                                limit_price = price,
+                                gtd_expiration_unix_secs = expiration_unix_secs,
+                                "CLOB GTD (limit) order request failed"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 let _ = tx.send(AppEvent::OrderErr(e.to_string())).await;
             }
         }

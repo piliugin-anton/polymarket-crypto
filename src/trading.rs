@@ -19,6 +19,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::str::FromStr;
+use std::time::Duration;
 use tracing::debug;
 
 use crate::config::{
@@ -144,14 +145,14 @@ pub struct ApiCreds {
 #[derive(Debug, Deserialize)]
 pub struct PostOrderResponse {
     #[serde(default)] pub success:  bool,
-    #[serde(default)] #[serde(rename = "orderID")]
-    #[allow(dead_code)]
+    #[serde(default)]
+    #[serde(rename = "orderID")]
     pub order_id: Option<String>,
     #[serde(default)] pub status:   Option<String>,
-    /// USDC leg for BUY, shares leg for SELL — 1e6 fixed decimals (see Polymarket `SendOrderResponse`).
+    /// Matched **BUY**: USDC spent (decimal string). Matched **SELL**: shares sold — see API response.
     #[serde(default, rename = "makingAmount")]
     pub making_amount: Option<String>,
-    /// Shares leg for BUY, USDC leg for SELL — 1e6 fixed decimals.
+    /// Matched **BUY**: shares received (decimal string). Matched **SELL**: USDC — see API response.
     #[serde(default, rename = "takingAmount")]
     pub taking_amount: Option<String>,
     #[serde(default, rename = "errorMsg")]
@@ -159,19 +160,67 @@ pub struct PostOrderResponse {
 }
 
 impl PostOrderResponse {
-    /// After a matched **BUY**: filled shares and average price from `makingAmount` / `takingAmount`.
+    /// After a matched **BUY**: `makingAmount` is USDC, `takingAmount` is shares (Polymarket
+    /// `SendOrderResponse` decimal strings — **not** scaled by 1e6).
     pub fn matched_buy_fill_shares_and_avg_price(&self) -> Option<(f64, f64)> {
         let mk = self.making_amount.as_ref()?.trim();
         let tk = self.taking_amount.as_ref()?.trim();
         if mk.is_empty() || tk.is_empty() {
             return None;
         }
-        let maker_usdc = mk.parse::<f64>().ok()? / 1_000_000.0;
-        let taker_sh = tk.parse::<f64>().ok()? / 1_000_000.0;
+        let maker_usdc = mk.parse::<f64>().ok()?;
+        let taker_sh = tk.parse::<f64>().ok()?;
         if taker_sh <= 1e-12 || !maker_usdc.is_finite() {
             return None;
         }
         Some((taker_sh, maker_usdc / taker_sh))
+    }
+
+    /// If parsed shares are nonsense vs the submitted order (wrong field order, partial parse),
+    /// fall back to request-sized estimates.
+    fn parsed_buy_fill_plausible(parsed_sh: f64, req_shares: f64) -> bool {
+        if !parsed_sh.is_finite() || parsed_sh <= 0.0 {
+            return false;
+        }
+        if req_shares <= 1e-9 {
+            return parsed_sh > 1e-15;
+        }
+        // Absolute dust when the user clearly submitted a normal-sized ticket.
+        if req_shares >= 0.1 && parsed_sh < 1e-3 {
+            return false;
+        }
+        // Parsed share count orders of magnitude below request → wrong scale / swapped fields.
+        if req_shares >= 0.05 && parsed_sh / req_shares < 1e-5 {
+            return false;
+        }
+        true
+    }
+
+    /// Filled shares + avg price for a **market BUY** (FAK), used to place take-profit.
+    ///
+    /// Prefer `makingAmount` / `takingAmount`. If those are missing or empty, fall back to the
+    /// submitted size and limit when the response indicates execution (`matched`, `delayed`, or
+    /// `success`). Returns `None` for resting `live` / `open` (no reliable fill yet).
+    ///
+    /// Second bool: `true` if amounts came from the API, `false` if estimated from the request.
+    pub fn take_profit_fill_for_market_buy(
+        &self,
+        req_shares: f64,
+        req_limit_price: f64,
+    ) -> Option<(f64, f64, bool)> {
+        if let Some((sh, px)) = self.matched_buy_fill_shares_and_avg_price() {
+            if Self::parsed_buy_fill_plausible(sh, req_shares) {
+                return Some((sh, px, true));
+            }
+            // Ignore implausible parse; use request-sized fallback below (same as missing amounts).
+        }
+        let st = self.status.as_deref().map(|s| s.to_ascii_lowercase());
+        match st.as_deref() {
+            Some("matched") | Some("delayed") => Some((req_shares, req_limit_price, false)),
+            Some("live") | Some("open") => None,
+            _ if self.success => Some((req_shares, req_limit_price, false)),
+            _ => None,
+        }
     }
 }
 
@@ -182,8 +231,17 @@ struct FeeRateResponse {
     base_fee: u64,
 }
 
+/// One maker leg inside a Polymarket `Trade` (`maker_orders` in REST / TS `MakerOrder`).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ClobMakerOrder {
+    #[serde(default, rename = "order_id", alias = "orderID", alias = "orderId")]
+    pub order_id: String,
+    #[serde(default, rename = "matched_amount", alias = "matchedAmount")]
+    pub matched_amount: String,
+}
+
 /// Polymarket `clob-client-v2` `GET /data/trades` — one row per user fill (L2 auth).
-/// Shape matches `Trade` in `clob-client-v2` `types/clob.ts`.
+/// Shape matches `Trade` in `clob-client-v2` `types/clob.ts` (extra fields optional for older payloads).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClobTrade {
     pub id: String,
@@ -194,6 +252,14 @@ pub struct ClobTrade {
     pub price: String,
     #[serde(alias = "matchTime")]
     pub match_time: String,
+    /// When the authenticated user was **taker**, this matches `orderID` from `postOrder`.
+    #[serde(default, rename = "taker_order_id", alias = "takerOrderId")]
+    pub taker_order_id: Option<String>,
+    #[serde(default, rename = "maker_orders", alias = "makerOrders")]
+    pub maker_orders: Vec<ClobMakerOrder>,
+    /// `"TAKER"` | `"MAKER"` — disambiguates which leg to use with `order_id`.
+    #[serde(default, rename = "trader_side", alias = "traderSide")]
+    pub trader_side: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +296,161 @@ struct OrdersPage {
 const TRADES_INITIAL_CURSOR: &str = "MA==";
 const TRADES_END_CURSOR: &str = "LTE=";
 
+fn parse_clob_side_str(s: &str) -> Option<Side> {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "BUY" => Some(Side::Buy),
+        "SELL" => Some(Side::Sell),
+        _ => None,
+    }
+}
+
+fn norm_order_id_fragment(s: &str) -> String {
+    s.trim().trim_start_matches("0x").to_ascii_lowercase()
+}
+
+/// Compare Polymarket order ids from `orderID` / `taker_order_id` / `maker_orders.order_id`.
+fn order_ids_match(a: &str, b: &str) -> bool {
+    let a = norm_order_id_fragment(a);
+    let b = norm_order_id_fragment(b);
+    !a.is_empty() && a == b
+}
+
+/// Sum **BUY** fill size for `token_id` across trades that reference `buy_order_id`
+/// ([Polymarket L2 `Trade`](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
+/// Returns `None` if no matching fill row exists yet.
+fn buy_fill_shares_from_trades_for_order(
+    trades: &[ClobTrade],
+    buy_order_id: &str,
+    token_id: &str,
+) -> Option<f64> {
+    if buy_order_id.trim().is_empty() {
+        return None;
+    }
+    let mut sum = 0.0_f64;
+    for t in trades {
+        if t.asset_id != token_id {
+            continue;
+        }
+        if parse_clob_side_str(&t.side) != Some(Side::Buy) {
+            continue;
+        }
+        let role = t.trader_side.as_deref().map(|s| s.trim().to_ascii_uppercase());
+
+        match role.as_deref() {
+            Some("TAKER") => {
+                if let Some(ref toid) = t.taker_order_id {
+                    if order_ids_match(toid, buy_order_id) {
+                        if let Ok(sz) = t.size.parse::<f64>() {
+                            if sz.is_finite() && sz > 0.0 {
+                                sum += sz;
+                            }
+                        }
+                    }
+                }
+            }
+            Some("MAKER") => {
+                for mo in &t.maker_orders {
+                    if order_ids_match(&mo.order_id, buy_order_id) {
+                        let amt = mo.matched_amount.trim();
+                        if amt.is_empty() {
+                            continue;
+                        }
+                        if let Ok(sz) = amt.parse::<f64>() {
+                            if sz.is_finite() && sz > 0.0 {
+                                sum += sz;
+                            }
+                        }
+                    }
+                }
+            }
+            Some(_) | None => {
+                let mut matched_taker = false;
+                if let Some(ref toid) = t.taker_order_id {
+                    if order_ids_match(toid, buy_order_id) {
+                        if let Ok(sz) = t.size.parse::<f64>() {
+                            if sz.is_finite() && sz > 0.0 {
+                                sum += sz;
+                                matched_taker = true;
+                            }
+                        }
+                    }
+                }
+                if !matched_taker {
+                    for mo in &t.maker_orders {
+                        if order_ids_match(&mo.order_id, buy_order_id) {
+                            let amt = mo.matched_amount.trim();
+                            if amt.is_empty() {
+                                continue;
+                            }
+                            if let Ok(sz) = amt.parse::<f64>() {
+                                if sz.is_finite() && sz > 0.0 {
+                                    sum += sz;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (sum > 0.0).then_some(sum)
+}
+
+/// Net outcome-token shares implied by `GET /data/trades` for this `asset_id` (buys − sells).
+fn net_shares_on_token_from_trades(trades: &[ClobTrade], token_id: &str) -> f64 {
+    let mut sh = 0.0_f64;
+    for t in trades {
+        if t.asset_id != token_id {
+            continue;
+        }
+        let Some(side) = parse_clob_side_str(&t.side) else {
+            continue;
+        };
+        let Ok(qty) = t.size.parse::<f64>() else {
+            continue;
+        };
+        if !qty.is_finite() || qty <= 0.0 {
+            continue;
+        }
+        match side {
+            Side::Buy => sh += qty,
+            Side::Sell => sh -= qty,
+        }
+    }
+    sh.max(0.0)
+}
+
+/// Reconcile desired take-profit size with **conditional** balance and trade replay (see Polymarket
+/// `GET /data/trades`). Avoids insisting on `takingAmount` when it rounds above wallet/trades.
+fn take_profit_sell_cap(need: f64, bal: f64, replay: f64) -> f64 {
+    const EPS: f64 = 1e-9;
+    let bal = if bal.is_finite() { bal.max(0.0) } else { 0.0 };
+    let replay = if replay.is_finite() { replay.max(0.0) } else { 0.0 };
+    let tol = f64::max(0.02, 0.02 * f64::max(need, f64::max(bal, replay)));
+
+    let sell_cap = match (bal > EPS, replay > EPS) {
+        (true, true) => {
+            if replay + tol < bal {
+                // Trade list not caught up — trust `bal` over stale replay.
+                need.min(bal)
+            } else if bal + tol < replay {
+                // Replay can exceed wallet (fees / rounding / API vs chain). Never size above `bal`.
+                need.min(bal).min(replay)
+            } else {
+                need.min(bal).min(replay)
+            }
+        }
+        (true, false) => need.min(bal),
+        (false, true) => need.min(replay),
+        (false, false) => 0.0,
+    };
+    if sell_cap.is_finite() {
+        sell_cap.max(0.0)
+    } else {
+        0.0
+    }
+}
+
 /// `GET /balance-allowance` — Polymarket `clob-client-v2` `getBalanceAllowance`.
 #[derive(Debug, Deserialize)]
 struct BalanceAllowanceResponse {
@@ -247,6 +468,15 @@ fn json_balance_to_raw(v: &Option<serde_json::Value>) -> u128 {
         _ => 0,
     }
 }
+
+fn balance_allowance_error_text(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("not enough balance") || lower.contains("balance / allowance")
+}
+
+/// Settle times (ms) after `GET /balance-allowance/update` before POST **SELL**. GTD take-profit
+/// right after a FAK BUY often needs multi-second CLOB cache catch-up.
+const SELL_ORDER_PREP_SETTLE_MS: [u64; 5] = [450, 900, 1_800, 3_000, 5_000];
 
 // ── Client ──────────────────────────────────────────────────────────
 
@@ -648,6 +878,146 @@ impl TradingClient {
         Ok(shares)
     }
 
+    /// Double `balance-allowance/update` + pause so POST **SELL** validation sees non-stale inventory
+    /// (take-profit immediately after BUY is the worst case).
+    async fn prime_conditional_cache_before_sell_post(&mut self, token_id: &str) -> Result<()> {
+        self.update_conditional_balance_allowance(token_id).await?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        self.update_conditional_balance_allowance(token_id).await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        Ok(())
+    }
+
+    /// After a market **BUY**, wait until we can size a take-profit **SELL** safely.
+    ///
+    /// Combines `GET /balance-allowance` (CONDITIONAL) with Polymarket `GET /data/trades` so we:
+    /// - do not block on `takingAmount` when it is slightly above wallet/trade replay, and
+    /// - can proceed when fills appear in trade history before the balance endpoint updates.
+    ///
+    /// When `buy_order_id` is set (`orderID` from the BUY response), we **require** a matching row
+    /// in `/data/trades` (`taker_order_id` / `maker_orders[].order_id`) before sizing, and cap
+    /// `want_shares` by that fill sum.
+    ///
+    /// Returns the **share count to pass into the GTD sell** (≤ `want_shares`).
+    pub async fn wait_for_take_profit_sell_shares(
+        &mut self,
+        condition_id: &str,
+        token_id: &str,
+        want_shares: f64,
+        min_executable: f64,
+        buy_order_id: Option<&str>,
+    ) -> Result<f64> {
+        const MAX_ATTEMPTS: u32 = 40;
+        const DELAY_MS: u64 = 250;
+        if !want_shares.is_finite() || want_shares <= 0.0 {
+            return self.fetch_conditional_balance_shares(token_id).await;
+        }
+        if !min_executable.is_finite() || min_executable <= 0.0 {
+            bail!("min_executable must be positive");
+        }
+        let need = want_shares;
+        let require_trade_for_order = buy_order_id.is_some_and(|s| !s.trim().is_empty());
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let bal = self.fetch_conditional_balance_shares(token_id).await?;
+            let trades = self.fetch_trades_for_market(condition_id).await?;
+            let order_fill = match buy_order_id {
+                Some(oid) if !oid.trim().is_empty() => {
+                    buy_fill_shares_from_trades_for_order(&trades, oid, token_id)
+                }
+                _ => None,
+            };
+
+            if require_trade_for_order && order_fill.is_none() {
+                tracing::debug!(
+                    attempt,
+                    buy_order_id = ?buy_order_id,
+                    "take-profit: waiting for BUY orderID to appear in /data/trades"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+                continue;
+            }
+
+            let need_for_cap = order_fill
+                .map(|f| want_shares.min(f))
+                .unwrap_or(want_shares);
+            let replay = net_shares_on_token_from_trades(&trades, token_id);
+            let sell_cap = take_profit_sell_cap(need_for_cap, bal, replay);
+
+            if sell_cap + 1e-6 >= min_executable {
+                if sell_cap + 1e-6 < need {
+                    tracing::info!(
+                        attempt,
+                        want = need,
+                        need_for_cap,
+                        order_fill,
+                        bal,
+                        replay,
+                        sell_cap,
+                        "take-profit: sell size reconciled (order fill + balance / trades replay)"
+                    );
+                } else if attempt > 0 {
+                    tracing::info!(
+                        attempt,
+                        bal,
+                        replay,
+                        sell_cap,
+                        order_fill,
+                        "take-profit: inventory ready for GTD sell (balance + trades)"
+                    );
+                }
+                self.prime_conditional_cache_before_sell_post(token_id).await?;
+                return Ok(sell_cap);
+            }
+            tracing::debug!(
+                attempt,
+                bal,
+                replay,
+                need,
+                need_for_cap,
+                order_fill,
+                sell_cap,
+                min_executable,
+                "waiting for take-profit inventory (balance + /data/trades vs min size)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+        }
+
+        let bal = self.fetch_conditional_balance_shares(token_id).await?;
+        let trades = self.fetch_trades_for_market(condition_id).await?;
+        let order_fill = match buy_order_id {
+            Some(oid) if !oid.trim().is_empty() => {
+                buy_fill_shares_from_trades_for_order(&trades, oid, token_id)
+            }
+            _ => None,
+        };
+        if require_trade_for_order && order_fill.is_none() {
+            return Err(anyhow!(
+                "take-profit: BUY orderID {:?} not found in /data/trades after ~{}ms",
+                buy_order_id,
+                u64::from(MAX_ATTEMPTS) * DELAY_MS
+            ));
+        }
+        let need_for_cap = order_fill
+            .map(|f| want_shares.min(f))
+            .unwrap_or(want_shares);
+        let replay = net_shares_on_token_from_trades(&trades, token_id);
+        let sell_cap = take_profit_sell_cap(need_for_cap, bal, replay);
+        if sell_cap + 1e-6 >= min_executable {
+            self.prime_conditional_cache_before_sell_post(token_id).await?;
+            return Ok(sell_cap);
+        }
+        Err(anyhow!(
+            "take-profit: only {:.6} sh sellable (want {:.6}, bal {:.6}, trades-replay {:.6}, min {:.1}) after ~{}ms",
+            sell_cap,
+            need,
+            bal,
+            replay,
+            min_executable,
+            u64::from(MAX_ATTEMPTS) * DELAY_MS
+        ))
+    }
+
     /// USDC **collateral** balance + spending allowance (`GET /balance-allowance`, `asset_type=COLLATERAL`).
     ///
     /// Raw amounts use **6 decimals** (same as conditional shares in this client). The allowance
@@ -787,210 +1157,299 @@ impl TradingClient {
     }
 
     /// Build + sign an order and POST it to the CLOB.
-    pub async fn place_order(&mut self, args: OrderArgs, order_type: OrderType)
+    pub async fn place_order(&mut self, mut args: OrderArgs, order_type: OrderType)
         -> Result<PostOrderResponse>
     {
-        let creds = self.ensure_creds().await?;
-        let fee_bps = self.fetch_fee_rate_bps(&args.token_id).await?;
-
-        let expiration_u256 = match order_type {
-            OrderType::Gtd => {
-                if args.expiration_unix_secs == 0 {
-                    bail!("GTD order requires non-zero expiration_unix_secs");
-                }
-                U256::from(args.expiration_unix_secs)
-            }
-            _ => {
-                if args.expiration_unix_secs != 0 {
-                    bail!("expiration_unix_secs must be 0 for {:?}", order_type);
-                }
-                U256::ZERO
-            }
-        };
-        let expiration_wire = match order_type {
-            OrderType::Gtd => args.expiration_unix_secs.to_string(),
-            _ => "0".into(),
-        };
-
-        // 1. Compute maker/taker amounts from price+size (tick-aware — see `getOrderRawAmounts`).
-        let (maker_amount, taker_amount) = amounts_for(
-            args.side,
-            args.size,
-            args.price,
-            &args.tick_size,
-            args.buy_notional_usdc,
-            order_type,
-        );
-
-        // 2. Salt — must fit in JS `Number` (see `orderToJsonV1` / `orderToJsonV2` `parseInt`).
-        let ts_ms = chrono::Utc::now().timestamp_millis();
-        let salt = (rand::random::<f64>() * ts_ms as f64).round() as u64;
-
-        let api_version = self.fetch_clob_order_version().await?;
-        if order_type == OrderType::Gtd && api_version != 1 {
-            bail!(
-                "GTD orders need CLOB signing API version 1 (EIP-712 includes expiration); server returned {api_version}"
-            );
+        if matches!(order_type, OrderType::Gtc | OrderType::Gtd) {
+            args.price = snap_limit_order_price_to_tick(args.price, &args.tick_size);
         }
-        let token_id_u256 = U256::from_str(&args.token_id).context("token_id")?;
 
-        let verifying_v1 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V1 } else { CTF_EXCHANGE_V1 };
-        let verifying_v2 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V2 } else { CTF_EXCHANGE_V2 };
-
-        const PUBLIC_TAKER: &str = "0x0000000000000000000000000000000000000000";
-        const ZERO32: &str =
-            "0x0000000000000000000000000000000000000000000000000000000000000000";
-
-        let body = match api_version {
-            1 => {
-                // EIP-712 V1 — `exchangeOrderBuilderV1.ts` + `ctfExchangeV1TypedData.ts`
-                let verifying_addr = Address::from_str(verifying_v1)?;
-                let order = clob_order_v1::Order {
-                    salt: U256::from(salt),
-                    maker: self.config.funder,
-                    signer: self.signer.address(),
-                    taker: Address::ZERO,
-                    tokenId: token_id_u256,
-                    makerAmount: maker_amount,
-                    takerAmount: taker_amount,
-                    expiration: expiration_u256,
-                    nonce: U256::ZERO,
-                    feeRateBps: U256::from(fee_bps),
-                    side: args.side.as_u8(),
-                    signatureType: self.config.sig_type as u8,
-                };
-                let dom = domain_v1(verifying_addr);
-                let hash = order.eip712_signing_hash(&dom);
-                let sig = self.signer.sign_hash(&hash).await?;
-                let sig_hex = format!("0x{}", hex::encode(sig.as_bytes()));
-
-                #[derive(Serialize)]
-                struct OrderPayloadV1<'a> {
-                    #[serde(rename = "deferExec")] defer_exec: bool,
-                    #[serde(rename = "postOnly")] post_only: bool,
-                    order: OrderWireV1,
-                    owner: &'a str,
-                    #[serde(rename = "orderType")] order_type: &'a str,
-                }
-                #[derive(Serialize)]
-                struct OrderWireV1 {
-                    salt: u64,
-                    maker: String,
-                    signer: String,
-                    taker: String,
-                    #[serde(rename = "tokenId")] token_id: String,
-                    #[serde(rename = "makerAmount")] maker_amount: String,
-                    #[serde(rename = "takerAmount")] taker_amount: String,
-                    side: String,
-                    expiration: String,
-                    nonce: String,
-                    #[serde(rename = "feeRateBps")] fee_rate_bps: String,
-                    #[serde(rename = "signatureType")] signature_type: u8,
-                    signature: String,
-                }
-                let payload = OrderPayloadV1 {
-                    defer_exec: false,
-                    post_only: false,
-                    order: OrderWireV1 {
-                        salt,
-                        maker: format!("{:#x}", order.maker),
-                        signer: format!("{:#x}", order.signer),
-                        taker: PUBLIC_TAKER.into(),
-                        token_id: order.tokenId.to_string(),
-                        maker_amount: order.makerAmount.to_string(),
-                        taker_amount: order.takerAmount.to_string(),
-                        side: args.side.as_str().to_string(),
-                        expiration: expiration_wire.clone(),
-                        nonce: "0".into(),
-                        fee_rate_bps: fee_bps.to_string(),
-                        signature_type: self.config.sig_type as u8,
-                        signature: sig_hex,
-                    },
-                    owner: &creds.api_key,
-                    order_type: order_type.as_str(),
-                };
-                serde_json::to_string(&payload)?
-            }
-            2 => {
-                // EIP-712 V2 — `exchangeOrderBuilderV2.ts` + `ctfExchangeV2TypedData.ts`
-                let verifying_addr = Address::from_str(verifying_v2)?;
-                let ts_u256 = U256::from(ts_ms as u128);
-                let order = clob_order_v2::Order {
-                    salt: U256::from(salt),
-                    maker: self.config.funder,
-                    signer: self.signer.address(),
-                    tokenId: token_id_u256,
-                    makerAmount: maker_amount,
-                    takerAmount: taker_amount,
-                    side: args.side.as_u8(),
-                    signatureType: self.config.sig_type as u8,
-                    timestamp: ts_u256,
-                    metadata: B256::ZERO,
-                    builder: B256::ZERO,
-                };
-                let dom = domain_v2(verifying_addr);
-                let hash = order.eip712_signing_hash(&dom);
-                let sig = self.signer.sign_hash(&hash).await?;
-                let sig_hex = format!("0x{}", hex::encode(sig.as_bytes()));
-
-                #[derive(Serialize)]
-                struct OrderPayloadV2<'a> {
-                    #[serde(rename = "deferExec")] defer_exec: bool,
-                    #[serde(rename = "postOnly")] post_only: bool,
-                    order: OrderWireV2,
-                    owner: &'a str,
-                    #[serde(rename = "orderType")] order_type: &'a str,
-                }
-                #[derive(Serialize)]
-                struct OrderWireV2 {
-                    salt: u64,
-                    maker: String,
-                    signer: String,
-                    taker: String,
-                    #[serde(rename = "tokenId")] token_id: String,
-                    #[serde(rename = "makerAmount")] maker_amount: String,
-                    #[serde(rename = "takerAmount")] taker_amount: String,
-                    side: String,
-                    expiration: String,
-                    nonce: String,
-                    #[serde(rename = "signatureType")] signature_type: u8,
-                    signature: String,
-                    timestamp: String,
-                    metadata: String,
-                    builder: String,
-                }
-                let payload = OrderPayloadV2 {
-                    defer_exec: false,
-                    post_only: false,
-                    order: OrderWireV2 {
-                        salt,
-                        maker: format!("{:#x}", order.maker),
-                        signer: format!("{:#x}", order.signer),
-                        taker: PUBLIC_TAKER.into(),
-                        token_id: order.tokenId.to_string(),
-                        maker_amount: order.makerAmount.to_string(),
-                        taker_amount: order.takerAmount.to_string(),
-                        side: args.side.as_str().to_string(),
-                        expiration: expiration_wire,
-                        nonce: "0".into(),
-                        signature_type: self.config.sig_type as u8,
-                        signature: sig_hex,
-                        timestamp: ts_ms.to_string(),
-                        metadata: ZERO32.into(),
-                        builder: ZERO32.into(),
-                    },
-                    owner: &creds.api_key,
-                    order_type: order_type.as_str(),
-                };
-                serde_json::to_string(&payload)?
-            }
-            v => bail!("CLOB GET /version returned unsupported order version {v}"),
+        // SELL transfers conditional tokens the CLOB reads from a **cached** `balance-allowance`
+        // snapshot. Without `GET /balance-allowance/update` first, validation often sees `balance: 0`
+        // right after a BUY fill (Polymarket docs + clob-client#128).
+        let max_post_attempts: u32 = if matches!(args.side, Side::Sell) {
+            SELL_ORDER_PREP_SETTLE_MS.len() as u32
+        } else {
+            1
         };
 
-        self.post_order_http(&creds, body).await
+        for post_attempt in 0..max_post_attempts {
+            if matches!(args.side, Side::Sell) {
+                self.update_conditional_balance_allowance(&args.token_id).await?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                self.update_conditional_balance_allowance(&args.token_id).await?;
+                let settle_idx = post_attempt as usize;
+                let settle_idx = settle_idx.min(SELL_ORDER_PREP_SETTLE_MS.len() - 1);
+                tokio::time::sleep(Duration::from_millis(SELL_ORDER_PREP_SETTLE_MS[settle_idx]))
+                    .await;
+
+                let bal = self.fetch_conditional_balance_shares(&args.token_id).await?;
+                if bal < 1e-6
+                    && args.size > 1e-9
+                    && post_attempt + 1 < max_post_attempts
+                {
+                    tracing::warn!(
+                        post_attempt,
+                        bal,
+                        size = args.size,
+                        token_id = %args.token_id,
+                        "CLOB conditional balance read 0 after update+settle; retry before SELL POST"
+                    );
+                    continue;
+                }
+                if args.size > bal + 1e-12 {
+                    tracing::debug!(
+                        post_attempt,
+                        before = args.size,
+                        bal,
+                        "SELL size clamped to conditional balance (GET /balance-allowance)"
+                    );
+                    args.size = bal;
+                }
+            }
+
+            let creds = self.ensure_creds().await?;
+            let fee_bps = self.fetch_fee_rate_bps(&args.token_id).await?;
+
+            let expiration_u256 = match order_type {
+                OrderType::Gtd => {
+                    if args.expiration_unix_secs == 0 {
+                        bail!("GTD order requires non-zero expiration_unix_secs");
+                    }
+                    U256::from(args.expiration_unix_secs)
+                }
+                _ => {
+                    if args.expiration_unix_secs != 0 {
+                        bail!("expiration_unix_secs must be 0 for {:?}", order_type);
+                    }
+                    U256::ZERO
+                }
+            };
+            let expiration_wire = match order_type {
+                OrderType::Gtd => args.expiration_unix_secs.to_string(),
+                _ => "0".into(),
+            };
+
+            // 1. Compute maker/taker amounts from price+size (tick-aware — see `getOrderRawAmounts`).
+            let (maker_amount, taker_amount) = amounts_for(
+                args.side,
+                args.size,
+                args.price,
+                &args.tick_size,
+                args.buy_notional_usdc,
+                order_type,
+            );
+
+            // 2. Salt — must fit in JS `Number` (see `orderToJsonV1` / `orderToJsonV2` `parseInt`).
+            let ts_ms = chrono::Utc::now().timestamp_millis();
+            let salt = (rand::random::<f64>() * ts_ms as f64).round() as u64;
+
+            let api_version = self.fetch_clob_order_version().await?;
+            if order_type == OrderType::Gtd && api_version != 1 {
+                bail!(
+                    "GTD orders need CLOB signing API version 1 (EIP-712 includes expiration); server returned {api_version}"
+                );
+            }
+            let token_id_u256 = U256::from_str(&args.token_id).context("token_id")?;
+
+            let verifying_v1 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V1 } else { CTF_EXCHANGE_V1 };
+            let verifying_v2 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V2 } else { CTF_EXCHANGE_V2 };
+
+            const PUBLIC_TAKER: &str = "0x0000000000000000000000000000000000000000";
+            const ZERO32: &str =
+                "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+            let body = match api_version {
+                1 => {
+                    // EIP-712 V1 — `exchangeOrderBuilderV1.ts` + `ctfExchangeV1TypedData.ts`
+                    let verifying_addr = Address::from_str(verifying_v1)?;
+                    let order = clob_order_v1::Order {
+                        salt: U256::from(salt),
+                        maker: self.config.funder,
+                        signer: self.signer.address(),
+                        taker: Address::ZERO,
+                        tokenId: token_id_u256,
+                        makerAmount: maker_amount,
+                        takerAmount: taker_amount,
+                        expiration: expiration_u256,
+                        nonce: U256::ZERO,
+                        feeRateBps: U256::from(fee_bps),
+                        side: args.side.as_u8(),
+                        signatureType: self.config.sig_type as u8,
+                    };
+                    let dom = domain_v1(verifying_addr);
+                    let hash = order.eip712_signing_hash(&dom);
+                    let sig = self.signer.sign_hash(&hash).await?;
+                    let sig_hex = format!("0x{}", hex::encode(sig.as_bytes()));
+
+                    #[derive(Serialize)]
+                    struct OrderPayloadV1<'a> {
+                        #[serde(rename = "deferExec")] defer_exec: bool,
+                        #[serde(rename = "postOnly")] post_only: bool,
+                        order: OrderWireV1,
+                        owner: &'a str,
+                        #[serde(rename = "orderType")] order_type: &'a str,
+                    }
+                    #[derive(Serialize)]
+                    struct OrderWireV1 {
+                        salt: u64,
+                        maker: String,
+                        signer: String,
+                        taker: String,
+                        #[serde(rename = "tokenId")] token_id: String,
+                        #[serde(rename = "makerAmount")] maker_amount: String,
+                        #[serde(rename = "takerAmount")] taker_amount: String,
+                        side: String,
+                        expiration: String,
+                        nonce: String,
+                        #[serde(rename = "feeRateBps")] fee_rate_bps: String,
+                        #[serde(rename = "signatureType")] signature_type: u8,
+                        signature: String,
+                    }
+                    let payload = OrderPayloadV1 {
+                        defer_exec: false,
+                        post_only: false,
+                        order: OrderWireV1 {
+                            salt,
+                            maker: format!("{:#x}", order.maker),
+                            signer: format!("{:#x}", order.signer),
+                            taker: PUBLIC_TAKER.into(),
+                            token_id: order.tokenId.to_string(),
+                            maker_amount: order.makerAmount.to_string(),
+                            taker_amount: order.takerAmount.to_string(),
+                            side: args.side.as_str().to_string(),
+                            expiration: expiration_wire.clone(),
+                            nonce: "0".into(),
+                            fee_rate_bps: fee_bps.to_string(),
+                            signature_type: self.config.sig_type as u8,
+                            signature: sig_hex,
+                        },
+                        owner: &creds.api_key,
+                        order_type: order_type.as_str(),
+                    };
+                    serde_json::to_string(&payload)?
+                }
+                2 => {
+                    // EIP-712 V2 — `exchangeOrderBuilderV2.ts` + `ctfExchangeV2TypedData.ts`
+                    let verifying_addr = Address::from_str(verifying_v2)?;
+                    let ts_u256 = U256::from(ts_ms as u128);
+                    let order = clob_order_v2::Order {
+                        salt: U256::from(salt),
+                        maker: self.config.funder,
+                        signer: self.signer.address(),
+                        tokenId: token_id_u256,
+                        makerAmount: maker_amount,
+                        takerAmount: taker_amount,
+                        side: args.side.as_u8(),
+                        signatureType: self.config.sig_type as u8,
+                        timestamp: ts_u256,
+                        metadata: B256::ZERO,
+                        builder: B256::ZERO,
+                    };
+                    let dom = domain_v2(verifying_addr);
+                    let hash = order.eip712_signing_hash(&dom);
+                    let sig = self.signer.sign_hash(&hash).await?;
+                    let sig_hex = format!("0x{}", hex::encode(sig.as_bytes()));
+
+                    #[derive(Serialize)]
+                    struct OrderPayloadV2<'a> {
+                        #[serde(rename = "deferExec")] defer_exec: bool,
+                        #[serde(rename = "postOnly")] post_only: bool,
+                        order: OrderWireV2,
+                        owner: &'a str,
+                        #[serde(rename = "orderType")] order_type: &'a str,
+                    }
+                    #[derive(Serialize)]
+                    struct OrderWireV2 {
+                        salt: u64,
+                        maker: String,
+                        signer: String,
+                        taker: String,
+                        #[serde(rename = "tokenId")] token_id: String,
+                        #[serde(rename = "makerAmount")] maker_amount: String,
+                        #[serde(rename = "takerAmount")] taker_amount: String,
+                        side: String,
+                        expiration: String,
+                        nonce: String,
+                        #[serde(rename = "signatureType")] signature_type: u8,
+                        signature: String,
+                        timestamp: String,
+                        metadata: String,
+                        builder: String,
+                    }
+                    let payload = OrderPayloadV2 {
+                        defer_exec: false,
+                        post_only: false,
+                        order: OrderWireV2 {
+                            salt,
+                            maker: format!("{:#x}", order.maker),
+                            signer: format!("{:#x}", order.signer),
+                            taker: PUBLIC_TAKER.into(),
+                            token_id: order.tokenId.to_string(),
+                            maker_amount: order.makerAmount.to_string(),
+                            taker_amount: order.takerAmount.to_string(),
+                            side: args.side.as_str().to_string(),
+                            expiration: expiration_wire,
+                            nonce: "0".into(),
+                            signature_type: self.config.sig_type as u8,
+                            signature: sig_hex,
+                            timestamp: ts_ms.to_string(),
+                            metadata: ZERO32.into(),
+                            builder: ZERO32.into(),
+                        },
+                        owner: &creds.api_key,
+                        order_type: order_type.as_str(),
+                    };
+                    serde_json::to_string(&payload)?
+                }
+                v => bail!("CLOB GET /version returned unsupported order version {v}"),
+            };
+
+            let post_res = self.post_order_http(&creds, body, order_type).await;
+            match post_res {
+                Ok(resp) if !resp.success => {
+                    let msg = resp.error.as_deref().unwrap_or("");
+                    if post_attempt + 1 < max_post_attempts
+                        && matches!(args.side, Side::Sell)
+                        && balance_allowance_error_text(msg)
+                    {
+                        tracing::warn!(
+                            post_attempt,
+                            error = %msg,
+                            "CLOB sell rejected (balance/allowance); retry after refresh"
+                        );
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if post_attempt + 1 < max_post_attempts
+                        && matches!(args.side, Side::Sell)
+                        && balance_allowance_error_text(&msg)
+                    {
+                        tracing::warn!(
+                            post_attempt,
+                            error = %msg,
+                            "CLOB POST /order failed (balance/allowance); retry after refresh"
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(anyhow!("internal error: place_order POST loop did not return"))
     }
 
-    async fn post_order_http(&mut self, creds: &ApiCreds, body: String) -> Result<PostOrderResponse> {
+    async fn post_order_http(
+        &mut self,
+        creds: &ApiCreds,
+        body: String,
+        order_type: OrderType,
+    ) -> Result<PostOrderResponse> {
         let ts = chrono::Utc::now().timestamp();
         let path = "/order";
         let l2_sig = l2_hmac(&creds.secret, ts, "POST", path, &body)?;
@@ -1011,6 +1470,13 @@ impl TradingClient {
         let txt    = resp.text().await?;
         if !status.is_success() {
             return Err(anyhow!("CLOB POST /order failed: {} — {}", status, txt));
+        }
+        if matches!(order_type, OrderType::Fak | OrderType::Gtd) {
+            debug!(
+                order_type = order_type.as_str(),
+                response_body = %snip(&txt),
+                "CLOB POST /order raw JSON"
+            );
         }
         let out: PostOrderResponse = serde_json::from_str(&txt)
             .with_context(|| format!("decoding order response: {}", snip(&txt)))?;
@@ -1039,11 +1505,13 @@ impl TradingClient {
     }
 }
 
-/// Polymarket `ROUNDING_CONFIG` (`roundingConfig.ts`): `(price_dec, size_dec)` for price / share rounding.
+/// Polymarket `ROUNDING_CONFIG` in `py-clob-client` `order_builder/builder.py`:
+/// `(price_decimals, size_decimals, amount_decimals)` — `amount` is max precision for the **USDC**
+/// leg on BUY and the **USDC received** leg on SELL (4 for tick `0.01`, not 2).
 /// Nearest tick (e.g. 0.51269 + tick 0.01 → 0.51). Avoids float drift on `n * tick`.
 fn snap_price_to_nearest_tick(price: f64, tick: &str) -> f64 {
     let tick_f = tick.trim().parse::<f64>().unwrap_or(0.01);
-    let (price_dec, _) = round_cfg_from_tick(tick);
+    let (price_dec, _, _) = round_cfg_from_tick(tick);
     if !price.is_finite() || tick_f <= 0.0 {
         return price;
     }
@@ -1051,19 +1519,58 @@ fn snap_price_to_nearest_tick(price: f64, tick: &str) -> f64 {
     round_down_f64(n * tick_f, price_dec)
 }
 
-fn round_cfg_from_tick(tick: &str) -> (u32, u32) {
+/// CLOB validates limit **implied** prices against `orderPriceMinTickSize` (e.g. 0.01 → two decimals).
+/// Call for every GTC/GTD order so `args.price` is never a float tail like `0.7302551640340219`.
+fn snap_limit_order_price_to_tick(price: f64, tick: &str) -> f64 {
+    let p = price.clamp(0.01, 0.99);
+    snap_price_to_nearest_tick(p, tick)
+}
+
+fn round_cfg_from_tick(tick: &str) -> (u32, u32, u32) {
     let x = tick.trim().parse::<f64>().unwrap_or(0.01);
     if (x - 0.1).abs() < 1e-6 {
-        (1, 2)
+        (1, 2, 3)
     } else if (x - 0.01).abs() < 1e-7 {
-        (2, 2)
+        (2, 2, 4)
     } else if (x - 0.001).abs() < 1e-8 {
-        (3, 2)
+        (3, 2, 5)
     } else if (x - 0.0001).abs() < 1e-9 {
-        (4, 2)
+        (4, 2, 6)
     } else {
-        (2, 2)
+        (2, 2, 4)
     }
+}
+
+fn round_normal_f64(num: f64, decimals: u32) -> f64 {
+    let p = 10_f64.powi(decimals as i32);
+    (num * p).round() / p
+}
+
+/// Matches `py-clob-client` `decimal_places` / `helpers.decimal_places` for order amount checks.
+fn decimal_places_f64(x: f64) -> u32 {
+    if !x.is_finite() || x == 0.0 {
+        return 0;
+    }
+    let s = format!("{:.14}", x.abs());
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() < 2 {
+        return 0;
+    }
+    let frac = parts[1].trim_end_matches('0');
+    frac.chars().filter(|c| c.is_ascii_digit()).count() as u32
+}
+
+/// `py-clob-client` `to_token_decimals`: `int(round(1e6 * x))` for EIP-712 `maker`/`taker` amounts.
+fn clob_float_to_micros_py_style(human: f64) -> U256 {
+    if !human.is_finite() || human <= 0.0 {
+        return U256::ZERO;
+    }
+    let f = human * 1_000_000.0;
+    let f = round_normal_f64(f, 0);
+    if f <= 0.0 {
+        return U256::ZERO;
+    }
+    U256::from(f as u128)
 }
 
 fn round_down_f64(num: f64, decimals: u32) -> f64 {
@@ -1076,19 +1583,31 @@ fn round_up_f64(num: f64, decimals: u32) -> f64 {
     (num * p).ceil() / p
 }
 
-fn human_to_base_units_6(human: f64) -> U256 {
+/// USDC on the wire: **exactly 2** fractional digits → micros are multiples of `10_000`.
+fn usdc_human_to_wire_micros(human: f64) -> U256 {
     if !human.is_finite() || human <= 0.0 {
         return U256::ZERO;
     }
-    let micros = (human * 1_000_000.0).floor() as u128;
-    U256::from(micros)
+    let cents = (human * 100.0).round() as i64;
+    let cents = cents.max(0) as u128;
+    U256::from(cents * 10_000u128)
+}
+
+/// Outcome-token **shares** on the wire: **exactly 4** fractional digits → micros multiples of `100`.
+fn share_human_to_wire_micros(human: f64) -> U256 {
+    if !human.is_finite() || human <= 0.0 {
+        return U256::ZERO;
+    }
+    let ten_thousandths = (human * 10_000.0).round() as i64;
+    let ten_thousandths = ten_thousandths.max(0) as u128;
+    U256::from(ten_thousandths * 100u128)
 }
 
 /// price×size → (makerAmount, takerAmount) in **1e6** base units (`parseUnits(..., 6)` in TS).
 ///
-/// CLOB validates **market-style** orders as: **USDC leg ≤ 2** decimal places, **share leg ≤ 4**
-/// (buy: maker=USDC / taker=shares; sell: maker=shares / taker=USDC). The TS `amount` field in
-/// `ROUNDING_CONFIG` is *not* this limit — using it produced USDC with up to 6 decimals and broke buys.
+/// CLOB amounts: see `py-clob-client` `OrderBuilder.get_order_amounts` + `to_token_decimals`.
+/// Market FAK uses 2-decimal USDC via [`usdc_human_to_wire_micros`]; **limit** SELL uses `amount`
+/// precision from [`round_cfg_from_tick`] (e.g. **4** fractional digits for USDC when tick is 0.01).
 fn amounts_for(
     side: Side,
     size_shares: f64,
@@ -1100,7 +1619,7 @@ fn amounts_for(
     const USDC_DECIMALS: u32 = 2;
     const SHARE_DECIMALS_MAX: u32 = 4;
 
-    let (price_dec, size_dec) = round_cfg_from_tick(tick);
+    let (price_dec, size_dec, amount_dec_cfg) = round_cfg_from_tick(tick);
     let share_dec = size_dec.min(SHARE_DECIMALS_MAX);
     let is_limit = matches!(order_type, OrderType::Gtc | OrderType::Gtd);
 
@@ -1138,7 +1657,10 @@ fn amounts_for(
                 let mm = (tm as u128 * price_micros as u128 + 999_999) / 1_000_000;
                 let raw_maker = mm as f64 / 1_000_000.0;
                 if raw_maker + 1e-9 >= floor_notional {
-                    return (human_to_base_units_6(raw_maker), human_to_base_units_6(raw_taker));
+                    return (
+                        usdc_human_to_wire_micros(raw_maker),
+                        share_human_to_wire_micros(raw_taker),
+                    );
                 }
                 taker_ticks += 1;
                 guard += 1;
@@ -1174,19 +1696,40 @@ fn amounts_for(
                 taker_ticks += 1;
                 guard += 1;
             }
-            (human_to_base_units_6(raw_maker), human_to_base_units_6(raw_taker))
+            (
+                usdc_human_to_wire_micros(raw_maker),
+                share_human_to_wire_micros(raw_taker),
+            )
         }
         Side::Sell if is_limit => {
-            let raw_maker = round_down_f64(size_shares, share_dec);
-            let maker_micros = (raw_maker * 1_000_000.0).round() as u64;
-            let taker_micros = (maker_micros as u128 * price_micros as u128) / 1_000_000;
-            let raw_taker = taker_micros as f64 / 1_000_000.0;
-            (human_to_base_units_6(raw_maker), human_to_base_units_6(raw_taker))
+            // Mirrors `py-clob-client` `get_order_amounts` SELL branch — not 2-decimal USDC rounding;
+            // tick `0.01` allows **4** decimals on the USDC (taker) leg (`ROUNDING_CONFIG.amount`).
+            let raw_maker_amt = round_down_f64(size_shares, share_dec);
+            if raw_maker_amt <= 0.0 || !raw_maker_amt.is_finite() {
+                return (U256::ZERO, U256::ZERO);
+            }
+            let mut raw_taker_amt = raw_maker_amt * raw_price;
+            if decimal_places_f64(raw_taker_amt) > amount_dec_cfg {
+                raw_taker_amt = round_up_f64(raw_taker_amt, amount_dec_cfg + 4);
+            }
+            if decimal_places_f64(raw_taker_amt) > amount_dec_cfg {
+                raw_taker_amt = round_down_f64(raw_taker_amt, amount_dec_cfg);
+            }
+            (
+                clob_float_to_micros_py_style(raw_maker_amt),
+                clob_float_to_micros_py_style(raw_taker_amt),
+            )
         }
         Side::Sell => {
             let raw_maker = round_down_f64(size_shares, share_dec);
+            if raw_maker <= 0.0 || !raw_maker.is_finite() {
+                return (U256::ZERO, U256::ZERO);
+            }
             let raw_taker = round_down_f64(raw_maker * raw_price, USDC_DECIMALS);
-            (human_to_base_units_6(raw_maker), human_to_base_units_6(raw_taker))
+            (
+                share_human_to_wire_micros(raw_maker),
+                usdc_human_to_wire_micros(raw_taker),
+            )
         }
     }
 }
@@ -1227,4 +1770,202 @@ fn snip(s: &str) -> String {
     let one_line: String = s.chars().filter(|&c| c != '\n' && c != '\r').collect();
     if one_line.chars().count() <= 200 { one_line }
     else { one_line.chars().take(200).collect::<String>() + "…" }
+}
+
+#[cfg(test)]
+mod take_profit_fill_tests {
+    use super::PostOrderResponse;
+
+    fn r(
+        success: bool,
+        status: Option<&str>,
+        making: Option<&str>,
+        taking: Option<&str>,
+    ) -> PostOrderResponse {
+        PostOrderResponse {
+            success,
+            order_id: None,
+            status: status.map(String::from),
+            making_amount: making.map(String::from),
+            taking_amount: taking.map(String::from),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn delayed_without_amounts_uses_request() {
+        let p = r(true, Some("delayed"), None, None);
+        let o = p.take_profit_fill_for_market_buy(10.0, 0.5).unwrap();
+        assert!((o.0 - 10.0).abs() < 1e-9);
+        assert!((o.1 - 0.5).abs() < 1e-9);
+        assert!(!o.2);
+    }
+
+    #[test]
+    fn amounts_from_api_preferred() {
+        let p = r(true, Some("matched"), Some("2"), Some("4"));
+        let o = p.take_profit_fill_for_market_buy(99.0, 0.99).unwrap();
+        assert!((o.0 - 4.0).abs() < 1e-9);
+        assert!((o.1 - 0.5).abs() < 1e-9);
+        assert!(o.2);
+    }
+
+    /// CLOB returns decimal USDC / shares, not 1e6-scaled integers.
+    #[test]
+    fn matched_buy_parses_decimal_strings_from_clob() {
+        let p = r(true, Some("matched"), Some("1.009999"), Some("1.463767"));
+        let (sh, px) = p.matched_buy_fill_shares_and_avg_price().unwrap();
+        assert!((sh - 1.463767).abs() < 1e-6);
+        assert!((px - 1.009999 / 1.463767).abs() < 1e-6);
+    }
+
+    #[test]
+    fn live_without_amounts_is_none() {
+        let p = r(true, Some("live"), None, None);
+        assert!(p.take_profit_fill_for_market_buy(10.0, 0.5).is_none());
+    }
+
+    /// Implausible dust share count vs a normal ticket → fall back to the submitted order.
+    #[test]
+    fn implausible_api_dust_falls_back_to_request() {
+        let p = r(true, Some("matched"), Some("1.0"), Some("0.0000001"));
+        let o = p.take_profit_fill_for_market_buy(10.0, 0.55).unwrap();
+        assert!((o.0 - 10.0).abs() < 1e-9);
+        assert!((o.1 - 0.55).abs() < 1e-9);
+        assert!(!o.2);
+    }
+}
+
+#[cfg(test)]
+mod take_profit_reconcile_tests {
+    use super::{net_shares_on_token_from_trades, take_profit_sell_cap, ClobTrade};
+
+    fn trade(id: &str, asset: &str, side: &str, size: &str) -> ClobTrade {
+        ClobTrade {
+            id: id.to_string(),
+            asset_id: asset.to_string(),
+            side: side.to_string(),
+            size: size.to_string(),
+            price: "0.5".to_string(),
+            match_time: "0".to_string(),
+            taker_order_id: None,
+            maker_orders: vec![],
+            trader_side: None,
+        }
+    }
+
+    #[test]
+    fn net_buy_minus_sell_on_token() {
+        let t = vec![
+            trade("1", "tok", "BUY", "10"),
+            trade("2", "tok", "SELL", "3"),
+        ];
+        assert!((net_shares_on_token_from_trades(&t, "tok") - 7.0).abs() < 1e-9);
+    }
+
+    /// Observed in the wild: `takingAmount` a hair above conditional balance / trade replay.
+    #[test]
+    fn cap_matches_conservative_min_when_api_round_high() {
+        let c = take_profit_sell_cap(5.329783, 5.306763, 5.306763);
+        assert!((c - 5.306763).abs() < 1e-5);
+    }
+
+    #[test]
+    fn cap_prefers_replay_when_balance_not_yet_updated() {
+        let c = take_profit_sell_cap(5.0, 0.0, 5.2);
+        assert!((c - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cap_prefers_balance_when_trade_list_lags() {
+        let c = take_profit_sell_cap(5.0, 5.2, 4.0);
+        assert!((c - 5.0).abs() < 1e-9);
+    }
+
+    /// Replay / fills above wallet (fees, rounding) must not size above balance.
+    #[test]
+    fn cap_when_replay_high_uses_min_of_need_balance_and_replay() {
+        let c = take_profit_sell_cap(9.82, 9.476958, 9.82);
+        assert!((c - 9.476958).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod buy_fill_order_id_tests {
+    use super::{
+        buy_fill_shares_from_trades_for_order, order_ids_match, ClobMakerOrder, ClobTrade,
+    };
+
+    #[test]
+    fn order_ids_ignore_0x_and_case() {
+        assert!(order_ids_match("0xAbC", "abc"));
+        assert!(order_ids_match("AbC", "0xabc"));
+        assert!(!order_ids_match("a", "b"));
+    }
+
+    #[test]
+    fn taker_buy_fill_by_taker_order_id() {
+        let oid = "0xdeadbeef";
+        let trades = vec![ClobTrade {
+            id: "t1".into(),
+            asset_id: "tok1".into(),
+            side: "BUY".into(),
+            size: "5.25".into(),
+            price: "0.5".into(),
+            match_time: "0".into(),
+            taker_order_id: Some(oid.to_string()),
+            maker_orders: vec![],
+            trader_side: Some("TAKER".into()),
+        }];
+        let f = buy_fill_shares_from_trades_for_order(&trades, oid, "tok1").unwrap();
+        assert!((f - 5.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn maker_buy_fill_uses_matched_amount() {
+        let oid = "order-maker-1";
+        let trades = vec![ClobTrade {
+            id: "t1".into(),
+            asset_id: "tok1".into(),
+            side: "BUY".into(),
+            size: "99".into(),
+            price: "0.5".into(),
+            match_time: "0".into(),
+            taker_order_id: None,
+            maker_orders: vec![ClobMakerOrder {
+                order_id: oid.to_string(),
+                matched_amount: "3.5".into(),
+            }],
+            trader_side: Some("MAKER".into()),
+        }];
+        let f = buy_fill_shares_from_trades_for_order(&trades, oid, "tok1").unwrap();
+        assert!((f - 3.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_matching_order_returns_none() {
+        let trades = vec![ClobTrade {
+            id: "t1".into(),
+            asset_id: "tok1".into(),
+            side: "BUY".into(),
+            size: "5".into(),
+            price: "0.5".into(),
+            match_time: "0".into(),
+            taker_order_id: Some("other".into()),
+            maker_orders: vec![],
+            trader_side: Some("TAKER".into()),
+        }];
+        assert!(buy_fill_shares_from_trades_for_order(&trades, "want-this", "tok1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod limit_price_snap_tests {
+    use super::snap_limit_order_price_to_tick;
+
+    #[test]
+    fn gtd_float_snaps_to_min_tick_decimals() {
+        let p = snap_limit_order_price_to_tick(0.7302551640340219, "0.01");
+        assert!((p - 0.73).abs() < 1e-9);
+    }
 }
