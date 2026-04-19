@@ -937,6 +937,14 @@ fn spawn_order(
                         && matches!(side, Side::Buy)
                         && otype == OrderType::Fak
                     {
+                        if price >= 0.99 {
+                            info!(
+                                limit_price = price,
+                                outcome = ?outcome,
+                                "take-profit: skipped — market FAK limit price >= 0.99",
+                            );
+                            return;
+                        }
                         info!(
                             take_profit_bps,
                             outcome = ?outcome,
