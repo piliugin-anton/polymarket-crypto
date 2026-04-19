@@ -203,6 +203,16 @@ struct BalanceAllowanceResponse {
     /// API may return a JSON string or number.
     #[serde(default)]
     balance: Option<serde_json::Value>,
+    #[serde(default)]
+    allowance: Option<serde_json::Value>,
+}
+
+fn json_balance_to_raw(v: &Option<serde_json::Value>) -> u128 {
+    match v {
+        Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
+        Some(serde_json::Value::Number(n)) => n.as_u128().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 // ── Client ──────────────────────────────────────────────────────────
@@ -559,14 +569,56 @@ impl TradingClient {
         }
         let parsed: BalanceAllowanceResponse = serde_json::from_str(&txt)
             .with_context(|| format!("decode /balance-allowance: {}", snip(&txt)))?;
-        let raw: u128 = match &parsed.balance {
-            Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
-            Some(serde_json::Value::Number(n)) => n.as_u128().unwrap_or(0),
-            _ => 0,
-        };
+        let raw = json_balance_to_raw(&parsed.balance);
         let shares = raw as f64 / 1_000_000.0;
         debug!(token_id = %token_id, %raw, shares, "fetch_conditional_balance_shares");
         Ok(shares)
+    }
+
+    /// USDC **collateral** balance + spending allowance (`GET /balance-allowance`, `asset_type=COLLATERAL`).
+    ///
+    /// Raw amounts use **6 decimals** (same as conditional shares in this client). The allowance
+    /// is the ERC-20 approval the funder granted to Polymarket contracts — often near-unlimited.
+    pub async fn fetch_collateral_cash_and_cashout_usdc(&mut self) -> Result<(f64, f64)> {
+        let creds = self.ensure_creds().await?;
+        let ts = chrono::Utc::now().timestamp();
+        let path = "/balance-allowance";
+        let mut url = url::Url::parse(&format!("{CLOB_HOST}{path}"))
+            .context("parse /balance-allowance URL")?;
+        url.query_pairs_mut()
+            .append_pair("asset_type", "COLLATERAL")
+            .append_pair("signature_type", &(self.config.sig_type as u8).to_string());
+
+        let l2_sig = l2_hmac(&creds.secret, ts, "GET", path, "")?;
+
+        let resp = self
+            .http
+            .get(url.as_str())
+            .header("POLY_ADDRESS", format!("{:#x}", self.signer.address()))
+            .header("POLY_API_KEY", &creds.api_key)
+            .header("POLY_PASSPHRASE", &creds.passphrase)
+            .header("POLY_TIMESTAMP", ts.to_string())
+            .header("POLY_SIGNATURE", l2_sig)
+            .send()
+            .await
+            .context("GET /balance-allowance COLLATERAL")?;
+        let status = resp.status();
+        let txt = resp.text().await.context("reading /balance-allowance body")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "CLOB GET /balance-allowance (COLLATERAL) failed: {} — {}",
+                status,
+                snip(&txt)
+            ));
+        }
+        let parsed: BalanceAllowanceResponse = serde_json::from_str(&txt)
+            .with_context(|| format!("decode /balance-allowance COLLATERAL: {}", snip(&txt)))?;
+        let raw_bal = json_balance_to_raw(&parsed.balance);
+        let raw_allow = json_balance_to_raw(&parsed.allowance);
+        let cash = raw_bal as f64 / 1_000_000.0;
+        let cashout = raw_allow as f64 / 1_000_000.0;
+        debug!(%raw_bal, %raw_allow, cash, cashout, "fetch_collateral_cash_and_cashout_usdc");
+        Ok((cash, cashout))
     }
 
     /// All trades for `condition_id` (Gamma `conditionId` / CLOB `market`), paginated like TS `getTrades`.

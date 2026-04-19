@@ -1,8 +1,7 @@
 //! Ratatui draw routine — all in one function for clarity.
 //!
 //! Layout:
-//! ┌─ Header (2 lines) ───────────────────────────────────────┐
-//! │ BTC / price to beat / countdown / market title           │
+//! ┌─ Header: BTC block (left) + Balance (right) ─────────────┐
 //! ├─ Main (split 62/38, min height capped by layout) ────────┤
 //! │   Order book        │   Positions                         │
 //! ├─ Open orders (8 lines, same as Fills) ────────────────────┤
@@ -27,7 +26,7 @@ pub fn draw(f: &mut Frame, s: &AppState) {
         Constraint::Length(3), // help
     ]).split(area);
 
-    draw_header(f, chunks[0], s);
+    draw_header_row(f, chunks[0], s);
     draw_main(f, chunks[1], s);
     draw_open_orders(f, chunks[2], s);
     draw_fills(f, chunks[3], s);
@@ -38,8 +37,54 @@ pub fn draw(f: &mut Frame, s: &AppState) {
     }
 }
 
-// ── Header ──────────────────────────────────────────────────────────
-fn draw_header(f: &mut Frame, area: Rect, s: &AppState) {
+// ── Header (BTC left, Balance right) ────────────────────────────────
+fn draw_header_row(f: &mut Frame, area: Rect, s: &AppState) {
+    let cols = Layout::horizontal([Constraint::Min(28), Constraint::Length(30)]).split(area);
+    draw_header_btc(f, cols[0], s);
+    draw_balance_panel(f, cols[1], s);
+}
+
+fn draw_balance_panel(f: &mut Frame, area: Rect, s: &AppState) {
+    let cash = s
+        .collateral_cash_usdc
+        .map(|v| format!("${}", fmt_money(v)))
+        .unwrap_or_else(|| "—".to_string());
+    let claimable = s
+        .collateral_claimable_usdc
+        .map(|v| format!("${}", fmt_money(v)))
+        .unwrap_or_else(|| "—".to_string());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(" Balance ", Style::default().add_modifier(Modifier::BOLD)));
+    let inner_w = block.inner(area).width.max(1) as usize;
+    let line1 = balance_row_right_aligned("Cash ", &cash, inner_w, Color::Cyan, true);
+    let line2 = balance_row_right_aligned("Claimable ", &claimable, inner_w, Color::White, false);
+    let p = Paragraph::new(vec![line1, line2]).block(block).wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+/// Label left, value flush to the right edge of the inner rect (`inner_width` cells).
+fn balance_row_right_aligned<'a>(
+    label: &'a str,
+    value: &'a str,
+    inner_width: usize,
+    value_color: Color,
+    value_bold: bool,
+) -> Line<'a> {
+    let gap = inner_width.saturating_sub(label.chars().count() + value.chars().count());
+    let mut vs = Style::default().fg(value_color);
+    if value_bold {
+        vs = vs.add_modifier(Modifier::BOLD);
+    }
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::DarkGray)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(value, vs),
+    ])
+}
+
+fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
     let price_cell = match s.btc_price {
         Some(p) => format!("${:>12}", fmt_money(p)),
         None    => "        ---     ".to_string(),
@@ -299,6 +344,7 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         key("D", "sell DOWN"), sep(),
         key("l", "limit"), sep(),
         key("c", "cancel all"), sep(),
+        key("x", "CTF redeem"), sep(),
         key("s", "resize"), sep(),
         key("q", "quit"),
     ]);

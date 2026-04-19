@@ -18,6 +18,8 @@ pub enum Action {
     PlaceLimit  { outcome: Outcome, side: Side, price: f64, size_usdc: f64 },
     CancelAll,
     ForceMarketRoll,
+    /// Hint for claiming resolved positions (Data API claimable positive). Redeem is on-chain / Portfolio, not CLOB HTTP.
+    Claim,
 }
 
 pub fn handle_key(state: &mut AppState, k: KeyEvent) -> Action {
@@ -66,6 +68,9 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
         // Manual force-roll (useful if gamma polling hasn't picked up the next market yet)
         KeyCode::Char('r') => Action::ForceMarketRoll,
 
+        // CTF redeem via relayer (Safe) — see `spawn_claim` + `redeem`
+        KeyCode::Char('x') | KeyCode::Char('X') => Action::Claim,
+
         _ => Action::None,
     }
 }
@@ -80,6 +85,13 @@ fn edit_size_mode(state: &mut AppState, k: KeyEvent) -> Action {
             }
             state.input_mode = InputMode::Normal;
         }
+        KeyCode::Char('x') | KeyCode::Char('X') => {
+            if state.size_input.parse::<f64>().is_err() {
+                state.size_input = format!("{:.2}", state.default_size_usdc);
+            }
+            state.input_mode = InputMode::Normal;
+            return Action::Claim;
+        }
         KeyCode::Backspace => { state.size_input.pop(); }
         KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
             if state.size_input.len() < 10 { state.size_input.push(c); }
@@ -93,6 +105,10 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
     -> Action
 {
     match k.code {
+        KeyCode::Char('x') | KeyCode::Char('X') => {
+            state.input_mode = InputMode::Normal;
+            Action::Claim
+        }
         KeyCode::Esc => { state.input_mode = InputMode::Normal; Action::None }
         KeyCode::Tab => {
             state.input_mode = InputMode::LimitModal {

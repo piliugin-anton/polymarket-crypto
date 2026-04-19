@@ -55,6 +55,12 @@ pub struct Config {
     pub default_size_usdc: f64,
     /// Max fill slippage for market FAK orders, in basis points (widens buy ceiling / sell floor).
     pub market_slippage_bps: u32,
+    /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
+    pub relayer_api_key: Option<String>,
+    /// Address paired with the relayer API key (same screen in Polymarket settings).
+    pub relayer_api_key_address: Option<Address>,
+    /// Polygon JSON-RPC URL for `eth_call` (neg-risk balances). Public default if unset.
+    pub polygon_rpc_url: String,
 }
 
 impl Config {
@@ -90,6 +96,21 @@ impl Config {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(200); // 2% default slippage tolerance on market orders
 
+        let relayer_api_key = std::env::var("POLYMARKET_RELAYER_API_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let relayer_api_key_address = std::env::var("POLYMARKET_RELAYER_API_KEY_ADDRESS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| Address::from_str(&s))
+            .transpose()
+            .context("POLYMARKET_RELAYER_API_KEY_ADDRESS is not a valid address")?;
+
+        let polygon_rpc_url = std::env::var("POLYGON_RPC_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "https://polygon-rpc.com".to_string());
+
         let signer: alloy_signer_local::PrivateKeySigner = private_key.parse()
             .context("Could not parse POLYMARKET_PK as a private key")?;
         let signer_address = signer.address();
@@ -108,6 +129,9 @@ impl Config {
             sig_type,
             default_size_usdc,
             market_slippage_bps,
+            relayer_api_key,
+            relayer_api_key_address,
+            polygon_rpc_url,
         })
     }
 }

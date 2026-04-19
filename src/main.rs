@@ -14,6 +14,8 @@
 
 mod app;
 mod config;
+mod data_api;
+mod redeem;
 mod events;
 mod feeds;
 mod gamma;
@@ -28,7 +30,7 @@ use app::{
 };
 use config::Config;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream},
+    event::{DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -123,6 +125,60 @@ async fn main() -> Result<()> {
                 let _ = tx.send(AppEvent::OrderErr(
                     "run `btc5m-bot debug-auth` for the full auth dump".into()
                 )).await;
+            }
+        });
+    }
+
+    // Poll CLOB cash + Data API claimable for the Balance panel (top-right).
+    {
+        let t = trading.clone();
+        let tx = tx.clone();
+        let funder = cfg.funder;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let mut cli = t.lock().await;
+                if cli.ensure_creds().await.is_err() {
+                    continue;
+                }
+                match cli.fetch_collateral_cash_and_cashout_usdc().await {
+                    Ok((cash, _allowance)) => {
+                        drop(cli);
+                        let claimable = match net::reqwest_client() {
+                            Ok(http) => {
+                                match crate::data_api::fetch_redeemable_positions(&http, funder).await {
+                                    Ok(pos) => crate::data_api::sum_claimable_usdc(&pos),
+                                    Err(e) => {
+                                        debug!(error = %e, "fetch data-api /positions failed");
+                                        0.0
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "reqwest client for data-api");
+                                0.0
+                            }
+                        };
+                        info!(
+                            cash_usdc = cash,
+                            claimable_usdc = claimable,
+                            funder = %format!("{funder:#x}"),
+                            "loaded balance panel: CLOB cash + Data API claimable (redeemable sum)"
+                        );
+                        let _ = tx
+                            .send(AppEvent::BalancePanelLoaded {
+                                cash_usdc: cash,
+                                claimable_usdc: claimable,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        drop(cli);
+                        debug!(error = %e, "fetch collateral balance failed");
+                    }
+                }
             }
         });
     }
@@ -258,7 +314,14 @@ async fn main() -> Result<()> {
                         should_quit = true;
                         break;
                     }
-                    dispatch_action(action, &state, &trading, &tx, cfg.market_slippage_bps);
+                    if matches!(action, Action::Claim) {
+                        info!(
+                            key_code = ?k.code,
+                            modifiers = ?k.modifiers,
+                            "TUI: CTF redeem key pressed (dispatching redeem)"
+                        );
+                    }
+                    dispatch_action(action, &state, &trading, &tx, &cfg);
                 }
                 e => state.apply(e),
             }
@@ -341,6 +404,12 @@ fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
         while let Some(Ok(ev)) = stream.next().await {
             match ev {
                 CtEvent::Key(k) if k.kind == crossterm::event::KeyEventKind::Press => {
+                    if matches!(k.code, KeyCode::Char('x') | KeyCode::Char('X')) {
+                        info!(
+                            modifiers = ?k.modifiers,
+                            "key reader: x/X KeyEvent (Press) — forwarding to main loop"
+                        );
+                    }
                     if tx.send(AppEvent::Key(k)).await.is_err() { break; }
                 }
                 CtEvent::Resize(_, _) => {
@@ -385,18 +454,62 @@ fn forward_order_err(tx: &mpsc::Sender<AppEvent>, msg: String) {
     });
 }
 
+/// Fetch redeemable positions and submit CTF redemption via Polymarket Relayer (Safe) when configured.
+fn spawn_claim(tx: mpsc::Sender<AppEvent>, cfg: Config) {
+    tokio::spawn(async move {
+        info!("CTF redeem: task started (key x)");
+        let http = match crate::net::reqwest_client() {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = tx.send(AppEvent::OrderErr(format!("http client: {e:#}"))).await;
+                return;
+            }
+        };
+        let positions = match crate::data_api::fetch_redeemable_positions(&http, cfg.funder).await {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = tx
+                    .send(AppEvent::OrderErr(format!("data-api positions: {e:#}")))
+                    .await;
+                return;
+            }
+        };
+        if !positions.iter().any(|p| p.redeemable) {
+            let _ = tx
+                .send(AppEvent::OrderErr(
+                    "нет redeemable-позиций (Data API) — нечего выкупать".into(),
+                ))
+                .await;
+            return;
+        }
+        match crate::redeem::redeem_resolved_positions(&cfg, &http, &positions).await {
+            Ok(summary) => {
+                let _ = tx
+                    .send(AppEvent::StatusInfo(format!("CTF redeem: {summary}")))
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::OrderErr(format!("redeem: {e:#}"))).await;
+            }
+        }
+    });
+}
+
 fn dispatch_action(
     action:  Action,
     state:   &AppState,
     trading: &Arc<Mutex<TradingClient>>,
     tx:      &mpsc::Sender<AppEvent>,
-    market_slippage_bps: u32,
+    cfg:     &Config,
 ) {
     match action {
         Action::None => {}
         // `main` handles `Action::Quit` before calling this; kept for an exhaustive `match`.
         Action::Quit => {}
         Action::ForceMarketRoll  => { /* market watcher polls every 10s; r is a no-op for now */ }
+        Action::Claim => {
+            spawn_claim(tx.clone(), cfg.clone());
+        }
         Action::CancelAll        => {
             let t  = trading.clone();
             let tx = tx.clone();
@@ -419,7 +532,7 @@ fn dispatch_action(
                 return;
             };
             let Some((shares, price, otype)) =
-                resolve_market_order(state, outcome, side, size_usdc, market_slippage_bps)
+                resolve_market_order(state, outcome, side, size_usdc, cfg.market_slippage_bps)
             else {
                 forward_order_err(tx, "no book liquidity".into());
                 return;
