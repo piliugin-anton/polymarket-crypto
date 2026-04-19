@@ -1546,20 +1546,6 @@ fn round_normal_f64(num: f64, decimals: u32) -> f64 {
     (num * p).round() / p
 }
 
-/// Matches `py-clob-client` `decimal_places` / `helpers.decimal_places` for order amount checks.
-fn decimal_places_f64(x: f64) -> u32 {
-    if !x.is_finite() || x == 0.0 {
-        return 0;
-    }
-    let s = format!("{:.14}", x.abs());
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() < 2 {
-        return 0;
-    }
-    let frac = parts[1].trim_end_matches('0');
-    frac.chars().filter(|c| c.is_ascii_digit()).count() as u32
-}
-
 /// `py-clob-client` `to_token_decimals`: `int(round(1e6 * x))` for EIP-712 `maker`/`taker` amounts.
 fn clob_float_to_micros_py_style(human: f64) -> U256 {
     if !human.is_finite() || human <= 0.0 {
@@ -1606,8 +1592,9 @@ fn share_human_to_wire_micros(human: f64) -> U256 {
 /// price×size → (makerAmount, takerAmount) in **1e6** base units (`parseUnits(..., 6)` in TS).
 ///
 /// CLOB amounts: see `py-clob-client` `OrderBuilder.get_order_amounts` + `to_token_decimals`.
-/// Market FAK uses 2-decimal USDC via [`usdc_human_to_wire_micros`]; **limit** SELL uses `amount`
-/// precision from [`round_cfg_from_tick`] (e.g. **4** fractional digits for USDC when tick is 0.01).
+/// Market FAK uses 2-decimal USDC via [`usdc_human_to_wire_micros`]. **Limit** SELL derives taker
+/// USDC micros as `maker_micros * price_micros / 1e6` so implied price matches the tick (no float
+/// tails that break `orderPriceMinTickSize`).
 fn amounts_for(
     side: Side,
     size_shares: f64,
@@ -1619,7 +1606,7 @@ fn amounts_for(
     const USDC_DECIMALS: u32 = 2;
     const SHARE_DECIMALS_MAX: u32 = 4;
 
-    let (price_dec, size_dec, amount_dec_cfg) = round_cfg_from_tick(tick);
+    let (price_dec, size_dec, _amount_dec_cfg) = round_cfg_from_tick(tick);
     let share_dec = size_dec.min(SHARE_DECIMALS_MAX);
     let is_limit = matches!(order_type, OrderType::Gtc | OrderType::Gtd);
 
@@ -1702,23 +1689,20 @@ fn amounts_for(
             )
         }
         Side::Sell if is_limit => {
-            // Mirrors `py-clob-client` `get_order_amounts` SELL branch — not 2-decimal USDC rounding;
-            // tick `0.01` allows **4** decimals on the USDC (taker) leg (`ROUNDING_CONFIG.amount`).
             let raw_maker_amt = round_down_f64(size_shares, share_dec);
             if raw_maker_amt <= 0.0 || !raw_maker_amt.is_finite() {
                 return (U256::ZERO, U256::ZERO);
             }
-            let mut raw_taker_amt = raw_maker_amt * raw_price;
-            if decimal_places_f64(raw_taker_amt) > amount_dec_cfg {
-                raw_taker_amt = round_up_f64(raw_taker_amt, amount_dec_cfg + 4);
+            let maker_micros = clob_float_to_micros_py_style(raw_maker_amt);
+            if maker_micros.is_zero() {
+                return (U256::ZERO, U256::ZERO);
             }
-            if decimal_places_f64(raw_taker_amt) > amount_dec_cfg {
-                raw_taker_amt = round_down_f64(raw_taker_amt, amount_dec_cfg);
+            let p = U256::from(price_micros as u128);
+            let taker_micros = maker_micros * p / U256::from(1_000_000u128);
+            if taker_micros.is_zero() {
+                return (U256::ZERO, U256::ZERO);
             }
-            (
-                clob_float_to_micros_py_style(raw_maker_amt),
-                clob_float_to_micros_py_style(raw_taker_amt),
-            )
+            (maker_micros, taker_micros)
         }
         Side::Sell => {
             let raw_maker = round_down_f64(size_shares, share_dec);
@@ -1967,5 +1951,31 @@ mod limit_price_snap_tests {
     fn gtd_float_snaps_to_min_tick_decimals() {
         let p = snap_limit_order_price_to_tick(0.7302551640340219, "0.01");
         assert!((p - 0.73).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod limit_gtd_sell_amounts_tests {
+    use super::{amounts_for, OrderType, Side};
+    use alloy_primitives::U256;
+
+    fn implied_price_per_share(maker_micros: U256, taker_micros: U256) -> f64 {
+        let m: u128 = maker_micros.try_into().expect("maker fits u128");
+        let t: u128 = taker_micros.try_into().expect("taker fits u128");
+        if m == 0 {
+            return 0.0;
+        }
+        t as f64 / m as f64
+    }
+
+    #[test]
+    fn gtd_sell_implied_price_on_tick_despite_input_float_tail() {
+        let noisy = 0.9804305283757339;
+        let (m1, t1) = amounts_for(Side::Sell, 9.82, noisy, "0.01", None, OrderType::Gtd);
+        let (m2, t2) = amounts_for(Side::Sell, 9.82, 0.98, "0.01", None, OrderType::Gtd);
+        assert_eq!(m1, m2);
+        assert_eq!(t1, t2);
+        let px = implied_price_per_share(m1, t1);
+        assert!((px - 0.98).abs() < 1e-14, "implied={}", px);
     }
 }

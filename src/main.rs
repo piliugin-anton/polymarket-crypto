@@ -31,7 +31,7 @@ use app::{
 use config::Config;
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEventKind,
+        Event as CtEvent, EventStream, KeyCode, KeyEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -291,7 +291,9 @@ async fn main() -> Result<()> {
     // ── terminal setup ───────────────────────────────────────────────
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    // Do not enable mouse capture: we don't handle mouse events, and SGR mouse mode can make some
+    // terminals (e.g. embedded IDE terminal) deliver keyboard only after the pane is clicked.
+    execute!(out, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
 
@@ -345,7 +347,7 @@ async fn main() -> Result<()> {
 
     // ── teardown ─────────────────────────────────────────────────────
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
 
     if let Err(e) = &result { error!(error = %e, "exited with error"); }
@@ -401,6 +403,14 @@ fn spawn_ticker(tx: mpsc::Sender<AppEvent>) {
     });
 }
 
+/// After minimize/restore or `EventStream` recovery, some terminals drop raw mode even when we stay
+/// on the alternate screen — without it, key events never reach crossterm.
+fn tty_restore_raw_mode() {
+    if let Err(e) = enable_raw_mode() {
+        debug!(error = %e, "enable_raw_mode after tty restore (may be ok if not a TTY)");
+    }
+}
+
 fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
     tokio::spawn(async move {
         let mut stream = EventStream::new();
@@ -437,9 +447,7 @@ fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
                     CtEvent::FocusGained => {
                         // After minimize / tab away, some terminals drop raw mode or the event
                         // stream returns transient I/O errors; restore tty state and redraw.
-                        if let Err(e) = enable_raw_mode() {
-                            debug!(error = %e, "enable_raw_mode after FocusGained (may be ok if not a TTY)");
-                        }
+                        tty_restore_raw_mode();
                         let _ = tx.try_send(AppEvent::Tick);
                     }
                     CtEvent::FocusLost => {}
@@ -450,11 +458,13 @@ fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
                         error = %e,
                         "crossterm event read failed (e.g. terminal hide/show); recreating stream"
                     );
+                    tty_restore_raw_mode();
                     stream = EventStream::new();
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 None => {
                     warn!("crossterm EventStream ended; recreating");
+                    tty_restore_raw_mode();
                     stream = EventStream::new();
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -607,6 +617,9 @@ fn dispatch_action(
                 forward_order_err(tx, "no active market".into());
                 return;
             };
+            // Same band as take-profit limit price (`tp_px = clamp_prob(...)` in `spawn_order` path).
+            // Tick snap + EIP-712 amounts happen in `TradingClient::place_order` for all GTD orders.
+            let price = clamp_prob(price);
             // Limit BUY: `size_usdc` = USDC notional → shares at limit price.
             // Limit SELL: `size_usdc` = shares (field name is historical).
             let shares = match side {
@@ -822,6 +835,8 @@ fn spawn_order(
                                 ))
                                 .await;
                         }
+                        // Limit SELL: same downstream as manual limit — `place_order` snaps to
+                        // `orderPriceMinTickSize` and builds amounts (maker/taker micros on tick).
                         let tp_px = clamp_prob(
                             entry_px * (1.0 + take_profit_bps as f64 / 10_000.0),
                         );
