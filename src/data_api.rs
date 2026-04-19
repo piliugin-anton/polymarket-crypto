@@ -3,10 +3,15 @@
 //! Claimable USDC from resolved markets is the sum of `currentValue` on positions with `redeemable: true`.
 //! Redeeming on-chain uses CTF `redeemPositions` (see Polymarket CTF docs); typical accounts hold tokens in a
 //! Safe — use the web Portfolio **Claim** flow or `polymarket ctf redeem` (official CLI).
+//!
+//! [`fetch_positions_for_market`] returns **total** outcome size (incl. shares escrowed for resting SELLs),
+//! useful when CLOB spendable balance + trade replay are both empty or inconsistent.
 
 use alloy_primitives::Address;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+
+use crate::trading::clob_asset_ids_match;
 
 pub const DATA_API_HOST: &str = "https://data-api.polymarket.com";
 
@@ -25,6 +30,12 @@ pub struct DataPosition {
     /// Outcome ERC-1155 token id (decimal or 0x hex).
     #[serde(default)]
     pub asset: String,
+    /// Position size in outcome shares (Data API).
+    #[serde(default)]
+    pub size: f64,
+    /// Volume-average entry price from Data API (USDC per share).
+    #[serde(default, rename = "avgPrice")]
+    pub avg_price: f64,
     #[serde(rename = "outcomeIndex", default)]
     pub outcome_index: u32,
     #[serde(rename = "negativeRisk", default)]
@@ -80,4 +91,53 @@ pub fn sum_claimable_usdc(positions: &[DataPosition]) -> f64 {
         .map(|p| p.current_value)
         .filter(|v| v.is_finite())
         .sum()
+}
+
+/// `GET /positions?user=…&market=<conditionId>&sizeThreshold=0` — rows for one market only.
+pub async fn fetch_positions_for_market(
+    http: &reqwest::Client,
+    user: Address,
+    market_condition_id: &str,
+) -> Result<Vec<DataPosition>> {
+    let url = format!(
+        "{DATA_API_HOST}/positions?user={}&market={}&sizeThreshold=0&limit=500",
+        format!("{user:#x}"),
+        market_condition_id
+    );
+    let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("data-api GET /positions (market) failed: {} — {}", status, txt.trim());
+    }
+    let batch: Vec<DataPosition> = serde_json::from_str(&txt)
+        .with_context(|| format!("decode /positions (market): {}", txt.trim()))?;
+    Ok(batch)
+}
+
+/// Map Data API rows to UP/DOWN `(shares, avg_price)` using the same token-id rules as CLOB.
+pub fn positions_size_avg_for_tokens(
+    rows: &[DataPosition],
+    up_token_id: &str,
+    down_token_id: &str,
+) -> (Option<(f64, f64)>, Option<(f64, f64)>) {
+    let mut up: Option<(f64, f64)> = None;
+    let mut down: Option<(f64, f64)> = None;
+    for p in rows {
+        if !p.size.is_finite() || p.size <= 1e-12 {
+            continue;
+        }
+        let avg = if p.avg_price.is_finite() && p.avg_price > 0.0 {
+            p.avg_price
+        } else {
+            0.0
+        };
+        let pair = (p.size, avg);
+        if clob_asset_ids_match(&p.asset, up_token_id) {
+            up = Some(pair);
+        } else if clob_asset_ids_match(&p.asset, down_token_id) {
+            down = Some(pair);
+        }
+    }
+    (up, down)
 }

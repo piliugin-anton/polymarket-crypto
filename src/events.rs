@@ -3,7 +3,7 @@
 //! `handle_key` returns an `Action` the runtime should dispatch. Keeping this
 //! pure (no I/O) makes the key logic unit-testable.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
 use crate::app::{AppState, InputMode, LimitField, Outcome, MIN_LIMIT_ORDER_SHARES};
 use crate::trading::Side;
@@ -22,7 +22,38 @@ pub enum Action {
     Claim,
 }
 
+/// When the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) is
+/// enabled (`PushKeyboardEnhancementFlags`), `KeyEvent.state` includes lock-key bits from the
+/// terminal. If Caps Lock was toggled while the terminal pane was unfocused, some emulators emit
+/// uppercase letters with **no** `CAPS_LOCK` in the mask (stale output) — treat that like lowercase
+/// for our `u`/`d`/`U`/`D` bindings. When `state` is empty (legacy mode), keep the character as-is
+/// so Caps Lock still maps to uppercase sells.
+fn normalize_terminal_key_event(k: KeyEvent) -> KeyEvent {
+    let KeyCode::Char(c) = k.code else {
+        return k;
+    };
+    if !c.is_ascii_uppercase() {
+        return k;
+    }
+    if k.modifiers.contains(KeyModifiers::SHIFT) {
+        return k;
+    }
+    if k.state.is_empty() {
+        return k;
+    }
+    if k.state.contains(KeyEventState::CAPS_LOCK) {
+        return k;
+    }
+    KeyEvent::new_with_kind_and_state(
+        KeyCode::Char(c.to_ascii_lowercase()),
+        k.modifiers,
+        k.kind,
+        k.state,
+    )
+}
+
 pub fn handle_key(state: &mut AppState, k: KeyEvent) -> Action {
+    let k = normalize_terminal_key_event(k);
     // Ctrl-C / Ctrl-Q always quits
     if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('q')) {
         return Action::Quit;
@@ -213,6 +244,36 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn uppercase_without_caps_in_protocol_state_maps_to_lowercase() {
+        let mut state = AppState::new(5.0);
+        let ev = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('U'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+            KeyEventState::NUM_LOCK,
+        );
+        assert!(matches!(
+            handle_key(&mut state, ev),
+            Action::PlaceMarket { outcome: Outcome::Up, side: Side::Buy, .. }
+        ));
+    }
+
+    #[test]
+    fn uppercase_with_caps_lock_unchanged() {
+        let mut state = AppState::new(5.0);
+        let ev = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('U'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+            KeyEventState::CAPS_LOCK,
+        );
+        assert!(matches!(
+            handle_key(&mut state, ev),
+            Action::PlaceMarket { outcome: Outcome::Up, side: Side::Sell, .. }
+        ));
+    }
 
     #[test]
     fn normal_mode_ignores_key_repeat() {

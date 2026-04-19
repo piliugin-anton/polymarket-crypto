@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
 use crate::fees::polymarket_crypto_taker_fee_usdc;
 use crate::gamma::ActiveMarket;
-use crate::trading::{ClobOpenOrder, ClobTrade, Side, OrderType};
+use crate::trading::{clob_asset_ids_match, ClobOpenOrder, ClobTrade, OrderType, Side};
 use tracing::debug;
 
 /// Minimum outcome shares for a limit (GTD) order — enforced in the UI before submit.
@@ -364,6 +364,41 @@ fn parse_clob_side(s: &str) -> Option<Side> {
     }
 }
 
+/// Unfilled size of resting **SELL** orders per outcome (shares escrowed off the spendable balance).
+pub fn escrow_sell_shares_from_clob_orders(
+    rows: &[ClobOpenOrder],
+    up_token_id: &str,
+    down_token_id: &str,
+) -> (f64, f64) {
+    let mut up = 0.0f64;
+    let mut down = 0.0f64;
+    for o in rows {
+        let outcome = if clob_asset_ids_match(&o.asset_id, up_token_id) {
+            Some(Outcome::Up)
+        } else if clob_asset_ids_match(&o.asset_id, down_token_id) {
+            Some(Outcome::Down)
+        } else {
+            continue;
+        };
+        let Some(side) = parse_clob_side(&o.side) else { continue };
+        if side != Side::Sell {
+            continue;
+        }
+        let orig = o.original_size.parse::<f64>().unwrap_or(f64::NAN);
+        let matched = o.size_matched.parse::<f64>().unwrap_or(0.0);
+        let remaining = orig - matched;
+        if !remaining.is_finite() || remaining <= 1e-9 {
+            continue;
+        }
+        match outcome {
+            Some(Outcome::Up) => up += remaining,
+            Some(Outcome::Down) => down += remaining,
+            None => {}
+        }
+    }
+    (up, down)
+}
+
 /// Map `GET /data/orders` rows to UI rows for the UP/DOWN token pair.
 pub fn open_orders_from_clob(
     rows: Vec<ClobOpenOrder>,
@@ -372,9 +407,9 @@ pub fn open_orders_from_clob(
 ) -> Vec<OpenOrderRow> {
     let mut out = Vec::new();
     for o in rows {
-        let outcome = if o.asset_id == up_token_id {
+        let outcome = if clob_asset_ids_match(&o.asset_id, up_token_id) {
             Outcome::Up
-        } else if o.asset_id == down_token_id {
+        } else if clob_asset_ids_match(&o.asset_id, down_token_id) {
             Outcome::Down
         } else {
             continue;
@@ -414,27 +449,65 @@ pub fn open_orders_from_clob(
 /// Tokens committed to a resting **SELL** disappear from that balance until the order fills or
 /// cancels, while [`GET /data/trades`](https://docs.polymarket.com) still reflects true net
 /// position. The Positions panel therefore prefers replay for `shares` (and VWAP) whenever we
-/// have it, and only falls back to `balance` when the trade list is empty or failed to load.
-fn merge_chain_balance(replay: Position, balance: f64) -> Position {
-    let bal_ok = balance.is_finite() && balance.abs() >= 1e-12;
+/// have it, then `balance + escrow_sell`, then [`Data API`](crate::data_api) `size` / `avgPrice`
+/// when the trade list is empty, failed to load, or `asset_id` strings did not match.
+fn merge_chain_balance(
+    replay: Position,
+    balance: f64,
+    escrow_sell: f64,
+    data_api: Option<(f64, f64)>,
+) -> Position {
+    let spendable = if balance.is_finite() { balance.max(0.0) } else { 0.0 };
+    let escrow = if escrow_sell.is_finite() && escrow_sell > 0.0 {
+        escrow_sell
+    } else {
+        0.0
+    };
+    let inventory_fallback = spendable + escrow;
+    let bal_ok = spendable >= 1e-12;
+    let escrow_ok = escrow >= 1e-12;
     let replay_ok = replay.shares > 1e-9;
 
-    if !replay_ok && !bal_ok {
+    let data_shares = data_api
+        .map(|(s, _)| s)
+        .filter(|s| s.is_finite() && *s > 1e-12)
+        .unwrap_or(0.0);
+    let data_avg = data_api.and_then(|(s, a)| {
+        (s.is_finite() && s > 1e-12 && a.is_finite() && a > 0.0).then_some(a)
+    });
+
+    if !replay_ok && !bal_ok && !escrow_ok && data_shares < 1e-12 {
         return Position::default();
     }
 
-    let shares = if replay_ok { replay.shares } else { balance };
+    let shares = if replay_ok {
+        replay.shares
+    } else if inventory_fallback > 1e-12 {
+        inventory_fallback
+    } else if data_shares > 1e-12 {
+        data_shares
+    } else {
+        0.0
+    };
 
     let avg_entry = if replay_ok {
-        let tol = f64::max(0.02, 0.02 * f64::max(replay.shares.abs(), balance.abs()));
-        if bal_ok && (replay.shares - balance).abs() > tol {
+        let tol = f64::max(
+            0.02,
+            0.02 * f64::max(replay.shares.abs(), inventory_fallback.max(data_shares)),
+        );
+        if (bal_ok || escrow_ok) && (replay.shares - inventory_fallback).abs() > tol {
             debug!(
                 replay_shares = replay.shares,
-                spendable_balance_shares = balance,
-                "position from trades vs spendable conditional balance (e.g. open SELL escrow)"
+                spendable_balance_shares = spendable,
+                escrow_sell_shares = escrow,
+                "position from trades vs spendable + SELL escrow"
             );
         }
         replay.avg_entry
+    } else if data_shares > 1e-12
+        && (shares - data_shares).abs() <= f64::max(1e-6, 0.02 * shares.max(data_shares))
+    {
+        data_avg.unwrap_or(0.0)
     } else {
         0.0
     };
@@ -449,10 +522,17 @@ pub fn hydrate_positions_from_trades(
     down_token_id: &str,
     balance_up: f64,
     balance_down: f64,
+    escrow_sell_up: f64,
+    escrow_sell_down: f64,
+    data_api_up: Option<(f64, f64)>,
+    data_api_down: Option<(f64, f64)>,
 ) -> (Position, Position, Vec<Fill>) {
     let mut indexed: Vec<(DateTime<Utc>, &str, &ClobTrade)> = trades
         .iter()
-        .filter(|t| t.asset_id == up_token_id || t.asset_id == down_token_id)
+        .filter(|t| {
+            clob_asset_ids_match(&t.asset_id, up_token_id)
+                || clob_asset_ids_match(&t.asset_id, down_token_id)
+        })
         .map(|t| (parse_trade_timestamp(&t.match_time), t.id.as_str(), t))
         .collect();
     indexed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
@@ -462,7 +542,7 @@ pub fn hydrate_positions_from_trades(
     let mut fills_chrono: Vec<Fill> = Vec::new();
 
     for (_, _, t) in indexed {
-        let outcome = if t.asset_id == up_token_id {
+        let outcome = if clob_asset_ids_match(&t.asset_id, up_token_id) {
             Outcome::Up
         } else {
             Outcome::Down
@@ -497,8 +577,8 @@ pub fn hydrate_positions_from_trades(
         });
     }
 
-    let position_up = merge_chain_balance(up, balance_up);
-    let position_down = merge_chain_balance(down, balance_down);
+    let position_up = merge_chain_balance(up, balance_up, escrow_sell_up, data_api_up);
+    let position_down = merge_chain_balance(down, balance_down, escrow_sell_down, data_api_down);
 
     let fills_bootstrap: Vec<Fill> = fills_chrono.into_iter().rev().take(64).collect();
 
@@ -611,7 +691,8 @@ mod tests {
             trade("a", up, "BUY", "10", "0.5", "1000"),
             trade("b", up, "BUY", "10", "0.6", "2000"),
         ];
-        let (pu, pd, fills) = hydrate_positions_from_trades(&trades, up, down, 20.0, 0.0);
+        let (pu, pd, fills) =
+            hydrate_positions_from_trades(&trades, up, down, 20.0, 0.0, 0.0, 0.0, None, None);
         assert!((pu.shares - 20.0).abs() < 1e-6);
         // VWAP of USDC cost/share incl. crypto taker fees on each BUY.
         let c1 = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
@@ -659,7 +740,8 @@ mod tests {
             trade("a", up, "BUY", "10", "0.5", "1000"),
             trade("b", up, "SELL", "4", "0.7", "2000"),
         ];
-        let (pu, _, fills) = hydrate_positions_from_trades(&trades, up, "222", 6.0, 0.0);
+        let (pu, _, fills) =
+            hydrate_positions_from_trades(&trades, up, "222", 6.0, 0.0, 0.0, 0.0, None, None);
         assert!((pu.shares - 6.0).abs() < 1e-6);
         let buy_cost = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
         let expect_avg = buy_cost / 10.0;
@@ -676,7 +758,8 @@ mod tests {
         let up = "111";
         let trades = vec![trade("a", up, "BUY", "10", "0.5", "1000")];
         let spendable = 4.0;
-        let (pu, _, _) = hydrate_positions_from_trades(&trades, up, "222", spendable, 0.0);
+        let (pu, _, _) =
+            hydrate_positions_from_trades(&trades, up, "222", spendable, 0.0, 0.0, 0.0, None, None);
         assert!((pu.shares - 10.0).abs() < 1e-6);
         let buy_cost = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
         assert!((pu.avg_entry - buy_cost / 10.0).abs() < 1e-6);
@@ -686,8 +769,70 @@ mod tests {
     fn hydrate_falls_back_to_balance_when_no_trades() {
         let up = "111";
         let trades: Vec<ClobTrade> = vec![];
-        let (pu, pd, _) = hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0);
+        let (pu, pd, _) =
+            hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0, 0.0, 0.0, None, None);
         assert!((pu.shares - 3.5).abs() < 1e-6);
+        assert!(pd.shares.abs() < 1e-9);
+    }
+
+    /// No trade history to replay and spendable balance is 0 while entire position is in a resting SELL.
+    #[test]
+    fn hydrate_no_trades_uses_sell_escrow_when_spendable_zero() {
+        let up = "111";
+        let trades: Vec<ClobTrade> = vec![];
+        let rows = vec![ClobOpenOrder {
+            id: String::new(),
+            asset_id: up.to_string(),
+            side: "SELL".into(),
+            price: "0.60".into(),
+            original_size: "12".into(),
+            size_matched: "0".into(),
+        }];
+        let (escrow_u, escrow_d) = escrow_sell_shares_from_clob_orders(&rows, up, "222");
+        assert!((escrow_u - 12.0).abs() < 1e-9);
+        assert!(escrow_d.abs() < 1e-9);
+        let (pu, pd, _) =
+            hydrate_positions_from_trades(&trades, up, "222", 0.0, 0.0, escrow_u, escrow_d, None, None);
+        assert!((pu.shares - 12.0).abs() < 1e-6);
+        assert!(pd.shares.abs() < 1e-9);
+    }
+
+    /// CLOB may return `asset_id` as `0x…` while Gamma uses the same id in decimal — replay must still match.
+    #[test]
+    fn hydrate_replay_matches_trade_when_asset_id_hex_equals_decimal_token() {
+        let up_decimal = "10";
+        let up_hex = "0x0a";
+        let trades = vec![trade("a", up_hex, "BUY", "5", "0.5", "1000")];
+        let (pu, _, _) = hydrate_positions_from_trades(
+            &trades,
+            up_decimal,
+            "222",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+        );
+        assert!((pu.shares - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hydrate_uses_data_api_when_trades_and_balances_empty() {
+        let trades: Vec<ClobTrade> = vec![];
+        let (pu, pd, _) = hydrate_positions_from_trades(
+            &trades,
+            "111",
+            "222",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            Some((8.0, 0.44)),
+            None,
+        );
+        assert!((pu.shares - 8.0).abs() < 1e-6);
+        assert!((pu.avg_entry - 0.44).abs() < 1e-6);
         assert!(pd.shares.abs() < 1e-9);
     }
 }

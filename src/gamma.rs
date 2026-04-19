@@ -26,7 +26,7 @@ use url::Url;
 use crate::config::{GAMMA_HOST, POLYMARKET_CRYPTO_PRICE_URL};
 
 /// Five-minute window length in seconds (matches Polymarket BTC 5m slugs).
-const BTC_5M_WINDOW_SEC: i64 = 300;
+pub const BTC_5M_WINDOW_SEC: i64 = 300;
 
 /// What the rest of the app needs to know about a market.
 #[derive(Debug, Clone)]

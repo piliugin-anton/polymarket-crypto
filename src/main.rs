@@ -4,7 +4,7 @@
 //!   1. Tracing → stderr (filtered by RUST_LOG).
 //!   2. Trading client (derives L2 API creds on first use).
 //!   3. Chainlink RTDS task (BTC price).
-//!   4. Gamma market discovery + auto-roll task.
+//!   4. Market discovery (`new_market` WS + Gamma fallback) + auto-roll task.
 //!   5. CLOB book subscription task — restarted on each market roll.
 //!   6. Crossterm event task.
 //!   7. 1-Hz ticker for countdown.
@@ -26,15 +26,15 @@ mod ui;
 
 use anyhow::{Context, Result};
 use app::{
-    clamp_prob, hydrate_positions_from_trades, open_orders_from_clob, AppEvent, AppState, Outcome,
-    resolve_market_order, MIN_LIMIT_ORDER_SHARES,
+    clamp_prob, escrow_sell_shares_from_clob_orders, hydrate_positions_from_trades,
+    open_orders_from_clob, AppEvent, AppState, Outcome, resolve_market_order, MIN_LIMIT_ORDER_SHARES,
 };
 use fees::take_profit_limit_price_crypto_after_fees;
 use config::Config;
 use crossterm::{
     event::{
-        DisableFocusChange, EnableFocusChange, Event as CtEvent, EventStream, KeyCode,
-        KeyEventKind,
+        DisableFocusChange, EnableFocusChange, Event as CtEvent, EventStream, KeyboardEnhancementFlags,
+        KeyCode, KeyEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -42,7 +42,26 @@ use crossterm::{
 use events::Action;
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{collections::HashMap, io::stdout, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    io::stdout,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+/// Set when we `execute!(PushKeyboardEnhancementFlags)` so `FocusGained` can pop/push to resync
+/// after the terminal loses track of modifier/lock state (see `events::normalize_terminal_key_event`).
+static KEYBOARD_PROTOCOL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn keyboard_protocol_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+}
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 use trading::{OrderArgs, OrderType, Side, TradingClient};
@@ -191,11 +210,12 @@ async fn main() -> Result<()> {
 
     // Market discovery + book-subscription supervisor
     let (market_tx, mut market_rx) = mpsc::channel::<gamma::ActiveMarket>(8);
-    spawn_market_watcher(tx.clone(), market_tx);
+    feeds::market_discovery_ws::spawn(tx.clone(), market_tx);
 
     // When a new market arrives, tear down the old book WS and start a new one.
     let tx_for_books = tx.clone();
     let trading_for_positions = trading.clone();
+    let data_api_user = cfg.funder;
     tokio::spawn(async move {
         let mut book_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut orders_poll: Option<tokio::task::JoinHandle<()>> = None;
@@ -211,7 +231,34 @@ async fn main() -> Result<()> {
             let up_id = m.up_token_id.clone();
             let down_id = m.down_token_id.clone();
             let condition_id = m.condition_id.clone();
+            let user_addr = data_api_user;
             tokio::spawn(async move {
+                let (data_api_up, data_api_down) = match net::reqwest_client() {
+                    Ok(http) => match crate::data_api::fetch_positions_for_market(
+                        &http,
+                        user_addr,
+                        &condition_id,
+                    )
+                    .await
+                    {
+                        Ok(rows) => {
+                            crate::data_api::positions_size_avg_for_tokens(&rows, &up_id, &down_id)
+                        }
+                        Err(e) => {
+                            debug!(
+                                error = %e,
+                                market = %condition_id,
+                                "data-api GET /positions (market) failed"
+                            );
+                            (None, None)
+                        }
+                    },
+                    Err(e) => {
+                        debug!(error = %e, "reqwest client for data-api positions");
+                        (None, None)
+                    }
+                };
+
                 let mut cli = t.lock().await;
                 if let Err(e) = cli.ensure_creds().await {
                     debug!(error = %e, "positions sync skipped: no CLOB creds");
@@ -231,6 +278,16 @@ async fn main() -> Result<()> {
                         debug!(error = %e, token = %down_id, "fetch DOWN balance failed");
                         0.0
                     });
+                let oo_raw = match cli.fetch_open_orders_for_market(&condition_id).await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        debug!(error = %e, market = %condition_id, "fetch /data/orders failed");
+                        vec![]
+                    }
+                };
+                let (escrow_up, escrow_down) =
+                    escrow_sell_shares_from_clob_orders(&oo_raw, &up_id, &down_id);
+
                 let trades = match cli.fetch_trades_for_market(&condition_id).await {
                     Ok(t) => t,
                     Err(e) => {
@@ -238,8 +295,17 @@ async fn main() -> Result<()> {
                         vec![]
                     }
                 };
-                let (position_up, position_down, fills_bootstrap) =
-                    hydrate_positions_from_trades(&trades, &up_id, &down_id, up, down);
+                let (position_up, position_down, fills_bootstrap) = hydrate_positions_from_trades(
+                    &trades,
+                    &up_id,
+                    &down_id,
+                    up,
+                    down,
+                    escrow_up,
+                    escrow_down,
+                    data_api_up,
+                    data_api_down,
+                );
                 let _ = txp
                     .send(AppEvent::PositionsLoaded {
                         position_up,
@@ -248,13 +314,7 @@ async fn main() -> Result<()> {
                     })
                     .await;
 
-                let oo = match cli.fetch_open_orders_for_market(&condition_id).await {
-                    Ok(rows) => open_orders_from_clob(rows, &up_id, &down_id),
-                    Err(e) => {
-                        debug!(error = %e, market = %condition_id, "fetch /data/orders failed");
-                        vec![]
-                    }
-                };
+                let oo = open_orders_from_clob(oo_raw, &up_id, &down_id);
                 let _ = txp.send(AppEvent::OpenOrdersLoaded { orders: oo }).await;
             });
 
@@ -298,6 +358,18 @@ async fn main() -> Result<()> {
     // terminals (e.g. embedded IDE terminal) deliver keyboard only after the pane is clicked.
     // Focus events are opt-in (`EnableFocusChange`); without them, `FocusGained` never fires after
     // hide/show and we cannot re-apply raw mode (see crossterm::event module docs).
+    //
+    // Kitty keyboard protocol (when supported): lock/modifier bits in `KeyEvent.state` and
+    // press/repeat/release kinds — see crossterm `examples/event-read.rs` and
+    // https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+    // Skip on VS Code's terminal: enabling these flags is known to break CapsLock there.
+    let can_kbd_enhance = matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true));
+    let vscode_terminal = std::env::var("TERM_PROGRAM").ok().as_deref() == Some("vscode");
+    let use_keyboard_protocol = can_kbd_enhance && !vscode_terminal;
+    if use_keyboard_protocol {
+        execute!(out, PushKeyboardEnhancementFlags(keyboard_protocol_flags()))?;
+        KEYBOARD_PROTOCOL_ACTIVE.store(true, Ordering::Relaxed);
+    }
     execute!(out, EnterAlternateScreen, EnableFocusChange)?;
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
@@ -352,6 +424,9 @@ async fn main() -> Result<()> {
 
     // ── teardown ─────────────────────────────────────────────────────
     disable_raw_mode()?;
+    if KEYBOARD_PROTOCOL_ACTIVE.load(Ordering::Relaxed) {
+        execute!(term.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     execute!(term.backend_mut(), DisableFocusChange, LeaveAlternateScreen)?;
     term.show_cursor()?;
 
@@ -455,6 +530,16 @@ fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
                         // After minimize / tab away, some terminals drop raw mode or the event
                         // stream returns transient I/O errors; restore tty state and redraw.
                         tty_restore_raw_mode();
+                        if KEYBOARD_PROTOCOL_ACTIVE.load(Ordering::Relaxed) {
+                            // Pop/push resyncs Kitty protocol state after focus changes (avoids
+                            // stale uppercase after Caps Lock toggled off-window).
+                            let mut out = stdout();
+                            let _ = execute!(
+                                out,
+                                PopKeyboardEnhancementFlags,
+                                PushKeyboardEnhancementFlags(keyboard_protocol_flags())
+                            );
+                        }
                         let _ = tx.try_send(AppEvent::Tick);
                     }
                     CtEvent::FocusLost => {}
@@ -476,30 +561,6 @@ fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
-        }
-    });
-}
-
-fn spawn_market_watcher(
-    tx:        mpsc::Sender<AppEvent>,
-    market_tx: mpsc::Sender<gamma::ActiveMarket>,
-) {
-    tokio::spawn(async move {
-        let gamma = gamma::GammaClient::new();
-        let mut current_slug: Option<String> = None;
-        loop {
-            match gamma.find_current_btc_5m().await {
-                Ok(m) => {
-                    if current_slug.as_deref() != Some(&m.slug) {
-                        current_slug = Some(m.slug.clone());
-                        if market_tx.send(m).await.is_err() { break; }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::OrderErr(format!("gamma: {e}"))).await;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(10)).await;
         }
     });
 }

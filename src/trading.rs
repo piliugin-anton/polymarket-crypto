@@ -304,6 +304,26 @@ fn parse_clob_side_str(s: &str) -> Option<Side> {
     }
 }
 
+/// Compare Polymarket ERC-1155 outcome token ids: decimal and `0x` hex denote the same id.
+/// Gamma / CLOB / `GET /data/trades` do not always use the same string form; strict `==` misses rows.
+pub fn clob_asset_ids_match(a: &str, b: &str) -> bool {
+    fn parse_token_u256(s: &str) -> Option<U256> {
+        let t = s.trim();
+        if t.is_empty() {
+            return None;
+        }
+        if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            let bytes = ::hex::decode(h).ok()?;
+            return Some(U256::from_be_slice(&bytes));
+        }
+        U256::from_str_radix(t, 10).ok()
+    }
+    match (parse_token_u256(a), parse_token_u256(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.trim() == b.trim(),
+    }
+}
+
 fn norm_order_id_fragment(s: &str) -> String {
     s.trim().trim_start_matches("0x").to_ascii_lowercase()
 }
@@ -328,7 +348,7 @@ fn buy_fill_shares_from_trades_for_order(
     }
     let mut sum = 0.0_f64;
     for t in trades {
-        if t.asset_id != token_id {
+        if !clob_asset_ids_match(&t.asset_id, token_id) {
             continue;
         }
         if parse_clob_side_str(&t.side) != Some(Side::Buy) {
@@ -400,7 +420,7 @@ fn buy_fill_shares_from_trades_for_order(
 fn net_shares_on_token_from_trades(trades: &[ClobTrade], token_id: &str) -> f64 {
     let mut sh = 0.0_f64;
     for t in trades {
-        if t.asset_id != token_id {
+        if !clob_asset_ids_match(&t.asset_id, token_id) {
             continue;
         }
         let Some(side) = parse_clob_side_str(&t.side) else {
