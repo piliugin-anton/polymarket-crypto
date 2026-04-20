@@ -38,7 +38,7 @@ pub enum AppEvent {
     },
     /// Resting orders for the active market (`GET /data/orders`).
     OpenOrdersLoaded { orders: Vec<OpenOrderRow> },
-    /// CLOB cash (`GET /balance-allowance` COLLATERAL `balance`) + claimable estimate from Data API (`/positions`, `redeemable`).
+    /// USDC.e cash + claimable from on-chain reads (Multicall3); neg-risk redeemable sums still use Data API.
     BalancePanelLoaded { cash_usdc: f64, claimable_usdc: f64 },
     Key(crossterm::event::KeyEvent),
     OrderAck { side: Side, outcome: Outcome, qty: f64, price: f64 },
@@ -143,9 +143,9 @@ pub struct AppState {
     pub open_orders:    Vec<OpenOrderRow>,
     pub status_line:    String,
 
-    /// `GET /balance-allowance` (`COLLATERAL`): current USDC balance (cash).
+    /// USDC.e (`0x2791…174`) `balanceOf(funder)` on Polygon (via Multicall3).
     pub collateral_cash_usdc: Option<f64>,
-    /// Sum of `currentValue` for `redeemable` positions from Data API (`/positions`).
+    /// Resolved CTF claimable USDC from `payoutNumerators`/`payoutDenominator` + ERC-1155 balances; neg-risk from Data API.
     pub collateral_claimable_usdc: Option<f64>,
 
     /// When Gamma omits the opening USD level in the market text, we latch the

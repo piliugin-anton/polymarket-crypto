@@ -84,6 +84,7 @@ pub async fn fetch_redeemable_positions(
     Ok(out)
 }
 
+#[allow(dead_code)] // Legacy Data-API-only claimable sum; balance panel uses on-chain totals in `balances`.
 pub fn sum_claimable_usdc(positions: &[DataPosition]) -> f64 {
     positions
         .iter()

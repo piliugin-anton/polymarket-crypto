@@ -1042,6 +1042,7 @@ impl TradingClient {
     ///
     /// Raw amounts use **6 decimals** (same as conditional shares in this client). The allowance
     /// is the ERC-20 approval the funder granted to Polymarket contracts — often near-unlimited.
+    #[allow(dead_code)] // Balance panel uses on-chain USDC.e (`balances`); kept for debugging / scripts.
     pub async fn fetch_collateral_cash_and_cashout_usdc(&mut self) -> Result<(f64, f64)> {
         let creds = self.ensure_creds().await?;
         let ts = chrono::Utc::now().timestamp();

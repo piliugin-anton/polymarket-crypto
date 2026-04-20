@@ -15,6 +15,7 @@
 //! issue #1338 / FAQ: `draw` dominates CPU if called on every RTDS/CLOB message.
 
 mod app;
+mod balances;
 mod config;
 mod fees;
 mod data_api;
@@ -192,58 +193,61 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Poll CLOB cash + Data API claimable for the Balance panel (top-right).
+    // On-chain USDC.e cash + claimable (CTF via `eth_call` / batch); Data API indexes redeemable markets
+    // (and neg-risk `currentValue`). Polygon RPC uses a direct HTTP client (no `POLYMARKET_PROXY`).
     {
-        let t = trading.clone();
         let tx = tx.clone();
         let funder = cfg.funder;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let mut cli = t.lock().await;
-                if cli.ensure_creds().await.is_err() {
-                    continue;
-                }
-                match cli.fetch_collateral_cash_and_cashout_usdc().await {
-                    Ok((cash, _allowance)) => {
-                        drop(cli);
-                        let claimable = match net::reqwest_client() {
-                            Ok(http) => {
-                                match crate::data_api::fetch_redeemable_positions(&http, funder).await {
-                                    Ok(pos) => crate::data_api::sum_claimable_usdc(&pos),
-                                    Err(e) => {
-                                        debug!(error = %e, "fetch data-api /positions failed");
-                                        0.0
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!(error = %e, "reqwest client for data-api");
-                                0.0
-                            }
-                        };
-                        info!(
-                            cash_usdc = cash,
-                            claimable_usdc = claimable,
-                            funder = %format!("{funder:#x}"),
-                            "loaded balance panel: CLOB cash + Data API claimable (redeemable sum)"
-                        );
-                        let _ = tx
-                            .send(AppEvent::BalancePanelLoaded {
-                                cash_usdc: cash,
-                                claimable_usdc: claimable,
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        drop(cli);
-                        debug!(error = %e, "fetch collateral balance failed");
-                    }
-                }
+        let rpc_url = cfg.polygon_rpc_url.clone();
+        let rpc_http = match balances::polygon_rpc_http_client() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!(error = %e, "direct Polygon RPC HTTP client failed — balance panel disabled");
+                None
             }
-        });
+        };
+        if let Some(rpc_http) = rpc_http {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let data_http = match net::reqwest_client() {
+                        Ok(h) => h,
+                        Err(e) => {
+                            debug!(error = %e, "reqwest client for Data API (balance index)");
+                            continue;
+                        }
+                    };
+                    match crate::balances::fetch_balance_panel_usdc(
+                        &data_http,
+                        &rpc_http,
+                        &rpc_url,
+                        funder,
+                    )
+                    .await
+                    {
+                        Ok((cash, claimable)) => {
+                            info!(
+                                cash_usdc = cash,
+                                claimable_usdc = claimable,
+                                funder = %format!("{funder:#x}"),
+                                "balance panel: on-chain USDC.e + CTF claimable (eth_call batch; neg-risk from Data API)"
+                            );
+                            let _ = tx
+                                .send(AppEvent::BalancePanelLoaded {
+                                    cash_usdc: cash,
+                                    claimable_usdc: claimable,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "on-chain balance panel fetch failed");
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // Market discovery + book-subscription supervisor

@@ -309,7 +309,7 @@ async fn erc1155_balance(
     Ok(U256::from_be_bytes(arr))
 }
 
-fn parse_condition_id(s: &str) -> Result<B256> {
+pub(crate) fn parse_condition_id(s: &str) -> Result<B256> {
     let t = s.trim();
     let h = t.strip_prefix("0x").unwrap_or(t);
     let b = hex::decode(h).context("conditionId hex")?;
