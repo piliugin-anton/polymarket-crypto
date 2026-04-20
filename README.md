@@ -230,6 +230,8 @@ Normal mode:
 | `r`     | force-refresh active market            |
 | `q` / `Esc` / `Ctrl-C` | quit                    |
 
+**Sizing (Polymarket CLOB).** Per [Create order](https://docs.polymarket.com/developers/CLOB/orders/create-order), **FAK/FOK market BUY** is a **USDC dollar budget** (“specify the dollar amount you want to spend”); **market SELL** is **outcome shares**. **GTC/GTD limit BUY** uses **`size` in shares** at your limit price (this TUI’s limit modal still types BUY size as USDC notional, then converts to shares before submit). The `minimum_order_size` / `min_order_size` fields on [`getOrderBook`](https://docs.polymarket.com/developers/CLOB/clients/methods-public#getOrderBook) are **share** thresholds— they align with **limit** flow and **share-sized** legs, **not** a direct “\$5 minimum spend” on **market BUY**. Small **market BUY** tickets (e.g. **\$1** while the ask is **> 0.5**, i.e. fewer than five shares if fully filled at that price) can still match in practice; third-party guides often cite **~\$1** as a **market** floor and **~5 shares** for **limits** (e.g. [Start Polymarket — How to Trade](https://startpolymarket.com/guides/how-to-trade/)). If placement fails with `INVALID_ORDER_MIN_SIZE`, increase size or re-check book metadata for that token.
+
 Limit modal:
 
 | key     | action                                 |
@@ -240,6 +242,8 @@ Limit modal:
 | digits / `.` | edit current field                |
 | `Enter` | submit as **GTD** limit order          |
 | `Esc`   | cancel modal                           |
+
+The modal enforces at least **5 outcome shares** on submit after converting BUY notional → shares (SELL: size is already shares). That matches typical **`minimum_order_size`** on **btc-updown-5m-*** books and avoids `INVALID_ORDER_MIN_SIZE` on **GTD**; see `min_order_size` / `minimum_order_size` in Polymarket’s [order book](https://docs.polymarket.com/developers/CLOB/clients/methods-public#getOrderBook) / [market](https://docs.polymarket.com/developers/CLOB/clients/methods-public#getMarket) payloads (values can differ by slug).
 
 GTD expiration is chosen so the order stops resting about **one second before** the active market’s `closes_at`. The CLOB expects a unix `expiration` field with Polymarket’s **+60s** security buffer on top of that instant (see [Create order → GTD](https://docs.polymarket.com/developers/CLOB/orders/create-order)). **CLOB API signing version must be 1** (EIP-712 includes `expiration`); if `/version` returns `2`, GTD placement is rejected until the client supports it.
 
@@ -293,9 +297,14 @@ src/
 This bot signs orders on your behalf. Until you're confident in its
 behaviour:
 
-1. Start with `DEFAULT_SIZE_USDC=1.0` or `0.5`. Orders below ~$1 on
-   Polymarket are often rejected by the CLOB minimum-order-size check —
-   useful dry-run signal.
+1. Start with a small `DEFAULT_SIZE_USDC`. **`u` / `d` market BUY** uses that
+   value as a **USDC spend** budget (Polymarket **FAK BUY** = dollars; see
+   [Create order → Order types](https://docs.polymarket.com/developers/CLOB/orders/create-order)),
+   so **\$1** tickets can fill even when the implied share count is **below**
+   book **`minimum_order_size`** at the current ask. **GTD limits** are blocked
+   in-app below **5 shares** after notional→share conversion; you can still see
+   `INVALID_ORDER_MIN_SIZE` or liquidity errors from the API for edge sizes—
+   bump the ticket or check the book if that happens.
 2. Tune `MARKET_BUY_SLIPPAGE_BPS` / `MARKET_SELL_SLIPPAGE_BPS` (use `0` for no
    cushion); legacy `MARKET_SLIPPAGE_BPS` still sets either side if unset.
 3. Never check your private key into source control. The `.env.example`
