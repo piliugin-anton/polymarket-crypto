@@ -7,70 +7,78 @@ current UP/DOWN positions with unrealized PnL, and lets you fire **FAK**
 market orders or **GTD** limit orders that auto-expire just before the
 current 5m window closes — all from single-key actions.
 
-## Design at a glance
-
-```
-┌─ BTC 5m Predictions ──────────────────────────────────────────────────┐
-│ BTC/USD (Chainlink)  $  67,432.51   ▲   +32.51                        │
-│ Price to Beat: $67,400.00   Closes in 02:34   Bitcoin Up or Down…     │
-├───────────────────────────────────────────┬───────────────────────────┤
-│ Order Book                                │ Positions                 │
-│  UP price    size  │ DOWN price    size   │   UP                      │
-│   0.62   ×   200   │  0.38   ×  200       │   120.00 sh @ 0.580       │
-│   0.61   ×   150   │  0.39   ×  150       │          mark 0.620       │
-│   ── 0.605 ──      │  ── 0.395 ──         │          uPnL $+4.80      │
-│   0.60   ×   500   │  0.40   ×  500       │   DOWN                    │
-│                                           │   Realized   $+12.00      │
-│                                           │   Total      $+16.80      │
-├───────────────────────────────────────────┴───────────────────────────┤
-│ Fills                                                                 │
-│ 20:23:15 BUY  UP   120.00  @ 0.580  = $69.60                          │
-│ 20:18:42 SELL UP   100.00  @ 0.650  = $65.00  +7.00                   │
-├───────────────────────────────────────────────────────────────────────┤
-│ size [5.00] USDC   [u] buy UP  [d] buy DOWN  [U] sell UP  [D] sell …  │
-│ › BUY 2.00 UP @ 0.620 ✓                                               │
-└───────────────────────────────────────────────────────────────────────┘
-```
-
 ## Architecture
 
 ```
-┌────────────────────┐   ┌──────────────────────┐   ┌───────────────────┐
-│  Crossterm keys    │──▶│                      │◀──│ Chainlink RTDS WS │
-└────────────────────┘   │   mpsc<AppEvent>     │   └───────────────────┘
-┌────────────────────┐   │       ↓              │   ┌───────────────────┐
-│  Gamma poll (10s)  │──▶│    AppState          │◀──│ CLOB book WS      │
-│  + market roll     │   │       ↓              │   │ (restart on roll) │
-└────────────────────┘   │  ratatui::draw       │   └───────────────────┘
-                         └──────────────────────┘
-                                ↓ actions
-                         ┌──────────────────────┐
-                         │  TradingClient       │
-                         │  alloy EIP-712 sign  │
-                         │  reqwest → CLOB REST │
-                         └──────────────────────┘
+┌─────────────────────┐   ┌───────────────────────────────┐   ┌────────────────────┐
+│ Crossterm keys      │   │                               │   │ Chainlink RTDS WS  │
+│ + resize / focus    │──▶│  mpsc<AppEvent> (bounded)     │◀──│ BTC/USD ticks      │
+└─────────────────────┘   │  coalesce bursts (price/book) │   └────────────────────┘
+┌─────────────────────┐   │            ↓                  │   ┌────────────────────┐
+│ 1 Hz Tick           │──▶│         AppState              │◀──│ CLOB market WS     │
+└─────────────────────┘   │            ↓                  │   │ per-market book    │
+┌─────────────────────┐   │     ratatui::draw             │   │ (supervisor restarts│
+│ CLOB market WS      │──▶│  throttled ~20 Hz on feeds    │   │  on each roll)     │
+│ `new_market` +      │   │                               │   └────────────────────┘
+│ Gamma fallback 60s  │   └───────────────┬───────────────┘
+└─────────────────────┘                   │
+         ┌────────────────────────────────┼────────────────────────────┐
+         ▼                                ▼                            ▼
+┌─────────────────┐              ┌──────────────────┐        ┌─────────────────────┐
+│ Gamma REST      │              │ TradingClient     │        │ Data API (HTTP)     │
+│ ActiveMarket    │              │ EIP-712 orders    │        │ positions, claimable│
+│ resolution      │              │ L1/L2 CLOB REST   │        │ (balance panel,     │
+└─────────────────┘              └──────────────────┘        │  roll bootstrap)    │
+                                                             └─────────────────────┘
 ```
 
-Four async tasks push into a single `mpsc<AppEvent>` channel. The main loop
-drains events, mutates `AppState`, and redraws. Key events run through
-`events::handle_key`, which returns a pure `Action` that the runtime then
-dispatches on a worker task — no I/O happens on the render loop.
+Many async producers share one `mpsc<AppEvent>` channel (buffer 512): keyboard
+and focus/resize handling, a 1&nbsp;Hz ticker, Chainlink price (via a small
+forwarder that keeps only the latest tick per burst), CLOB book snapshots (via
+a forwarder that merges concurrent UP/DOWN updates), market rolls, position /
+open-order / balance snapshots, and order status lines. The main loop drains
+events in batches, applies them to `AppState`, and calls `Terminal::draw`. When
+a batch has **no** key events, redraws are **throttled** (`FEED_REDRAW_MIN`,
+50&nbsp;ms) so feed-heavy sessions do not pin a CPU core — see ratatui
+discussion around high-frequency `draw`.
 
-**Signing.** Orders are built against the on-chain `Order` struct from
-[`ctf-exchange`](https://github.com/Polymarket/ctf-exchange) and signed with
-EIP-712 using `alloy` + `alloy-sol-types`. L1 auth (`ClobAuthDomain` struct)
-derives the L2 API credentials on first run; every subsequent REST call is
-authed with HMAC-SHA256 over `ts + method + path + body`.
+Key events go through `events::handle_key`, which returns a pure `Action`. The
+runtime dispatches trading, cancel, and **CTF redeem** (`x` / `X`) on separate
+`tokio` tasks — **no** network I/O on the render path. On startup, API
+credential derivation also runs in the background so the TUI can paint before
+L2 auth completes.
 
-**Market discovery.** The Gamma API's `/events` endpoint is polled every 10s
-with the `crypto-5m` tag filter. The bot picks the `btc-updown-5m-*` event
-whose `[start_date, end_date)` contains the current UTC time and auto-rolls
-when it closes.
+**Signing.** Orders use the on-chain `Order` shape from
+[`ctf-exchange`](https://github.com/Polymarket/ctf-exchange), signed with
+EIP-712 (`alloy` + `alloy-sol-types`). L1 auth derives L2 credentials once;
+later REST calls use HMAC-SHA256 over `ts + method + path + body`.
+
+**Networking.** `net` builds a proxy-aware `reqwest` client and WebSocket
+tunnels (`POLYMARKET_PROXY`: HTTP `CONNECT` or SOCKS5, then TLS + WS) shared by
+Gamma, CLOB REST, Data API, RTDS, and both CLOB sockets.
+
+**Market discovery.** A dedicated CLOB **market** WebSocket subscribes with an
+empty `assets_ids` list and `custom_feature_enabled: true` so **global**
+`new_market` events arrive (narrow token subscriptions miss the next 5&nbsp;m
+window). When a slug looks like the current `btc-updown-5m-*` grid, the client
+calls `GammaClient::find_current_btc_5m` to resolve a full [`ActiveMarket`](src/gamma.rs).
+A **60&nbsp;s** Gamma poll runs as a fallback if the socket is quiet. A
+supervisor task aborts the previous per-market book connection and starts a new
+one on each roll; it also kicks off a positions sync (CLOB balances + `/data/trades`
+replay, Data API sizes for escrowed sells) and a 5&nbsp;s open-order poller.
+
+**Balances and claimable.** A 5&nbsp;s loop reads CLOB collateral cash and sums
+Data API `redeemable` positions for the balance panel. **Redeem:** with
+`POLYMARKET_RELAYER_API_KEY` (+ address) set, `redeem` submits gasless Safe
+`execTransaction` bundles to the Polymarket relayer (`redeemPositions` on CTF).
+
+**Fees and take-profit.** `fees` implements Polymarket **crypto** taker fees for
+PnL and for limit prices after optional **market BUY → GTD take-profit** sells
+(`MARKET_BUY_TAKE_PROFIT_BPS`).
 
 **Price feed.** `wss://ws-live-data.polymarket.com` → topic
-`crypto_prices_chainlink` → filter `symbol=btc/usd`. This is the exact
-feed Polymarket resolves against, so the header color is consistent with
-what decides your position.
+`crypto_prices_chainlink` → filter `symbol=btc/usd` — the same feed used for
+resolution, so the header matches settlement logic.
 
 ## Debugging
 
@@ -232,9 +240,9 @@ Size edit mode:
 - **On-chain allowance setting.** Assumed pre-approved; if not, run a
   one-time script to call `USDC.approve` and `CTF.setApprovalForAll` for the
   two Exchange contracts.
-- **Winnings redemption.** When a market resolves, your winning shares sit
-  in the Safe until you redeem via `CTF.redeemPositions`. Out of scope for
-  this bot — the web UI handles it with one click.
+- **Winnings redemption without relayer keys.** The TUI can submit `CTF.redeemPositions`
+  via the Polymarket relayer when `POLYMARKET_RELAYER_API_KEY` is configured.
+  Otherwise use the web Portfolio **Claim** flow or another tool.
 - **Persistence.** Realized PnL resets on restart. Swap the `VecDeque<Fill>`
   for a sqlite table if you want history across sessions.
 
@@ -242,17 +250,22 @@ Size edit mode:
 
 ```
 src/
-├── main.rs            # tokio runtime, terminal init, action dispatch
-├── config.rs          # env vars, endpoints, SignatureType enum
-├── app.rs             # AppState, Position, Fill, event reducer
-├── events.rs          # keyboard → Action (pure, unit-testable)
-├── gamma.rs           # Gamma REST client, ActiveMarket
-├── trading.rs         # EIP-712 Order sign + L1/L2 auth + CLOB POST
+├── main.rs                 # tokio runtime, TUI init, event loop, action dispatch
+├── config.rs               # env vars, endpoints, SignatureType
+├── app.rs                  # AppState, positions, fills, AppEvent reducer
+├── events.rs               # keyboard → Action (pure)
+├── gamma.rs                # Gamma REST, ActiveMarket, GTD expiration helper
+├── trading.rs              # EIP-712 orders, L1/L2 auth, CLOB REST
+├── data_api.rs             # Data API: positions, claimable/redeemable
+├── redeem.rs               # CTF redeem via Polymarket relayer (Safe)
+├── fees.rs                 # crypto taker fee + take-profit limit price
+├── net.rs                  # proxy-aware HTTP + WebSocket connect
 ├── feeds/
-│   ├── chainlink.rs   # RTDS WS → PriceTick
-│   └── clob_ws.rs     # CLOB market WS → BookSnapshot
+│   ├── chainlink.rs        # RTDS WS → PriceTick
+│   ├── clob_ws.rs          # per-market CLOB WS → BookSnapshot
+│   └── market_discovery_ws.rs  # global new_market + Gamma fallback
 └── ui/
-    └── render.rs      # full ratatui render in one function
+    └── render.rs           # ratatui layout
 ```
 
 ## Safety
