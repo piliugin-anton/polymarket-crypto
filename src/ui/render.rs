@@ -349,7 +349,7 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         Span::raw("[D]"), Span::styled(" sell DOWN", Style::default().fg(Color::Red)), sep(),
         key("l", "limit"), sep(),
         key("c", "cancel all"), sep(),
-        key("x", "CTF redeem"), sep(),
+        key("x", "redeem all"), sep(),
         key("s", "resize"), sep(),
         key("q", "quit"),
     ]);

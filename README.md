@@ -33,8 +33,8 @@ current 5m window closes — all from single-key actions.
                                                                         │
                                                              ┌──────────▼──────────┐
                                                              │ Polygon JSON-RPC    │
-                                                             │ (direct `eth_call`/ │
-                                                             │  batch — balance    │
+                                                             │ (Multicall3         │
+                                                             │  `aggregate3`)      │
                                                              │  panel cash + CTF)  │
                                                              └─────────────────────┘
 ```
@@ -50,7 +50,7 @@ a batch has **no** key events, redraws are **throttled** (`FEED_REDRAW_MIN`,
 discussion around high-frequency `draw`.
 
 Key events go through `events::handle_key`, which returns a pure `Action`. The
-runtime dispatches trading, cancel, and **CTF redeem** (`x` / `X`) on separate
+runtime dispatches trading, cancel, and **redeem all** (`x` / `X`) on separate
 `tokio` tasks — **no** network I/O on the render path. On startup, API
 credential derivation also runs in the background so the TUI can paint before
 L2 auth completes.
@@ -77,14 +77,21 @@ one on each roll; it also kicks off a positions sync (CLOB balances + `/data/tra
 replay, Data API sizes for escrowed sells) and a 5&nbsp;s open-order poller.
 
 **Balances and claimable.** A 5&nbsp;s task reads **on-chain** values via Polygon
-`eth_call` (direct JSON-RPC batch): **USDC.e** cash (`balanceOf` on the bridged
-collateral token) and **standard CTF** claimable from `payoutDenominator` /
-`payoutNumerators` + ERC-1155 balances on the Conditional Tokens contract (see
+[Multicall3](https://github.com/mds1/multicall) **`aggregate3`** (one `eth_call`
+per chunk): **USDC.e** cash (`balanceOf` on the bridged collateral token) and
+**standard CTF** claimable from `payoutDenominator` / `payoutNumerators` +
+ERC-1155 balances on the Conditional Tokens contract (see
 [`balances.rs`](src/balances.rs)). The Data API lists **redeemable** markets
 (standard) and supplies **neg-risk** claimable sums where position IDs differ.
-**Redeem:** with `POLYMARKET_RELAYER_API_KEY` (+ address) set, `redeem` submits
-gasless Safe `execTransaction` bundles to the Polymarket relayer
-(`redeemPositions` on CTF / neg-risk adapter).
+**Redeem:** with `POLYMARKET_RELAYER_API_KEY` (+ `POLYMARKET_RELAYER_API_KEY_ADDRESS`)
+set and `POLYMARKET_SIG_TYPE=2` (Gnosis Safe funder), **`x`** / **`X`** fetches
+all redeemable rows from the Data API and submits **one** gasless Safe
+`execTransaction` to the Polymarket relayer. Multiple distinct markets are
+batched with Gnosis **`MultiSend`** + Safe **delegateCall** (same pattern as
+[`@polymarket/builder-relayer-client`](https://github.com/Polymarket/builder-relayer-client));
+a single market still uses a direct `redeemPositions` call on the CTF contract
+or neg-risk adapter. Rows that cannot be built (bad ids, zero on-chain neg-risk
+balances, etc.) are skipped with a log warning so the rest still redeem.
 
 **Fees and take-profit.** `fees` implements Polymarket **crypto** taker fees for
 PnL and for limit prices after optional **market BUY → GTD take-profit** sells
@@ -226,6 +233,7 @@ Normal mode:
 | `U` / `D` | **market SELL** UP / DOWN (FAK at best bid) |
 | `l`     | open limit-order modal                 |
 | `c`     | cancel ALL open orders                 |
+| `x` / `X` | **redeem all** claimable resolved positions (relayer + Safe; see *Balances and claimable*) |
 | `s`     | edit persistent ticket size            |
 | `r`     | force-refresh active market            |
 | `q` / `Esc` / `Ctrl-C` | quit                    |
@@ -253,6 +261,7 @@ Size edit mode:
 |---------|----------------------------------------|
 | digits / `.` | edit size buffer                  |
 | `Enter` / `Esc` | commit (reverts to default on parse fail) |
+| `x` / `X` | same as normal mode: **redeem all** (exits size edit first) |
 
 ## What's intentionally *not* here
 
@@ -263,9 +272,10 @@ Size edit mode:
 - **On-chain allowance setting.** Assumed pre-approved; if not, run a
   one-time script to call `USDC.approve` and `CTF.setApprovalForAll` for the
   two Exchange contracts.
-- **Winnings redemption without relayer keys.** The TUI can submit `CTF.redeemPositions`
-  via the Polymarket relayer when `POLYMARKET_RELAYER_API_KEY` is configured.
-  Otherwise use the web Portfolio **Claim** flow or another tool.
+- **Winnings redemption without relayer keys.** **`x`** batches redeemable
+  markets through the relayer only when `POLYMARKET_RELAYER_API_KEY` and
+  `POLYMARKET_RELAYER_API_KEY_ADDRESS` are set (Safe / `sig_type=2`). Otherwise
+  use the web Portfolio **Claim** flow or another tool.
 - **Persistence.** Realized PnL resets on restart. Swap the `VecDeque<Fill>`
   for a sqlite table if you want history across sessions.
 
@@ -279,7 +289,7 @@ src/
 ├── events.rs               # keyboard → Action (pure)
 ├── gamma.rs                # Gamma REST, ActiveMarket, GTD expiration helper
 ├── trading.rs              # EIP-712 orders, L1/L2 auth, CLOB REST
-├── balances.rs             # On-chain USDC.e + CTF claimable (Polygon eth_call / batch)
+├── balances.rs             # On-chain USDC.e + CTF claimable (Polygon Multicall3)
 ├── data_api.rs             # Data API: positions, redeemable index, neg-risk
 ├── redeem.rs               # CTF redeem via Polymarket relayer (Safe)
 ├── fees.rs                 # crypto taker fee + take-profit limit price

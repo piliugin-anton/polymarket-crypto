@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::{Config, SignatureType};
 use crate::data_api::DataPosition;
@@ -27,6 +27,8 @@ const NEG_RISK_ADAPTER: Address = address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0d
 const SAFE_FACTORY: Address = address!("0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b");
 const SAFE_INIT_CODE_HASH: B256 =
     b256!("0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf");
+/// Polygon — same `SafeMultisend` as `@polymarket/builder-relayer-client` (`getContractConfig(137)`).
+const SAFE_MULTISEND: Address = address!("0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761");
 
 sol! {
     contract Ctf {
@@ -42,6 +44,12 @@ sol! {
 sol! {
     contract NegRisk {
         function redeemPositions(bytes32 conditionId, uint256[] amounts) external;
+    }
+}
+
+sol! {
+    contract MultiSend {
+        function multiSend(bytes transactions) external;
     }
 }
 
@@ -91,6 +99,28 @@ fn encode_neg_risk_redeem(condition_id: B256, amounts: Vec<U256>) -> Vec<u8> {
     .abi_encode()
 }
 
+/// One inner call for Gnosis `MultiSend.multiSend` (`abi.encodePacked` per sub-tx).
+fn gnosis_multisend_pack_inner_call(to: Address, value: U256, data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 20 + 32 + 32 + data.len());
+    v.push(0u8); // OperationType.Call (delegatecall only on the outer Safe tx)
+    v.extend_from_slice(to.as_slice());
+    v.extend_from_slice(&value.to_be_bytes::<32>());
+    let len = U256::from(data.len());
+    v.extend_from_slice(&len.to_be_bytes::<32>());
+    v.extend_from_slice(data);
+    v
+}
+
+fn encode_safe_multisend_calldata_from_packed(packed: Vec<u8>) -> Result<Vec<u8>> {
+    if packed.is_empty() {
+        bail!("multiSend: empty batch");
+    }
+    Ok(MultiSend::multiSendCall {
+        transactions: packed.into(),
+    }
+    .abi_encode())
+}
+
 /// Pack ECDSA signature for Polymarket Safe relayer (see `builder-relayer-client` `splitAndPackSig`).
 fn pack_safe_rel_signature(mut sig: [u8; 65]) -> Result<String> {
     let mut v = u16::from(sig[64]);
@@ -118,6 +148,7 @@ fn safe_typed_data_digest(
     safe: Address,
     to: Address,
     data: &[u8],
+    operation: u8,
     nonce: &str,
 ) -> Result<B256> {
     let data_hex = format!(
@@ -152,7 +183,7 @@ fn safe_typed_data_digest(
             "to": format!("{to:#x}"),
             "value": "0",
             "data": data_hex,
-            "operation": 0,
+            "operation": operation,
             "safeTxGas": "0",
             "baseGas": "0",
             "gasPrice": "0",
@@ -319,7 +350,7 @@ pub(crate) fn parse_condition_id(s: &str) -> Result<B256> {
     Ok(B256::from_slice(&b))
 }
 
-fn parse_token_id_u256(s: &str) -> Result<U256> {
+pub(crate) fn parse_token_id_u256(s: &str) -> Result<U256> {
     let t = s.trim();
     if let Some(h) = t.strip_prefix("0x") {
         let b = hex::decode(h).context("asset id hex")?;
@@ -328,7 +359,9 @@ fn parse_token_id_u256(s: &str) -> Result<U256> {
     U256::from_str_radix(t, 10).context("asset id decimal")
 }
 
-/// Redeem all redeemable positions returned by Data API (one relayer tx per distinct `conditionId`).
+/// Redeem all redeemable positions returned by Data API in **one** relayer submission when possible:
+/// multiple `redeemPositions` calls are packed with Gnosis `MultiSend` + Safe `DelegateCall`, matching
+/// [`aggregateTransaction`](https://github.com/Polymarket/builder-relayer-client/blob/main/src/builder/safe.ts).
 pub async fn redeem_resolved_positions(
     cfg: &Config,
     http: &Client,
@@ -375,13 +408,20 @@ pub async fn redeem_resolved_positions(
     }
 
     let mut seen = std::collections::HashSet::new();
-    let mut summaries = Vec::new();
+    let mut ops: Vec<(String, Address, Vec<u8>)> = Vec::new();
 
-    for p in redeemable {
+    'each: for p in redeemable {
         if !seen.insert(p.condition_id.as_str()) {
             continue;
         }
-        let condition = parse_condition_id(&p.condition_id)?;
+        let short = p.condition_id.chars().take(10).collect::<String>();
+        let condition = match parse_condition_id(&p.condition_id) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(cond = %p.condition_id, error = %e, "CTF redeem: skip (bad conditionId)");
+                continue;
+            }
+        };
         let (to, calldata) = if p.negative_risk {
             let group: Vec<&DataPosition> = positions
                 .iter()
@@ -396,82 +436,121 @@ pub async fn redeem_resolved_positions(
             for q in &group {
                 let i = q.outcome_index as usize;
                 if i >= amounts.len() {
-                    bail!(
-                        "outcomeIndex {} out of bounds for neg-risk condition {}",
-                        q.outcome_index,
-                        p.condition_id
+                    warn!(
+                        cond = %p.condition_id,
+                        outcome = q.outcome_index,
+                        "CTF redeem: skip neg-risk (outcomeIndex out of bounds)"
                     );
+                    continue 'each;
                 }
-                let bal = erc1155_balance(
-                    http,
-                    &cfg.polygon_rpc_url,
-                    cfg.funder,
-                    parse_token_id_u256(&q.asset)?,
-                )
-                .await
-                .with_context(|| format!("balance for outcome {}", q.outcome_index))?;
+                let tid = match parse_token_id_u256(&q.asset) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(
+                            cond = %p.condition_id,
+                            error = %e,
+                            "CTF redeem: skip neg-risk (bad asset id)"
+                        );
+                        continue 'each;
+                    }
+                };
+                let bal = match erc1155_balance(http, &cfg.polygon_rpc_url, cfg.funder, tid).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(
+                            cond = %p.condition_id,
+                            outcome = q.outcome_index,
+                            error = %e,
+                            "CTF redeem: skip neg-risk (balance read)"
+                        );
+                        continue 'each;
+                    }
+                };
                 amounts[i] = bal;
             }
             if amounts.iter().all(|x| x.is_zero()) {
-                bail!(
-                    "neg-risk redeem: on-chain balances are zero for {} — try Portfolio",
-                    p.condition_id
+                warn!(
+                    cond = %p.condition_id,
+                    "CTF redeem: skip neg-risk (zero on-chain balances)"
                 );
+                continue;
             }
             let data = encode_neg_risk_redeem(condition, amounts);
             (NEG_RISK_ADAPTER, data)
         } else {
             (CTF, encode_standard_redeem(condition))
         };
-
-        let nonce = relayer_get_nonce(http, cfg.signer_address).await?;
-        let digest = safe_typed_data_digest(
-            crate::config::POLYGON_CHAIN_ID,
-            cfg.funder,
-            to,
-            &calldata,
-            &nonce,
-        )?;
-        // Polymarket `buildSafeTransactionRequest` signs the EIP-712 struct hash with
-        // `signMessage(hash)` (viem/ethers) → EIP-191 `personal_sign` over the 32-byte digest,
-        // **not** raw ECDSA on the digest. See `builder-relayer-client` `createSafeSignature`.
-        let sig = signer
-            .sign_message(digest.as_slice())
-            .await
-            .context("sign SafeTx digest (EIP-191 over EIP-712 hash, relayer-compatible)")?;
-        let sig_bytes: [u8; 65] = sig.as_bytes();
-        let packed = pack_safe_rel_signature(sig_bytes)?;
-
-        let req = json!({
-            "from": format!("{:#x}", cfg.signer_address),
-            "to": format!("{to:#x}"),
-            "proxyWallet": format!("{:#x}", cfg.funder),
-            "data": format!(
-                "0x{}",
-                calldata.iter().map(|b| format!("{b:02x}")).collect::<String>()
-            ),
-            "nonce": nonce,
-            "signature": packed,
-            "signatureParams": {
-                "gasPrice": "0",
-                "operation": "0",
-                "safeTxnGas": "0",
-                "baseGas": "0",
-                "gasToken": "0x0000000000000000000000000000000000000000",
-                "refundReceiver": "0x0000000000000000000000000000000000000000"
-            },
-            "type": "SAFE",
-            "metadata": "polymarket-btc5m redeem"
-        });
-
-        let out = relayer_submit(http, rel_key, rel_addr, req).await?;
-        summaries.push(format!(
-            "{}… → relayer {} ({})",
-            &p.condition_id[..10.min(p.condition_id.len())],
-            out.transaction_id,
-            out.state
-        ));
+        ops.push((short, to, calldata));
     }
 
-    Ok(summaries.join(" | "))
+    if ops.is_empty() {
+        bail!("CTF redeem: nothing to redeem (all rows skipped or no redeemable markets)");
+    }
+
+    let (relay_to, calldata, safe_operation) = if ops.len() == 1 {
+        let (_, t, d) = ops.pop().expect("len==1");
+        (t, d, 0u8)
+    } else {
+        let mut packed = Vec::new();
+        for (_, t, d) in &ops {
+            packed.extend(gnosis_multisend_pack_inner_call(*t, U256::ZERO, d));
+        }
+        let data = encode_safe_multisend_calldata_from_packed(packed)?;
+        (SAFE_MULTISEND, data, 1u8)
+    };
+
+    let nonce = relayer_get_nonce(http, cfg.signer_address).await?;
+    let digest = safe_typed_data_digest(
+        crate::config::POLYGON_CHAIN_ID,
+        cfg.funder,
+        relay_to,
+        &calldata,
+        safe_operation,
+        &nonce,
+    )?;
+    // Polymarket `buildSafeTransactionRequest` signs the EIP-712 struct hash with
+    // `signMessage(hash)` (viem/ethers) → EIP-191 `personal_sign` over the 32-byte digest,
+    // **not** raw ECDSA on the digest. See `builder-relayer-client` `createSafeSignature`.
+    let sig = signer
+        .sign_message(digest.as_slice())
+        .await
+        .context("sign SafeTx digest (EIP-191 over EIP-712 hash, relayer-compatible)")?;
+    let sig_bytes: [u8; 65] = sig.as_bytes();
+    let packed = pack_safe_rel_signature(sig_bytes)?;
+
+    let req = json!({
+        "from": format!("{:#x}", cfg.signer_address),
+        "to": format!("{relay_to:#x}"),
+        "proxyWallet": format!("{:#x}", cfg.funder),
+        "data": format!(
+            "0x{}",
+            calldata.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ),
+        "nonce": nonce,
+        "signature": packed,
+        "signatureParams": {
+            "gasPrice": "0",
+            "operation": format!("{safe_operation}"),
+            "safeTxnGas": "0",
+            "baseGas": "0",
+            "gasToken": "0x0000000000000000000000000000000000000000",
+            "refundReceiver": "0x0000000000000000000000000000000000000000"
+        },
+        "type": "SAFE",
+        "metadata": "polymarket-btc5m redeem-all"
+    });
+
+    let out = relayer_submit(http, rel_key, rel_addr, req).await?;
+    let markets = ops.len();
+    let ids = ops
+        .iter()
+        .map(|(s, _, _)| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "{markets} market(s){} → relayer {} ({}) [{ids}]",
+        if safe_operation == 1 { " (MultiSend batch)" } else { "" },
+        out.transaction_id,
+        out.state
+    ))
 }

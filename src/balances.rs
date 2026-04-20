@@ -1,19 +1,22 @@
 //! On-chain balance panel: USDC.e cash + claimable CTF payout (standard markets).
 //!
 //! * **Cash** — `USDC.e.balanceOf(funder)` (Polymarket collateral token on Polygon).
-//! * **Claimable** — for each *standard* (non–neg-risk) redeemable market from the Data API index,
-//!   read `payoutDenominator`, `payoutNumerators`, and ERC-1155 balances on the CTF and sum
-//!   `balance * numerator / denominator`. Neg-risk rows still use Data API `currentValue` sums
-//!   (different position-id scheme; see `redeem.rs`).
+//! * **Claimable** — standard redeemable rows: `eth_call` on CTF using payout vectors plus
+//!   `balanceOf(funder, asset)` where `asset` is the outcome token id from the Data API (same id
+//!   the CLOB uses). Rows whose token id does not match derived CTF positions fall back to
+//!   `currentValue`. Neg-risk rows use Data API `currentValue`. The panel uses
+//!   `max(standard_on_chain + neg_api, sum_api_claimable)` so mis-tagged neg-risk or indexing gaps
+//!   do not show as zero when the API still reports redeemable value.
 //!
-//! Reads use direct `eth_call` and JSON-RPC **batch** `eth_call` (no Multicall3 contract) so RPC
-//! return data is plain ABI-encoded outputs — avoids Alloy `aggregate3` return decode issues on
-//! some hosted Polygon endpoints.
+//! Reads use Polygon [**Multicall3**](https://github.com/mds1/multicall) `aggregate3` at
+//! `0xcA11…CA11`: one JSON-RPC `eth_call` packs USDC `balanceOf`, all CTF payout reads, and all
+//! CTF `balanceOf` outcome tokens (chunked if the call list exceeds [`MAX_AGGREGATE3_CALLS`]).
+//! Sub-calls use `allowFailure=true` so one bad slot does not revert the whole batch.
 //!
 //! Polygon JSON-RPC uses a **direct** HTTP client (no `POLYMARKET_PROXY`); Data API keeps using the
 //! proxy-aware client from [`crate::net`].
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use alloy_primitives::{address, keccak256, Address, B256, U256};
@@ -23,13 +26,15 @@ use reqwest::Client;
 use serde_json::json;
 
 use crate::data_api::{self, DataPosition};
-use crate::redeem::parse_condition_id;
+use crate::redeem::{parse_condition_id, parse_token_id_u256};
 
 const USDC_E: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
-const CTF: Address = address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
+const CTF: Address = address!("0x4D97DCd97eC945f40cF65f87097ACe5EA0476045");
+/// [Multicall3](https://github.com/mds1/multicall) on Polygon (same address on most EVM chains).
+const MULTICALL3: Address = address!("0xcA11bde05977b3631167028862bE2a173976CA11");
 
-/// Max `eth_call` sub-requests per JSON-RPC batch (must stay within provider limits).
-const MAX_BATCH_ETH_CALLS: usize = 80;
+/// Max sub-calls per `aggregate3` (stay within RPC `eth_call` input limits).
+const MAX_AGGREGATE3_CALLS: usize = 256;
 
 sol! {
     interface IERC20 {
@@ -42,6 +47,24 @@ sol! {
         function payoutDenominator(bytes32 conditionId) external view returns (uint256);
         function payoutNumerators(bytes32 conditionId, uint256 index) external view returns (uint256);
         function balanceOf(address account, uint256 id) external view returns (uint256);
+    }
+}
+
+sol! {
+    interface Multicall3 {
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+        struct Aggregate3Result {
+            bool success;
+            bytes returnData;
+        }
+        function aggregate3(Call3[] calldata calls)
+            external
+            payable
+            returns (Aggregate3Result[] memory returnData);
     }
 }
 
@@ -119,168 +142,234 @@ async fn rpc_eth_call(
     hex::decode(s.trim_start_matches("0x")).context("decode eth_call hex")
 }
 
-/// One HTTP round-trip: multiple `eth_call` with ids `0..n-1`, results in order.
-async fn rpc_eth_call_batch(
+/// Multicall3 `aggregate3`: one `eth_call`, `allowFailure` per slot. Chunks to respect calldata limits.
+async fn rpc_aggregate3_calls(
     http: &Client,
     rpc_url: &str,
-    items: &[(Address, Vec<u8>)],
-) -> Result<Vec<Vec<u8>>> {
+    items: &[(Address, bool, Vec<u8>)],
+) -> Result<Vec<(bool, Vec<u8>)>> {
     if items.is_empty() {
         return Ok(vec![]);
     }
-    let batch: Vec<serde_json::Value> = items
-        .iter()
-        .enumerate()
-        .map(|(i, (to, data))| {
-            let data_hex =
-                format!("0x{}", data.iter().map(|b| format!("{b:02x}")).collect::<String>());
-            json!({
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{"to": format!("{to:#x}"), "data": data_hex}, "latest"],
-                "id": i,
-            })
-        })
-        .collect();
-    let resp = http
-        .post(rpc_url)
-        .json(&batch)
-        .send()
-        .await
-        .context("RPC eth_call batch")?;
-    let arr: Vec<serde_json::Value> = resp.json().await.context("RPC batch JSON")?;
-    let mut by_id: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-    for obj in arr {
-        let id = obj
-            .get("id")
-            .and_then(|x| x.as_u64())
-            .context("batch response id")?;
-        if let Some(err) = obj.get("error") {
-            anyhow::bail!("eth_call batch item {id} error: {err}");
-        }
-        let s = obj
-            .get("result")
-            .and_then(|x| x.as_str())
-            .with_context(|| format!("batch item {id} missing result"))?;
-        let bytes = hex::decode(s.trim_start_matches("0x"))
-            .with_context(|| format!("batch item {id} hex"))?;
-        by_id.insert(id, bytes);
-    }
-    if by_id.len() != items.len() {
-        anyhow::bail!(
-            "batch response count {} != requests {}",
-            by_id.len(),
-            items.len()
-        );
-    }
     let mut out = Vec::with_capacity(items.len());
-    for i in 0..items.len() {
-        let b = by_id
-            .remove(&(i as u64))
-            .ok_or_else(|| anyhow::anyhow!("missing batch result id {i}"))?;
-        out.push(b);
+    for chunk in items.chunks(MAX_AGGREGATE3_CALLS) {
+        let calls: Vec<Multicall3::Call3> = chunk
+            .iter()
+            .map(|(target, allow_failure, data)| Multicall3::Call3 {
+                target: *target,
+                allowFailure: *allow_failure,
+                callData: data.clone().into(),
+            })
+            .collect();
+        let calldata = Multicall3::aggregate3Call { calls }.abi_encode();
+        let raw = rpc_eth_call(http, rpc_url, MULTICALL3, &calldata).await?;
+        let decoded = Multicall3::aggregate3Call::abi_decode_returns(&raw, false)
+            .context("Multicall3 aggregate3 decode")?;
+        let rows = decoded.returnData;
+        let n = rows.len();
+        if n != chunk.len() {
+            anyhow::bail!(
+                "aggregate3: got {n} results for {} calls",
+                chunk.len()
+            );
+        }
+        for r in rows {
+            out.push((r.success, r.returnData.to_vec()));
+        }
     }
     Ok(out)
 }
 
-/// Sum claimable USDC (6 decimals) for standard CTF conditions via batched `eth_call`.
-async fn claimable_standard_usdc(
-    http: &Client,
-    rpc_url: &str,
-    funder: Address,
-    conditions: &[B256],
-) -> Result<f64> {
-    if conditions.is_empty() {
-        return Ok(0.0);
-    }
+struct StandardClaimPrep {
+    parsed: Vec<(B256, U256, f64)>,
+    conds: Vec<B256>,
+    token_ids: Vec<U256>,
+}
 
-    let mut total = U256::ZERO;
-    let per_cond = 5usize;
-    let chunk_conds = (MAX_BATCH_ETH_CALLS / per_cond).max(1);
-
-    for chunk in conditions.chunks(chunk_conds) {
-        let mut batch_items: Vec<(Address, Vec<u8>)> = Vec::with_capacity(chunk.len() * per_cond);
-
-        for cond in chunk {
-            let col1 = collection_id(*cond, 1);
-            let col2 = collection_id(*cond, 2);
-            let pos1 = position_id(USDC_E, col1);
-            let pos2 = position_id(USDC_E, col2);
-
-            batch_items.push((
-                CTF,
-                ICTF::payoutDenominatorCall { conditionId: *cond }.abi_encode(),
-            ));
-            // CTF `payoutNumerators` uses **outcome slot index** 0..n-1 (binary → 0 and 1). Index *sets*
-            // 1 and 2 below are only for `getCollectionId` / ERC-1155 `positionId`.
-            batch_items.push((
-                CTF,
-                ICTF::payoutNumeratorsCall {
-                    conditionId: *cond,
-                    index: U256::from(0u64),
-                }
-                .abi_encode(),
-            ));
-            batch_items.push((
-                CTF,
-                ICTF::payoutNumeratorsCall {
-                    conditionId: *cond,
-                    index: U256::from(1u64),
-                }
-                .abi_encode(),
-            ));
-            batch_items.push((
-                CTF,
-                ICTF::balanceOfCall {
-                    account: funder,
-                    id: pos1,
-                }
-                .abi_encode(),
-            ));
-            batch_items.push((
-                CTF,
-                ICTF::balanceOfCall {
-                    account: funder,
-                    id: pos2,
-                }
-                .abi_encode(),
-            ));
+fn prepare_standard_claimable_parsed(rows: &[DataPosition]) -> StandardClaimPrep {
+    let mut by_key: HashMap<(B256, U256), f64> = HashMap::new();
+    for p in rows {
+        if !p.redeemable || p.negative_risk {
+            continue;
         }
+        let Ok(cid) = parse_condition_id(&p.condition_id) else {
+            continue;
+        };
+        let Ok(tid) = parse_token_id_u256(&p.asset) else {
+            continue;
+        };
+        if !p.current_value.is_finite() {
+            continue;
+        }
+        by_key
+            .entry((cid, tid))
+            .and_modify(|v| *v = v.max(p.current_value))
+            .or_insert(p.current_value);
+    }
+    let parsed: Vec<(B256, U256, f64)> = by_key.into_iter().map(|((c, t), v)| (c, t, v)).collect();
+    if parsed.is_empty() {
+        return StandardClaimPrep {
+            parsed,
+            conds: vec![],
+            token_ids: vec![],
+        };
+    }
+    let mut conds: Vec<B256> = parsed.iter().map(|(c, _, _)| *c).collect::<HashSet<_>>().into_iter().collect();
+    conds.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let mut token_ids: Vec<U256> = parsed.iter().map(|(_, t, _)| *t).collect::<HashSet<_>>().into_iter().collect();
+    token_ids.sort();
+    StandardClaimPrep {
+        parsed,
+        conds,
+        token_ids,
+    }
+}
 
-        let raws = rpc_eth_call_batch(http, rpc_url, &batch_items).await?;
-        let mut i = 0usize;
-        for _cond in chunk {
-            if i + per_cond > raws.len() {
-                break;
-            }
-            let denom = decode_uint256_return(&raws[i]).unwrap_or(U256::ZERO);
-            let n1 = decode_uint256_return(&raws[i + 1]).unwrap_or(U256::ZERO);
-            let n2 = decode_uint256_return(&raws[i + 2]).unwrap_or(U256::ZERO);
-            let b1 = decode_uint256_return(&raws[i + 3]).unwrap_or(U256::ZERO);
-            let b2 = decode_uint256_return(&raws[i + 4]).unwrap_or(U256::ZERO);
-            i += per_cond;
+fn claimable_standard_total_from_maps(
+    parsed: &[(B256, U256, f64)],
+    payouts: &HashMap<B256, (U256, U256, U256)>,
+    balances: &HashMap<U256, U256>,
+) -> f64 {
+    let mut total = 0.0f64;
+    for &(cid, tid, api_fb) in parsed {
+        let Some((d, n0, n1)) = payouts.get(&cid).copied() else {
+            total += api_fb;
+            continue;
+        };
+        let pos1 = position_id(USDC_E, collection_id(cid, 1));
+        let pos2 = position_id(USDC_E, collection_id(cid, 2));
+        let b = balances.get(&tid).copied().unwrap_or(U256::ZERO);
 
-            if denom.is_zero() {
-                continue;
-            }
-            total += b1 * n1 / denom;
-            total += b2 * n2 / denom;
+        if d.is_zero() {
+            total += api_fb;
+            continue;
+        }
+        if tid != pos1 && tid != pos2 {
+            total += api_fb;
+            continue;
+        }
+        let n = if tid == pos1 { n0 } else { n1 };
+        let slot_usdc = u256_to_usdc_f64(b * n / d);
+        if slot_usdc > 1e-9 {
+            total += slot_usdc;
+        } else if api_fb > 1e-9 {
+            total += api_fb;
         }
     }
-
-    Ok(u256_to_usdc_f64(total))
+    total
 }
 
 async fn fetch_onchain_cash_and_claim_std(
     http_rpc: &Client,
     rpc_url: &str,
     funder: Address,
-    conditions: &[B256],
+    redeemable_rows: &[DataPosition],
 ) -> Result<(f64, f64)> {
-    let cash = usdc_e_cash_f64(http_rpc, rpc_url, funder)
-        .await
-        .context("USDC.e balance eth_call")?;
-    let claim_std = claimable_standard_usdc(http_rpc, rpc_url, funder, conditions).await?;
+    let prep = prepare_standard_claimable_parsed(redeemable_rows);
+    if prep.parsed.is_empty() {
+        let cash = usdc_e_cash_f64(http_rpc, rpc_url, funder).await?;
+        return Ok((cash, 0.0));
+    }
+
+    let StandardClaimPrep {
+        parsed,
+        conds,
+        token_ids,
+    } = prep;
+
+    let mut calls: Vec<(Address, bool, Vec<u8>)> = Vec::new();
+    calls.push((
+        USDC_E,
+        true,
+        IERC20::balanceOfCall { account: funder }.abi_encode(),
+    ));
+    for cond in &conds {
+        calls.push((
+            CTF,
+            true,
+            ICTF::payoutDenominatorCall { conditionId: *cond }.abi_encode(),
+        ));
+        calls.push((
+            CTF,
+            true,
+            ICTF::payoutNumeratorsCall {
+                conditionId: *cond,
+                index: U256::ZERO,
+            }
+            .abi_encode(),
+        ));
+        calls.push((
+            CTF,
+            true,
+            ICTF::payoutNumeratorsCall {
+                conditionId: *cond,
+                index: U256::from(1u64),
+            }
+            .abi_encode(),
+        ));
+    }
+    for tid in &token_ids {
+        calls.push((
+            CTF,
+            true,
+            ICTF::balanceOfCall {
+                account: funder,
+                id: *tid,
+            }
+            .abi_encode(),
+        ));
+    }
+
+    let results = rpc_aggregate3_calls(http_rpc, rpc_url, &calls).await?;
+
+    let mut i = 0usize;
+    let (cash_ok, cash_raw) = &results[i];
+    i += 1;
+    let cash = if *cash_ok {
+        decode_uint256_return(cash_raw)
+            .map(u256_to_usdc_f64)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+
+    let mut payouts: HashMap<B256, (U256, U256, U256)> = HashMap::with_capacity(conds.len());
+    for cond in &conds {
+        let d = results
+            .get(i)
+            .filter(|(ok, _)| *ok)
+            .and_then(|(_, data)| decode_uint256_return(data).ok())
+            .unwrap_or(U256::ZERO);
+        i += 1;
+        let n0 = results
+            .get(i)
+            .filter(|(ok, _)| *ok)
+            .and_then(|(_, data)| decode_uint256_return(data).ok())
+            .unwrap_or(U256::ZERO);
+        i += 1;
+        let n1 = results
+            .get(i)
+            .filter(|(ok, _)| *ok)
+            .and_then(|(_, data)| decode_uint256_return(data).ok())
+            .unwrap_or(U256::ZERO);
+        i += 1;
+        payouts.insert(*cond, (d, n0, n1));
+    }
+
+    let mut balances: HashMap<U256, U256> = HashMap::with_capacity(token_ids.len());
+    for tid in &token_ids {
+        let b = results
+            .get(i)
+            .filter(|(ok, _)| *ok)
+            .and_then(|(_, data)| decode_uint256_return(data).ok())
+            .unwrap_or(U256::ZERO);
+        i += 1;
+        balances.insert(*tid, b);
+    }
+
+    debug_assert_eq!(i, results.len());
+
+    let claim_std = claimable_standard_total_from_maps(&parsed, &payouts, &balances);
     Ok((cash, claim_std))
 }
 
@@ -299,7 +388,7 @@ fn sum_neg_risk_claimable_usdc(rows: &[DataPosition]) -> f64 {
         .sum()
 }
 
-/// Cash (USDC.e) + claimable: standard CTF via `eth_call` / batch; neg-risk redeemable rows from Data API values.
+/// Cash (USDC.e) + claimable: standard CTF via Multicall3 `aggregate3`; neg-risk from Data API; floor vs full API sum.
 pub async fn fetch_balance_panel_usdc(
     http_data_api: &Client,
     http_rpc: &Client,
@@ -309,27 +398,16 @@ pub async fn fetch_balance_panel_usdc(
     let redeemable_rows = match data_api::fetch_redeemable_positions(http_data_api, funder).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::debug!(error = %e, "data-api redeemable positions (for index + neg-risk) failed");
+            tracing::warn!(error = %e, "data-api redeemable positions failed — claimable may be understated");
             Vec::new()
         }
     };
 
-    let mut std_ids: HashSet<B256> = HashSet::new();
-    for p in &redeemable_rows {
-        if !p.redeemable || p.negative_risk {
-            continue;
-        }
-        if let Ok(cid) = parse_condition_id(&p.condition_id) {
-            std_ids.insert(cid);
-        }
-    }
-    let mut conditions: Vec<B256> = std_ids.into_iter().collect();
-    conditions.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-
     let claim_neg = sum_neg_risk_claimable_usdc(&redeemable_rows);
 
     let (cash, claim_std) =
-        fetch_onchain_cash_and_claim_std(http_rpc, rpc_url, funder, &conditions).await?;
-    let total_claim = claim_std + claim_neg;
+        fetch_onchain_cash_and_claim_std(http_rpc, rpc_url, funder, &redeemable_rows).await?;
+    let api_total = data_api::sum_claimable_usdc(&redeemable_rows);
+    let total_claim = (claim_std + claim_neg).max(api_total);
     Ok((cash, total_claim))
 }

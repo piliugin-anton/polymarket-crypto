@@ -204,7 +204,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // On-chain USDC.e cash + claimable (CTF via `eth_call` / batch); Data API indexes redeemable markets
+    // On-chain USDC.e cash + claimable (CTF via Multicall3 `aggregate3`); Data API indexes redeemable markets
     // (and neg-risk `currentValue`). Polygon RPC uses a direct HTTP client (no `POLYMARKET_PROXY`).
     {
         let tx = tx.clone();
@@ -243,7 +243,7 @@ async fn main() -> Result<()> {
                                 cash_usdc = cash,
                                 claimable_usdc = claimable,
                                 funder = %format!("{funder:#x}"),
-                                "balance panel: on-chain USDC.e + CTF claimable (eth_call batch; neg-risk from Data API)"
+                                "balance panel: on-chain USDC.e + CTF claimable (Multicall3; neg-risk from Data API)"
                             );
                             let _ = tx
                                 .send(AppEvent::BalancePanelLoaded {
