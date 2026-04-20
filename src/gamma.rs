@@ -1,7 +1,9 @@
 //! Gamma API client.
 //!
-//! Used exclusively for market *discovery*: we hit this no-auth REST API every
-//! ~30s to find the currently-active "Bitcoin Up or Down - 5m" market and extract
+//! Used exclusively for market *discovery*: the app’s Gamma poll task calls into
+//! this no-auth REST API (**60&nbsp;s** while the window is open, **1&nbsp;s** after
+//! `closes_at` until the next market appears; requests are mutex-serialized) to find the
+//! currently-active "Bitcoin Up or Down - 5m" market and extract
 //! the UP / DOWN token IDs, the tick size, neg_risk flag, and the "Price to Beat".
 //!
 //! Market slug pattern:
@@ -9,9 +11,10 @@
 //!
 //! Each market has a single event with two outcome tokens (Up / Down).
 //!
-//! Discovery uses `GET /events?slug=btc-updown-5m-{ts}` (one event per slug).
-//! Gamma’s `/events` filter is `tag_id` (numeric), not `tag_slug` — listing by a
-//! bogus tag string returned no `btc-updown-5m-*` rows.
+//! Discovery uses **`GET /markets/slug/btc-updown-5m-{ts}`** (single market object).
+//! Polymarket documents slug lookup as path-based `/markets/slug/` and `/events/slug/`
+//! rather than `?slug=` filters; the latter can mis-match recurring 5m markets.
+//! See [Fetch markets guide](https://docs.polymarket.com/developers/gamma-markets-api/fetch-markets-guide).
 //!
 //! **Price to beat (opening USD)** — prefer Polymarket’s
 //! [`crate::config::POLYMARKET_CRYPTO_PRICE_URL`] (`openPrice`), then description
@@ -19,6 +22,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use tracing::debug;
 use url::Url;
@@ -102,6 +106,8 @@ struct RawMarket {
     #[serde(default)] description:    String,
     #[serde(default, rename = "startDate")] start_date: Option<String>,
     #[serde(default, rename = "endDate")]   end_date:   Option<String>,
+    /// Trading-window start on slug responses (preferred over `startDate` when present).
+    #[serde(default, rename = "eventStartTime")] event_start_time: Option<String>,
     #[serde(default)] closed: bool,
 }
 
@@ -119,14 +125,14 @@ impl GammaClient {
     /// Find the 5-min BTC market whose trading window contains `now`.
     ///
     /// Strategy: align `now` to the 5-minute grid, then request
-    /// `/events?slug=btc-updown-5m-{unix}` for that window and neighbors.
-    /// Pick the event where `start <= now < end`, else the next upcoming window.
+    /// `/markets/slug/btc-updown-5m-{unix}` for that window and neighbors.
+    /// Pick the market where `start <= now < end`, else the next upcoming window.
     pub async fn find_current_btc_5m(&self) -> Result<ActiveMarket> {
         let now = Utc::now();
         let now_ts = now.timestamp();
         let base = (now_ts / BTC_5M_WINDOW_SEC) * BTC_5M_WINDOW_SEC;
 
-        let mut candidates: Vec<RawEvent> = Vec::new();
+        let mut candidates: Vec<RawMarket> = Vec::new();
         for off in [
             0,
             BTC_5M_WINDOW_SEC,
@@ -136,48 +142,60 @@ impl GammaClient {
         ] {
             let ts = base + off;
             let slug = format!("btc-updown-5m-{ts}");
-            let url = format!("{GAMMA_HOST}/events?slug={slug}");
-            debug!(%url, "gamma: fetch event by slug");
+            let url = format!("{GAMMA_HOST}/markets/slug/{slug}");
+            debug!(%url, "gamma: fetch market by slug");
 
-            let resp: Vec<RawEvent> = self
+            let resp = self
                 .http
                 .get(&url)
                 .send()
                 .await
-                .with_context(|| format!("gamma GET {url} failed"))?
+                .with_context(|| format!("gamma GET {url} failed"))?;
+
+            if resp.status() == StatusCode::NOT_FOUND {
+                continue;
+            }
+
+            let m: RawMarket = resp
                 .error_for_status()
                 .with_context(|| format!("gamma GET {url} bad status"))?
                 .json()
                 .await
                 .with_context(|| format!("gamma GET {url} decode failed"))?;
 
-            if let Some(e) = resp.into_iter().next() {
-                candidates.push(e);
+            if m.closed {
+                continue;
             }
+            candidates.push(m);
         }
 
-        candidates.sort_by_key(|e| e.start_date.clone().unwrap_or_default());
+        candidates.sort_by_key(|m| {
+            m.slug
+                .strip_prefix("btc-updown-5m-")
+                .and_then(|t| t.parse::<i64>().ok())
+                .unwrap_or(i64::MAX)
+        });
 
-        let event = candidates
+        let market = candidates
             .iter()
-            .find(|e| {
-                match (parse_ts(e.start_date.as_deref()), parse_ts(e.end_date.as_deref())) {
+            .find(|m| {
+                match (gamma_market_window_start(m), parse_ts(m.end_date.as_deref())) {
                     (Some(s), Some(c)) => s <= now && now < c,
                     _ => false,
                 }
             })
             .or_else(|| {
-                candidates.iter().find(|e| {
-                    parse_ts(e.start_date.as_deref()).map_or(false, |s| s >= now)
+                candidates.iter().find(|m| {
+                    gamma_market_window_start(m).map_or(false, |s| s >= now)
                 })
             })
             .ok_or_else(|| {
                 anyhow!(
-                    "no active or upcoming btc-updown-5m-* event (tried windows around unix {base})"
+                    "no active or upcoming btc-updown-5m-* market (tried windows around unix {base})"
                 )
             })?;
 
-        let mut m = active_market_from_raw_event(event)?;
+        let mut m = active_market_from_raw_market(market, None)?;
         let (win_start, win_end) = utc_five_minute_window_bounds(&m.slug, m.opens_at);
         m.opens_at = win_start;
         m.closes_at = win_end;
@@ -270,6 +288,12 @@ fn floor_utc_to_five_minutes(t: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(floored, 0).unwrap_or(t)
 }
 
+/// Earliest usable window start for filtering `/markets/slug` rows.
+fn gamma_market_window_start(m: &RawMarket) -> Option<DateTime<Utc>> {
+    parse_ts(m.event_start_time.as_deref())
+        .or_else(|| parse_ts(m.start_date.as_deref()))
+}
+
 /// Maps a Gamma `RawEvent` + its first open market to [`ActiveMarket`].
 fn active_market_from_raw_event(event: &RawEvent) -> Result<ActiveMarket> {
     let m = event
@@ -277,7 +301,10 @@ fn active_market_from_raw_event(event: &RawEvent) -> Result<ActiveMarket> {
         .iter()
         .find(|m| !m.closed)
         .ok_or_else(|| anyhow!("event has no open markets"))?;
+    active_market_from_raw_market(m, Some(event))
+}
 
+fn active_market_from_raw_market(m: &RawMarket, event: Option<&RawEvent>) -> Result<ActiveMarket> {
     let token_ids: Vec<String> = serde_json::from_str(&m.clob_token_ids)
         .context("parsing clobTokenIds")?;
     if token_ids.len() < 2 {
@@ -307,6 +334,14 @@ fn active_market_from_raw_event(event: &RawEvent) -> Result<ActiveMarket> {
         None => "0.01".into(),
     };
 
+    let opens_at = parse_ts(m.event_start_time.as_deref())
+        .or_else(|| parse_ts(m.start_date.as_deref()))
+        .or_else(|| event.and_then(|e| parse_ts(e.start_date.as_deref())))
+        .unwrap_or_else(Utc::now);
+    let closes_at = parse_ts(m.end_date.as_deref())
+        .or_else(|| event.and_then(|e| parse_ts(e.end_date.as_deref())))
+        .unwrap_or_else(Utc::now);
+
     Ok(ActiveMarket {
         condition_id: m.condition_id.clone(),
         question:     m.question.clone(),
@@ -316,10 +351,8 @@ fn active_market_from_raw_event(event: &RawEvent) -> Result<ActiveMarket> {
         tick_size,
         neg_risk:    m.neg_risk,
         price_to_beat,
-        opens_at: parse_ts(m.start_date.as_deref().or(event.start_date.as_deref()))
-            .unwrap_or_else(Utc::now),
-        closes_at: parse_ts(m.end_date.as_deref().or(event.end_date.as_deref()))
-            .unwrap_or_else(Utc::now),
+        opens_at,
+        closes_at,
         crypto_price_query_start_utc: String::new(),
         crypto_price_query_end_utc:   String::new(),
     })

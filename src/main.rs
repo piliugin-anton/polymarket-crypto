@@ -4,7 +4,7 @@
 //!   1. Tracing → stderr (filtered by RUST_LOG).
 //!   2. Trading client (derives L2 API creds on first use).
 //!   3. Chainlink RTDS task (BTC price).
-//!   4. Market discovery (`new_market` WS + Gamma fallback) + auto-roll task.
+//!   4. Market discovery (Gamma poll) + auto-roll task.
 //!   5. CLOB book subscription task — restarted on each market roll.
 //!   6. Crossterm event task.
 //!   7. 1-Hz ticker for countdown.
@@ -263,7 +263,7 @@ async fn main() -> Result<()> {
 
     // Market discovery + book-subscription supervisor
     let (market_tx, mut market_rx) = mpsc::channel::<gamma::ActiveMarket>(8);
-    feeds::market_discovery_ws::spawn(tx.clone(), market_tx);
+    feeds::market_discovery_gamma::spawn(tx.clone(), market_tx);
 
     // When a new market arrives, tear down the old book WS and start a new one.
     let tx_for_books = tx.clone();

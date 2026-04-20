@@ -18,9 +18,9 @@ current 5m window closes — all from single-key actions.
 │ 1 Hz Tick           │──▶│         AppState              │◀──│ CLOB market WS      │
 └─────────────────────┘   │            ↓                  │   │ per-market book     │
 ┌─────────────────────┐   │     ratatui::draw             │   │ (supervisor restarts│
-│ CLOB market WS      │──▶│  throttled ~20 Hz on feeds    │   │  on each roll)      │
-│ `new_market` +      │   │                               │   └─────────────────────┘
-│ Gamma fallback 60s  │   └───────────────┬───────────────┘
+│ Gamma poll 60s/1s   │──▶│  throttled ~20 Hz on feeds    │   │  on each roll)      │
+│ (discovery)         │   │                               │   └─────────────────────┘
+│                     │   └───────────────┬───────────────┘
 └─────────────────────┘                   │
          ┌────────────────────────────────┼────────────────────────────┐
          ▼                                ▼                            ▼
@@ -66,15 +66,14 @@ Gamma, CLOB REST, Data API, RTDS, and both CLOB sockets. The **balance panel**
 uses a **separate** HTTP client to `POLYGON_RPC_URL` only (no proxy) so
 `eth_call` reads stay fast and are not routed through a Polymarket-blocked path.
 
-**Market discovery.** A dedicated CLOB **market** WebSocket subscribes with an
-empty `assets_ids` list and `custom_feature_enabled: true` so **global**
-`new_market` events arrive (narrow token subscriptions miss the next 5&nbsp;m
-window). When a slug looks like the current `btc-updown-5m-*` grid, the client
-calls `GammaClient::find_current_btc_5m` to resolve a full [`ActiveMarket`](src/gamma.rs).
-A **60&nbsp;s** Gamma poll runs as a fallback if the socket is quiet. A
-supervisor task aborts the previous per-market book connection and starts a new
-one on each roll; it also kicks off a positions sync (CLOB balances + `/data/trades`
-replay, Data API sizes for escrowed sells) and a 5&nbsp;s open-order poller.
+**Market discovery.** A background task calls `GammaClient::find_current_btc_5m`
+once at startup, then **every 60&nbsp;s** while the current window is open and
+**every 1&nbsp;s** after `closes_at` until Gamma exposes the next window (only one
+Gamma request at a time via an async mutex). It resolves the active
+`btc-updown-5m-*` [`ActiveMarket`](src/gamma.rs). A supervisor task aborts
+the previous per-market book WebSocket and starts a new one on each roll; it
+also kicks off a positions sync (CLOB balances + `/data/trades` replay, Data API
+sizes for escrowed sells) and a 5&nbsp;s open-order poller.
 
 **Balances and claimable.** A 5&nbsp;s task reads **on-chain** values via Polygon
 [Multicall3](https://github.com/mds1/multicall) **`aggregate3`** (one `eth_call`
@@ -297,7 +296,7 @@ src/
 ├── feeds/
 │   ├── chainlink.rs        # RTDS WS → PriceTick
 │   ├── clob_ws.rs          # per-market CLOB WS → BookSnapshot
-│   └── market_discovery_ws.rs  # global new_market + Gamma fallback
+│   └── market_discovery_gamma.rs  # Gamma poll → ActiveMarket
 └── ui/
     └── render.rs           # ratatui layout
 ```
