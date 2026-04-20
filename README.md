@@ -82,16 +82,16 @@ resolution, so the header matches settlement logic.
 
 ## Debugging
 
-Every run writes a log to `./btc5m-bot.log` (override with `BTC5M_LOG_PATH`).
+Every run writes a log to `./polymarket-btc5m.log` (override with `BTC5M_LOG_PATH`).
 Default log level is `debug` — every HTTP response body, every WS subscribe
-message, every EIP-712 digest is captured there. `tail -f btc5m-bot.log` in
+message, every EIP-712 digest is captured there. `tail -f polymarket-btc5m.log` in
 another pane while the TUI runs.
 
 If CLOB auth fails, the TUI's status line will scroll through the error
 chain over ~10 seconds. For the definitive dump, quit the TUI and run:
 
 ```sh
-./target/release/btc5m-bot debug-auth
+./target/release/polymarket-btc5m debug-auth
 ```
 
 That prints everything: the signer address, the funder, the proxy status,
@@ -139,7 +139,7 @@ You'll see `proxy=…` in the startup log line when it's active.
 If you see `could not derive CLOB API credentials` in the startup log, run:
 
 ```sh
-./target/release/btc5m-bot debug-auth
+./target/release/polymarket-btc5m debug-auth
 ```
 
 This skips the TUI, runs the L1 auth flow with verbose output, and prints
@@ -194,7 +194,7 @@ cargo build --release
 ### Run
 
 ```sh
-RUST_LOG=btc5m_bot=debug ./target/release/polymarket-btc5m
+RUST_LOG=polymarket-btc5m=debug ./target/release/polymarket-btc5m
 ```
 
 ## Key bindings

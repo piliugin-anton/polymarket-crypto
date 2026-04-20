@@ -461,7 +461,7 @@ pub async fn redeem_resolved_positions(
                 "refundReceiver": "0x0000000000000000000000000000000000000000"
             },
             "type": "SAFE",
-            "metadata": "btc5m-bot redeem"
+            "metadata": "polymarket-btc5m redeem"
         });
 
         let out = relayer_submit(http, rel_key, rel_addr, req).await?;

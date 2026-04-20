@@ -73,7 +73,7 @@ pub fn proxy_env() -> Option<String> {
 pub fn reqwest_client() -> Result<reqwest::Client> {
     use std::time::Duration;
     let mut b = reqwest::Client::builder()
-        .user_agent("btc5m-bot/0.1")
+        .user_agent("polymarket-btc5m/0.1")
         .timeout(Duration::from_secs(15))
         .http2_prior_knowledge()
         .http2_keep_alive_interval(Duration::from_secs(30))
