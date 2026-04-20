@@ -26,9 +26,16 @@ current 5m window closes — all from single-key actions.
          ▼                                ▼                            ▼
 ┌─────────────────┐              ┌──────────────────┐        ┌─────────────────────┐
 │ Gamma REST      │              │ TradingClient    │        │ Data API (HTTP)     │
-│ ActiveMarket    │              │ EIP-712 orders   │        │ positions, claimable│
-│ resolution      │              │ L1/L2 CLOB REST  │        │ (balance panel,     │
-└─────────────────┘              └──────────────────┘        │  roll bootstrap)    │
+│ ActiveMarket    │              │ EIP-712 orders   │        │ positions index,    │
+│ resolution      │              │ L1/L2 CLOB REST  │        │ neg-risk claimable  │
+└─────────────────┘              └──────────────────┘        │ (roll bootstrap)    │
+                                                             └──────────┬──────────┘
+                                                                        │
+                                                             ┌──────────▼──────────┐
+                                                             │ Polygon JSON-RPC    │
+                                                             │ (direct `eth_call`/ │
+                                                             │  batch — balance    │
+                                                             │  panel cash + CTF)  │
                                                              └─────────────────────┘
 ```
 
@@ -55,7 +62,9 @@ later REST calls use HMAC-SHA256 over `ts + method + path + body`.
 
 **Networking.** `net` builds a proxy-aware `reqwest` client and WebSocket
 tunnels (`POLYMARKET_PROXY`: HTTP `CONNECT` or SOCKS5, then TLS + WS) shared by
-Gamma, CLOB REST, Data API, RTDS, and both CLOB sockets.
+Gamma, CLOB REST, Data API, RTDS, and both CLOB sockets. The **balance panel**
+uses a **separate** HTTP client to `POLYGON_RPC_URL` only (no proxy) so
+`eth_call` reads stay fast and are not routed through a Polymarket-blocked path.
 
 **Market discovery.** A dedicated CLOB **market** WebSocket subscribes with an
 empty `assets_ids` list and `custom_feature_enabled: true` so **global**
@@ -67,10 +76,15 @@ supervisor task aborts the previous per-market book connection and starts a new
 one on each roll; it also kicks off a positions sync (CLOB balances + `/data/trades`
 replay, Data API sizes for escrowed sells) and a 5&nbsp;s open-order poller.
 
-**Balances and claimable.** A 5&nbsp;s loop reads CLOB collateral cash and sums
-Data API `redeemable` positions for the balance panel. **Redeem:** with
-`POLYMARKET_RELAYER_API_KEY` (+ address) set, `redeem` submits gasless Safe
-`execTransaction` bundles to the Polymarket relayer (`redeemPositions` on CTF).
+**Balances and claimable.** A 5&nbsp;s task reads **on-chain** values via Polygon
+`eth_call` (direct JSON-RPC batch): **USDC.e** cash (`balanceOf` on the bridged
+collateral token) and **standard CTF** claimable from `payoutDenominator` /
+`payoutNumerators` + ERC-1155 balances on the Conditional Tokens contract (see
+[`balances.rs`](src/balances.rs)). The Data API lists **redeemable** markets
+(standard) and supplies **neg-risk** claimable sums where position IDs differ.
+**Redeem:** with `POLYMARKET_RELAYER_API_KEY` (+ address) set, `redeem` submits
+gasless Safe `execTransaction` bundles to the Polymarket relayer
+(`redeemPositions` on CTF / neg-risk adapter).
 
 **Fees and take-profit.** `fees` implements Polymarket **crypto** taker fees for
 PnL and for limit prices after optional **market BUY → GTD take-profit** sells
@@ -100,7 +114,7 @@ signature, then hits both `/auth/derive-api-key` and `/auth/api-key` and
 shows the exact status + body you got back. If the digest looks right but
 the server still says 401, the problem is usually one of:
 
-- **Signer address doesn't match POLY_ADDRESS** — check that your
+- **Signer address doesn't match the wallet Polymarket expects** — check that your
   `POLYMARKET_PK` is for the right EOA. The `debug-auth` output shows the
   address derived from your key.
 - **Clock skew** — `date -u` vs a known reference. Off by more than ~10s
@@ -187,9 +201,14 @@ layer (headers, proxy, TLS).
 git clone <your-fork>
 cd polymarket-btc5m
 cp .env.example .env
-# ...edit .env with your keys
+# ...edit .env with your keys (incl. POLYGON_RPC_URL for on-chain balance reads)
 cargo build --release
 ```
+
+Set **`POLYGON_RPC_URL`** to a reliable Polygon HTTPS endpoint (Alchemy, drpc,
+public `polygon-rpc.com`, etc.). The TUI balance panel does **not** use
+`POLYMARKET_PROXY` for this URL. If you see empty Cash/Claimable, verify the URL
+and that the process was restarted after editing `.env`.
 
 ### Run
 
@@ -209,7 +228,7 @@ Normal mode:
 | `c`     | cancel ALL open orders                 |
 | `s`     | edit persistent ticket size            |
 | `r`     | force-refresh active market            |
-| `q` / `Esc` / `Ctrl-C` | quit                      |
+| `q` / `Esc` / `Ctrl-C` | quit                    |
 
 Limit modal:
 
@@ -219,7 +238,7 @@ Limit modal:
 | ↑ / ↓   | flip side (BUY ↔ SELL)                 |
 | `Tab`   | switch price / size field              |
 | digits / `.` | edit current field                |
-| `Enter` | submit as **GTD** limit order |
+| `Enter` | submit as **GTD** limit order          |
 | `Esc`   | cancel modal                           |
 
 GTD expiration is chosen so the order stops resting about **one second before** the active market’s `closes_at`. The CLOB expects a unix `expiration` field with Polymarket’s **+60s** security buffer on top of that instant (see [Create order → GTD](https://docs.polymarket.com/developers/CLOB/orders/create-order)). **CLOB API signing version must be 1** (EIP-712 includes `expiration`); if `/version` returns `2`, GTD placement is rejected until the client supports it.
@@ -256,7 +275,8 @@ src/
 ├── events.rs               # keyboard → Action (pure)
 ├── gamma.rs                # Gamma REST, ActiveMarket, GTD expiration helper
 ├── trading.rs              # EIP-712 orders, L1/L2 auth, CLOB REST
-├── data_api.rs             # Data API: positions, claimable/redeemable
+├── balances.rs             # On-chain USDC.e + CTF claimable (Polygon eth_call / batch)
+├── data_api.rs             # Data API: positions, redeemable index, neg-risk
 ├── redeem.rs               # CTF redeem via Polymarket relayer (Safe)
 ├── fees.rs                 # crypto taker fee + take-profit limit price
 ├── net.rs                  # proxy-aware HTTP + WebSocket connect
