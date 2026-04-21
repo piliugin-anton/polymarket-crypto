@@ -104,12 +104,12 @@ impl Config {
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .or(legacy_slippage_bps)
-            .unwrap_or(200);
+            .unwrap_or(50);
         let market_sell_slippage_bps = std::env::var("MARKET_SELL_SLIPPAGE_BPS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .or(legacy_slippage_bps)
-            .unwrap_or(200);
+            .unwrap_or(50);
 
         let market_buy_take_profit_bps = std::env::var("MARKET_BUY_TAKE_PROFIT_BPS")
             .ok()

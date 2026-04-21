@@ -32,6 +32,22 @@ use crate::config::{GAMMA_HOST, POLYMARKET_CRYPTO_PRICE_URL};
 /// Five-minute window length in seconds (matches Polymarket BTC 5m slugs).
 pub const BTC_5M_WINDOW_SEC: i64 = 300;
 
+/// Gamma returns `orderPriceMinTickSize` as JSON number; `format!("{v}")` on `f64` can emit IEEE
+/// tails (e.g. `0.010000000000000009`). Trim to a short decimal so CLOB rounding config matches
+/// Polymarket `ROUNDING_CONFIG` keys (`"0.01"`, `"0.001"`, …).
+fn gamma_tick_f64_to_string(v: f64) -> String {
+    if !v.is_finite() || v <= 0.0 {
+        return "0.01".into();
+    }
+    let s = format!("{:.12}", v);
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-" {
+        "0.01".into()
+    } else {
+        s.to_string()
+    }
+}
+
 /// What the rest of the app needs to know about a market.
 #[derive(Debug, Clone)]
 pub struct ActiveMarket {
@@ -322,7 +338,7 @@ fn active_market_from_raw_market(m: &RawMarket, event: Option<&RawEvent>) -> Res
         Some(v) if (v - 0.01).abs() < 1e-7 => "0.01".into(),
         Some(v) if (v - 0.001).abs() < 1e-8 => "0.001".into(),
         Some(v) if (v - 0.0001).abs() < 1e-9 => "0.0001".into(),
-        Some(v) => format!("{v}"),
+        Some(v) => gamma_tick_f64_to_string(v),
         None => "0.01".into(),
     };
 
@@ -403,4 +419,16 @@ fn extract_price_to_beat(desc: &str) -> Option<f64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tick_string_tests {
+    use super::gamma_tick_f64_to_string;
+
+    #[test]
+    fn formats_tick_without_excess_trailing_zeros() {
+        assert_eq!(gamma_tick_f64_to_string(0.001), "0.001");
+        assert_eq!(gamma_tick_f64_to_string(0.15), "0.15");
+        assert_eq!(gamma_tick_f64_to_string(0.123456789012), "0.123456789012");
+    }
 }

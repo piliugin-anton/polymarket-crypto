@@ -1336,6 +1336,9 @@ impl TradingClient {
             const ZERO32: &str =
                 "0x0000000000000000000000000000000000000000000000000000000000000000";
 
+            // Polymarket TS `orderToJson` / `NewOrder`: there is **no** `price` key on the wire.
+            // Tick rules apply to **implied** price from `makerAmount` & `takerAmount` (decimal
+            // **strings**, 1e6 token units). `salt` is a JSON **number** (`parseInt` in the client).
             let body = match api_version {
                 1 => {
                     // EIP-712 V1 — `exchangeOrderBuilderV1.ts` + `ctfExchangeV1TypedData.ts`
@@ -1588,25 +1591,31 @@ impl TradingClient {
     }
 }
 
-/// Polymarket `ROUNDING_CONFIG` in `py-clob-client` `order_builder/builder.py`:
-/// `(price_decimals, size_decimals, amount_decimals)` — `amount` is max precision for the **USDC**
-/// leg on BUY and the **USDC received** leg on SELL (4 for tick `0.01`, not 2).
-/// Nearest tick (e.g. 0.51269 + tick 0.01 → 0.51). Avoids float drift on `n * tick`.
-fn snap_price_to_nearest_tick(price: f64, tick: &str) -> f64 {
+/// Limit price as **integer** micros (`human * 1e6`), always an exact multiple of the tick in micros.
+/// Deriving `price_micros` from `f64` (`raw_price * 1_000_000.0`) can drift (e.g. `0.990115…` vs tick `0.01`)
+/// and CLOB rejects with `breaks minimum tick size rule`.
+fn snap_limit_price_micros(price: f64, tick: &str) -> u64 {
     let tick_f = tick.trim().parse::<f64>().unwrap_or(0.01);
-    let (price_dec, _, _) = round_cfg_from_tick(tick);
-    if !price.is_finite() || tick_f <= 0.0 {
-        return price;
+    if !price.is_finite() || !tick_f.is_finite() || tick_f <= 0.0 {
+        return 10_000;
     }
-    let n = (price / tick_f).round();
-    round_down_f64(n * tick_f, price_dec)
+    let tm = (tick_f * 1_000_000.0).round() as u64;
+    if tm == 0 {
+        return 10_000;
+    }
+    let clamped_micros = (price.clamp(0.01, 0.99) * 1_000_000.0).round() as i128;
+    let tm_i = tm as i128;
+    let mut n = ((clamped_micros + tm_i / 2) / tm_i).max(1);
+    let min_n = (10_000_i128 + tm_i - 1) / tm_i;
+    let max_n = (990_000_i128 / tm_i).max(1);
+    n = n.clamp(min_n.min(max_n), max_n);
+    (n as u64).saturating_mul(tm)
 }
 
 /// CLOB validates limit **implied** prices against `orderPriceMinTickSize` (e.g. 0.01 → two decimals).
 /// Call for every GTC/GTD order so `args.price` is never a float tail like `0.7302551640340219`.
 fn snap_limit_order_price_to_tick(price: f64, tick: &str) -> f64 {
-    let p = price.clamp(0.01, 0.99);
-    snap_price_to_nearest_tick(p, tick)
+    snap_limit_price_micros(price, tick) as f64 / 1_000_000.0
 }
 
 fn round_cfg_from_tick(tick: &str) -> (u32, u32, u32) {
@@ -1621,6 +1630,112 @@ fn round_cfg_from_tick(tick: &str) -> (u32, u32, u32) {
         (4, 2, 6)
     } else {
         (2, 2, 4)
+    }
+}
+
+/// `decimalPlaces` from `@polymarket/clob-client` `utilities.ts` (approximation for positive sizes).
+fn decimal_places_clob(num: f64) -> u32 {
+    if !num.is_finite() || num == 0.0 {
+        return 0;
+    }
+    let n = num.abs();
+    if (n - n.round()).abs() < 1e-9 {
+        return 0;
+    }
+    let s = format!("{:.12}", n);
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if !s.contains('.') {
+        return 0;
+    }
+    s.split('.').nth(1).map(|f| f.len()).unwrap_or(0) as u32
+}
+
+/// `roundNormal` — official client short-circuits when `decimalPlaces(num) <= decimals`.
+fn round_normal_clob(num: f64, decimals: u32) -> f64 {
+    if !num.is_finite() {
+        return num;
+    }
+    if decimal_places_clob(num) <= decimals {
+        return num;
+    }
+    let p = 10_f64.powi(decimals as i32);
+    ((num + f64::EPSILON) * p).round() / p
+}
+
+fn round_down_clob(num: f64, decimals: u32) -> f64 {
+    if !num.is_finite() {
+        return num;
+    }
+    if decimal_places_clob(num) <= decimals {
+        return num;
+    }
+    let p = 10_f64.powi(decimals as i32);
+    (num * p).floor() / p
+}
+
+fn round_up_clob(num: f64, decimals: u32) -> f64 {
+    if !num.is_finite() {
+        return num;
+    }
+    if decimal_places_clob(num) <= decimals {
+        return num;
+    }
+    let p = 10_f64.powi(decimals as i32);
+    (num * p).ceil() / p
+}
+
+/// `@polymarket/clob-client` `getOrderRawAmounts` (`order-builder/helpers.ts`) — limit order
+/// human `maker` / `taker` amounts before `parseUnits(..., 6)`.
+fn get_order_raw_amounts_official(
+    side: Side,
+    size: f64,
+    price: f64,
+    price_dec: u32,
+    size_dec: u32,
+    amount_dec: u32,
+) -> Option<(f64, f64)> {
+    if !size.is_finite() || size <= 0.0 || !price.is_finite() {
+        return None;
+    }
+    let raw_price = round_normal_clob(price, price_dec);
+    if raw_price <= 0.0 {
+        return None;
+    }
+    match side {
+        Side::Buy => {
+            let raw_taker = round_down_clob(size, size_dec);
+            if raw_taker <= 0.0 {
+                return None;
+            }
+            let mut raw_maker = raw_taker * raw_price;
+            if decimal_places_clob(raw_maker) > amount_dec {
+                raw_maker = round_up_clob(raw_maker, amount_dec.saturating_add(4));
+                if decimal_places_clob(raw_maker) > amount_dec {
+                    raw_maker = round_down_clob(raw_maker, amount_dec);
+                }
+            }
+            if raw_maker <= 0.0 {
+                return None;
+            }
+            Some((raw_maker, raw_taker))
+        }
+        Side::Sell => {
+            let raw_maker = round_down_clob(size, size_dec);
+            if raw_maker <= 0.0 {
+                return None;
+            }
+            let mut raw_taker = raw_maker * raw_price;
+            if decimal_places_clob(raw_taker) > amount_dec {
+                raw_taker = round_up_clob(raw_taker, amount_dec.saturating_add(4));
+                if decimal_places_clob(raw_taker) > amount_dec {
+                    raw_taker = round_down_clob(raw_taker, amount_dec);
+                }
+            }
+            if raw_taker <= 0.0 {
+                return None;
+            }
+            Some((raw_maker, raw_taker))
+        }
     }
 }
 
@@ -1674,10 +1789,11 @@ fn share_human_to_wire_micros(human: f64) -> U256 {
 
 /// price×size → (makerAmount, takerAmount) in **1e6** base units (`parseUnits(..., 6)` in TS).
 ///
-/// CLOB amounts: see `py-clob-client` `OrderBuilder.get_order_amounts` + `to_token_decimals`.
-/// Market FAK uses 2-decimal USDC via [`usdc_human_to_wire_micros`]. **Limit** SELL derives taker
-/// USDC micros as `maker_micros * price_micros / 1e6` so implied price matches the tick (no float
-/// tails that break `orderPriceMinTickSize`).
+/// **GTC/GTD:** [`get_order_raw_amounts_official`] matches `@polymarket/clob-client` `getOrderRawAmounts`
+/// then [`clob_float_to_micros_py_style`] on each leg (same as `parseUnits` + 6 decimals).
+/// **`price`** must already be tick-snapped in [`TradingClient::place_order`].
+///
+/// **FAK/FOK:** book-aggressive price rounding; USDC legs use [`usdc_human_to_wire_micros`].
 fn amounts_for(
     side: Side,
     size_shares: f64,
@@ -1689,54 +1805,76 @@ fn amounts_for(
     const USDC_DECIMALS: u32 = 2;
     const SHARE_DECIMALS_MAX: u32 = 4;
 
-    let (price_dec, size_dec, _amount_dec_cfg) = round_cfg_from_tick(tick);
+    let (price_dec, size_dec, amount_dec) = round_cfg_from_tick(tick);
     let share_dec = size_dec.min(SHARE_DECIMALS_MAX);
     let is_limit = matches!(order_type, OrderType::Gtc | OrderType::Gtd);
 
-    // GTC/GTD: snap to tick first so EIP-712 amounts imply a tick-valid price (CLOB rejects
-    // e.g. 0.5126903553299492 vs tick 0.01). FAK/FOK: aggressive rounding vs the book.
-    let raw_price = if is_limit {
-        snap_price_to_nearest_tick(price, tick)
-    } else {
-        match side {
+    if is_limit {
+        return match side {
+            Side::Buy => {
+                let floor_notional = buy_notional_usdc
+                    .filter(|n| n.is_finite() && *n > 0.0)
+                    .map(|n| round_down_f64(n, USDC_DECIMALS))
+                    .unwrap_or_else(|| {
+                        let rp = round_normal_clob(price, price_dec);
+                        round_up_f64(size_shares * rp, USDC_DECIMALS)
+                    });
+
+                if !size_shares.is_finite()
+                    || size_shares <= 0.0
+                    || !floor_notional.is_finite()
+                    || floor_notional <= 0.0
+                {
+                    return (U256::ZERO, U256::ZERO);
+                }
+
+                let scale = 10_i64.pow(share_dec.min(6) as u32);
+                let mut taker_ticks = ((size_shares * scale as f64).ceil() as i64).max(1);
+                for _ in 0..50_000u32 {
+                    let s = taker_ticks as f64 / scale as f64;
+                    if let Some((raw_maker, raw_taker)) =
+                        get_order_raw_amounts_official(Side::Buy, s, price, price_dec, size_dec, amount_dec)
+                    {
+                        if raw_maker + 1e-12 >= floor_notional {
+                            return (
+                                clob_float_to_micros_py_style(raw_maker),
+                                clob_float_to_micros_py_style(raw_taker),
+                            );
+                        }
+                    }
+                    taker_ticks += 1;
+                }
+                (U256::ZERO, U256::ZERO)
+            }
+            Side::Sell => {
+                let Some((raw_maker, raw_taker)) = get_order_raw_amounts_official(
+                    Side::Sell,
+                    size_shares,
+                    price,
+                    price_dec,
+                    size_dec,
+                    amount_dec,
+                ) else {
+                    return (U256::ZERO, U256::ZERO);
+                };
+                (
+                    clob_float_to_micros_py_style(raw_maker),
+                    clob_float_to_micros_py_style(raw_taker),
+                )
+            }
+        };
+    }
+
+    let (raw_price, _price_micros) = {
+        let rp = match side {
             Side::Buy => round_up_f64(price, price_dec),
             Side::Sell => round_down_f64(price, price_dec),
-        }
+        };
+        let pm = ((rp * 1_000_000.0).round() as i64).clamp(0, i64::MAX) as u64;
+        (rp, pm)
     };
-    let price_micros: u64 = ((raw_price * 1_000_000.0).round() as i64).clamp(0, i64::MAX) as u64;
 
     match side {
-        // Limit BUY: USDC (maker) and shares (taker) from integer micros so implied price matches tick.
-        Side::Buy if is_limit => {
-            let floor_notional = buy_notional_usdc
-                .filter(|n| n.is_finite() && *n > 0.0)
-                .map(|n| round_down_f64(n, USDC_DECIMALS))
-                .unwrap_or_else(|| round_up_f64(size_shares * raw_price, USDC_DECIMALS));
-
-            if !size_shares.is_finite() || size_shares <= 0.0 || !floor_notional.is_finite() || floor_notional <= 0.0
-            {
-                return (U256::ZERO, U256::ZERO);
-            }
-
-            let scale = 10_i64.pow(share_dec.min(6) as u32);
-            let mut taker_ticks = ((size_shares * scale as f64).ceil() as i64).max(1);
-            let mut guard = 0u32;
-            while guard < 50_000 {
-                let raw_taker = taker_ticks as f64 / scale as f64;
-                let tm = (raw_taker * 1_000_000.0).round() as u64;
-                let mm = (tm as u128 * price_micros as u128 + 999_999) / 1_000_000;
-                let raw_maker = mm as f64 / 1_000_000.0;
-                if raw_maker + 1e-9 >= floor_notional {
-                    return (
-                        usdc_human_to_wire_micros(raw_maker),
-                        share_human_to_wire_micros(raw_taker),
-                    );
-                }
-                taker_ticks += 1;
-                guard += 1;
-            }
-            (U256::ZERO, U256::ZERO)
-        }
         Side::Buy => {
             // Rounding shares down then USDC down can wipe a cent (e.g. 1 USDC → $0.99 vs $1 min).
             let floor_notional = buy_notional_usdc
@@ -1770,22 +1908,6 @@ fn amounts_for(
                 usdc_human_to_wire_micros(raw_maker),
                 share_human_to_wire_micros(raw_taker),
             )
-        }
-        Side::Sell if is_limit => {
-            let raw_maker_amt = round_down_f64(size_shares, share_dec);
-            if raw_maker_amt <= 0.0 || !raw_maker_amt.is_finite() {
-                return (U256::ZERO, U256::ZERO);
-            }
-            let maker_micros = clob_float_to_micros_py_style(raw_maker_amt);
-            if maker_micros.is_zero() {
-                return (U256::ZERO, U256::ZERO);
-            }
-            let p = U256::from(price_micros as u128);
-            let taker_micros = maker_micros * p / U256::from(1_000_000u128);
-            if taker_micros.is_zero() {
-                return (U256::ZERO, U256::ZERO);
-            }
-            (maker_micros, taker_micros)
         }
         Side::Sell => {
             let raw_maker = round_down_f64(size_shares, share_dec);
@@ -2073,12 +2195,90 @@ mod buy_fill_order_id_tests {
 
 #[cfg(test)]
 mod limit_price_snap_tests {
-    use super::snap_limit_order_price_to_tick;
+    use super::{snap_limit_order_price_to_tick, snap_limit_price_micros};
+
+    fn tick_micros(tick: &str) -> u64 {
+        let t = tick.trim().parse::<f64>().expect("tick parse");
+        (t * 1_000_000.0).round() as u64
+    }
 
     #[test]
     fn gtd_float_snaps_to_min_tick_decimals() {
         let p = snap_limit_order_price_to_tick(0.7302551640340219, "0.01");
         assert!((p - 0.73).abs() < 1e-9);
+    }
+
+    /// Regression: float tails near 0.99 must not produce off-tick `price_micros` (CLOB tick error).
+    #[test]
+    fn gtd_price_micros_exact_multiple_of_0_01_tick() {
+        let m = snap_limit_price_micros(0.9901153212520593, "0.01");
+        assert_eq!(m, 990_000);
+        assert_eq!(m % 10_000, 0);
+    }
+
+    #[test]
+    fn snap_clamps_below_min_to_one_cent() {
+        assert_eq!(snap_limit_price_micros(0.005, "0.01"), 10_000);
+        assert!((snap_limit_order_price_to_tick(0.005, "0.01") - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn snap_clamps_above_max_to_99_cents() {
+        assert_eq!(snap_limit_price_micros(1.5, "0.01"), 990_000);
+        assert!((snap_limit_order_price_to_tick(2.0, "0.01") - 0.99).abs() < 1e-12);
+    }
+
+    #[test]
+    fn snap_non_finite_price_falls_back_to_one_cent() {
+        assert_eq!(snap_limit_price_micros(f64::NAN, "0.01"), 10_000);
+        assert_eq!(snap_limit_price_micros(f64::INFINITY, "0.01"), 10_000);
+        assert_eq!(snap_limit_price_micros(f64::NEG_INFINITY, "0.01"), 10_000);
+    }
+
+    #[test]
+    fn snap_trims_tick_whitespace() {
+        assert_eq!(snap_limit_price_micros(0.44, "  0.01  "), 440_000);
+    }
+
+    #[test]
+    fn snap_nearest_on_0_01_grid() {
+        let tm = tick_micros("0.01");
+        for (human, want_micros) in [
+            (0.514999, 510_000),
+            (0.515, 520_000),
+            (0.01, 10_000),
+            (0.99, 990_000),
+        ] {
+            let m = snap_limit_price_micros(human, "0.01");
+            assert_eq!(m, want_micros, "human={human}");
+            assert_eq!(m % tm, 0);
+        }
+    }
+
+    #[test]
+    fn snap_nearest_on_0_001_grid() {
+        let tm = tick_micros("0.001");
+        let m = snap_limit_price_micros(0.456789, "0.001");
+        assert_eq!(m, 457_000);
+        assert_eq!(m % tm, 0);
+    }
+
+    #[test]
+    fn snap_nearest_on_0_1_grid() {
+        let tm = tick_micros("0.1");
+        let m = snap_limit_price_micros(0.35, "0.1");
+        assert_eq!(m, 400_000);
+        assert_eq!(m % tm, 0);
+    }
+
+    #[test]
+    fn snap_order_price_matches_micros_over_1e6() {
+        for human in [0.12_f64, 0.55, 0.73, 0.99] {
+            let m = snap_limit_price_micros(human, "0.01");
+            let p = snap_limit_order_price_to_tick(human, "0.01");
+            assert!((p * 1_000_000.0).round() as u64 >= 10_000);
+            assert_eq!((p * 1_000_000.0).round() as u64, m, "human={human}");
+        }
     }
 }
 
@@ -2096,6 +2296,14 @@ mod limit_gtd_sell_amounts_tests {
         t as f64 / m as f64
     }
 
+    /// SELL: maker = shares, taker = USDC → implied USDC/share = taker/maker.
+    fn sell_implied_price_micros(maker: U256, taker: U256) -> u128 {
+        let m: u128 = maker.try_into().expect("maker");
+        let t: u128 = taker.try_into().expect("taker");
+        assert!(m > 0);
+        t.saturating_mul(1_000_000) / m
+    }
+
     #[test]
     fn gtd_sell_implied_price_on_tick_despite_input_float_tail() {
         let noisy = 0.9804305283757339;
@@ -2105,5 +2313,72 @@ mod limit_gtd_sell_amounts_tests {
         assert_eq!(t1, t2);
         let px = implied_price_per_share(m1, t1);
         assert!((px - 0.98).abs() < 1e-14, "implied={}", px);
+    }
+
+    #[test]
+    fn gtd_sell_whole_shares_implied_exactly_on_tick() {
+        let (mk, tk) = amounts_for(Side::Sell, 10.0, 0.51, "0.01", None, OrderType::Gtd);
+        assert!(!mk.is_zero() && !tk.is_zero());
+        let implied_micros = sell_implied_price_micros(mk, tk);
+        assert_eq!(implied_micros, 510_000);
+        assert_eq!(implied_micros % 10_000, 0);
+    }
+
+    #[test]
+    fn gtd_sell_tick_0_001_implied_aligns_to_tick() {
+        let (mk, tk) = amounts_for(Side::Sell, 5.0, 0.1237, "0.001", None, OrderType::Gtd);
+        assert!(!mk.is_zero() && !tk.is_zero());
+        let implied_micros = sell_implied_price_micros(mk, tk);
+        assert_eq!(implied_micros % 1_000, 0);
+    }
+}
+
+#[cfg(test)]
+mod limit_gtd_buy_amounts_tests {
+    use super::{amounts_for, OrderType, Side};
+    use alloy_primitives::U256;
+
+    /// BUY limit: maker = USDC, taker = outcome shares → implied = maker/taker.
+    fn buy_implied_price_micros(maker: U256, taker: U256) -> u128 {
+        let m: u128 = maker.try_into().expect("maker");
+        let t: u128 = taker.try_into().expect("taker");
+        assert!(t > 0);
+        m.saturating_mul(1_000_000) / t
+    }
+
+    #[test]
+    fn gtd_buy_with_notional_implied_on_0_01_tick() {
+        let (mk, tk) = amounts_for(
+            Side::Buy,
+            250.0,
+            0.55,
+            "0.01",
+            Some(100.0),
+            OrderType::Gtd,
+        );
+        assert!(!mk.is_zero() && !tk.is_zero());
+        let implied = buy_implied_price_micros(mk, tk);
+        assert_eq!(implied % 10_000, 0, "implied_micros={implied}");
+    }
+
+    #[test]
+    fn gtd_buy_one_dollar_notional_implied_on_tick() {
+        let (mk, tk) = amounts_for(
+            Side::Buy,
+            50.0,
+            0.73,
+            "0.01",
+            Some(1.0),
+            OrderType::Gtd,
+        );
+        assert!(!mk.is_zero() && !tk.is_zero());
+        assert_eq!(buy_implied_price_micros(mk, tk) % 10_000, 0);
+    }
+
+    #[test]
+    fn gtd_buy_no_notional_uses_size_times_price_budget() {
+        let (mk, tk) = amounts_for(Side::Buy, 20.0, 0.40, "0.01", None, OrderType::Gtd);
+        assert!(!mk.is_zero() && !tk.is_zero());
+        assert_eq!(buy_implied_price_micros(mk, tk) % 10_000, 0);
     }
 }

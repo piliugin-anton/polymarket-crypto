@@ -615,7 +615,8 @@ pub fn resolve_market_order(
         Side::Buy => {
             let slip = buy_slippage_bps as f64 / 10_000.0;
             let ask = state.best_ask(outcome)?;
-            // Widen ceiling so a thin or stale book still crosses (`MARKET_BUY_SLIPPAGE_BPS`).
+            // Market FAK is an aggressive limit: ceiling above best ask so the book still crosses
+            // if the snapshot is stale or the ask moves (`MARKET_BUY_SLIPPAGE_BPS`; `0` = no cushion).
             let price = clamp_prob(ask * (1.0 + slip));
             // `size` = USDC notional → shares at reference ask
             let shares = (size / ask).max(0.01);
@@ -624,6 +625,7 @@ pub fn resolve_market_order(
         Side::Sell => {
             let slip = sell_slippage_bps as f64 / 10_000.0;
             let bid = state.best_bid(outcome)?;
+            // Floor below best bid (`MARKET_SELL_SLIPPAGE_BPS`; `0` = no cushion).
             let price = clamp_prob(bid * (1.0 - slip));
             // Dump **entire** tracked position (fills + CLOB sync). USDC field only sizes the
             // order when we have no inventory in-app (e.g. before balance sync).
