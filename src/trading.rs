@@ -909,12 +909,31 @@ impl TradingClient {
         Ok(())
     }
 
+    /// `GET /balance-allowance/update` for conditional tokens — public wrapper for app-level
+    /// cache warming (e.g. shortly after a BUY).
+    pub async fn refresh_conditional_balance_allowance_cache(&self, token_id: &str) -> Result<()> {
+        self.update_conditional_balance_allowance(token_id).await
+    }
+
     /// Conditional (outcome token) balance for `token_id`, in **human shares** (raw / 1e6).
     ///
     /// Uses L2 auth — same as `clob-client-v2` `getBalanceAllowance` with
     /// `asset_type: CONDITIONAL`.
+    ///
+    /// Sends `GET /balance-allowance/update` first so the read sees a fresher snapshot (Polymarket
+    /// `updateBalanceAllowance`). **SELL** placement uses the same GET without that poke (faster path).
     pub async fn fetch_conditional_balance_shares(&self, token_id: &str) -> Result<f64> {
-        let _ = self.update_conditional_balance_allowance(token_id).await;
+        self.fetch_conditional_balance_shares_impl(token_id, true).await
+    }
+
+    async fn fetch_conditional_balance_shares_impl(
+        &self,
+        token_id: &str,
+        refresh_allowance_cache: bool,
+    ) -> Result<f64> {
+        if refresh_allowance_cache {
+            let _ = self.update_conditional_balance_allowance(token_id).await;
+        }
         let creds = self.ensure_creds().await?;
         let ts = chrono::Utc::now().timestamp();
         let path = "/balance-allowance";
@@ -954,16 +973,6 @@ impl TradingClient {
         Ok(shares)
     }
 
-    /// Double `balance-allowance/update` + pause so POST **SELL** validation sees non-stale inventory
-    /// (take-profit immediately after BUY is the worst case).
-    async fn prime_conditional_cache_before_sell_post(&self, token_id: &str) -> Result<()> {
-        self.update_conditional_balance_allowance(token_id).await?;
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        self.update_conditional_balance_allowance(token_id).await?;
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        Ok(())
-    }
-
     /// After a market **BUY**, wait until we can size a take-profit **SELL** safely.
     ///
     /// Combines `GET /balance-allowance` (CONDITIONAL) with Polymarket `GET /data/trades` so we:
@@ -986,7 +995,7 @@ impl TradingClient {
         const MAX_ATTEMPTS: u32 = 40;
         const DELAY_MS: u64 = 250;
         if !want_shares.is_finite() || want_shares <= 0.0 {
-            return self.fetch_conditional_balance_shares(token_id).await;
+            return self.fetch_conditional_balance_shares_impl(token_id, true).await;
         }
         if !min_executable.is_finite() || min_executable <= 0.0 {
             bail!("min_executable must be positive");
@@ -995,7 +1004,7 @@ impl TradingClient {
         let require_trade_for_order = buy_order_id.is_some_and(|s| !s.trim().is_empty());
 
         for attempt in 0..MAX_ATTEMPTS {
-            let bal = self.fetch_conditional_balance_shares(token_id).await?;
+            let bal = self.fetch_conditional_balance_shares_impl(token_id, true).await?;
             let trades = self.fetch_trades_for_market(condition_id).await?;
             let order_fill = match buy_order_id {
                 Some(oid) if !oid.trim().is_empty() => {
@@ -1042,7 +1051,6 @@ impl TradingClient {
                         "take-profit: inventory ready for GTD sell (balance + trades)"
                     );
                 }
-                self.prime_conditional_cache_before_sell_post(token_id).await?;
                 return Ok(sell_cap);
             }
             tracing::debug!(
@@ -1080,7 +1088,6 @@ impl TradingClient {
         let replay = net_shares_on_token_from_trades(&trades, token_id);
         let sell_cap = take_profit_sell_cap(need_for_cap, bal, replay);
         if sell_cap + 1e-6 >= min_executable {
-            self.prime_conditional_cache_before_sell_post(token_id).await?;
             return Ok(sell_cap);
         }
         Err(anyhow!(
@@ -1241,9 +1248,9 @@ impl TradingClient {
             args.price = snap_limit_order_price_to_tick(args.price, &args.tick_size);
         }
 
-        // SELL transfers conditional tokens the CLOB reads from a **cached** `balance-allowance`
-        // snapshot. Without `GET /balance-allowance/update` first, validation often sees `balance: 0`
-        // right after a BUY fill (Polymarket docs + clob-client#128).
+        // SELL: size clamp uses `GET /balance-allowance` without a preceding `.../update` (post-BUY
+        // refresh in `main` + retries on POST errors mitigate stale cache). See Polymarket
+        // `balance-allowance/update` notes (clob-client#128).
         let max_post_attempts: u32 = if matches!(args.side, Side::Sell) {
             SELL_ORDER_PREP_SETTLE_MS.len() as u32
         } else {
@@ -1252,15 +1259,14 @@ impl TradingClient {
 
         for post_attempt in 0..max_post_attempts {
             if matches!(args.side, Side::Sell) {
-                self.update_conditional_balance_allowance(&args.token_id).await?;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                self.update_conditional_balance_allowance(&args.token_id).await?;
                 let settle_idx = post_attempt as usize;
                 let settle_idx = settle_idx.min(SELL_ORDER_PREP_SETTLE_MS.len() - 1);
                 tokio::time::sleep(Duration::from_millis(SELL_ORDER_PREP_SETTLE_MS[settle_idx]))
                     .await;
 
-                let bal = self.fetch_conditional_balance_shares(&args.token_id).await?;
+                let bal = self
+                    .fetch_conditional_balance_shares_impl(&args.token_id, false)
+                    .await?;
                 if bal < 1e-6
                     && args.size > 1e-9
                     && post_attempt + 1 < max_post_attempts
@@ -1270,7 +1276,7 @@ impl TradingClient {
                         bal,
                         size = args.size,
                         token_id = %args.token_id,
-                        "CLOB conditional balance read 0 after update+settle; retry before SELL POST"
+                        "CLOB conditional balance read 0 after settle; retry before SELL POST"
                     );
                     continue;
                 }

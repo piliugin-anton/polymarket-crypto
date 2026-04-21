@@ -948,6 +948,29 @@ fn spawn_order(
                     }).await;
                     spawn_open_orders_refresh(trading.clone(), tx.clone(), market_for_refresh.clone());
 
+                    if matches!(side, Side::Buy | Side::Sell) {
+                        let cli = trading.clone();
+                        let tid = match outcome {
+                            Outcome::Up => market_for_refresh.up_token_id.clone(),
+                            Outcome::Down => market_for_refresh.down_token_id.clone(),
+                        };
+                        let post_label = if matches!(side, Side::Buy) {
+                            "post-BUY"
+                        } else {
+                            "post-SELL"
+                        };
+                        tokio::spawn(async move {
+                            if let Err(e) = cli.refresh_conditional_balance_allowance_cache(&tid).await
+                            {
+                                debug!(
+                                    error = %e,
+                                    token_id = %tid,
+                                    "{post_label} delayed balance-allowance cache refresh failed"
+                                );
+                            }
+                        });
+                    }
+
                     if take_profit_bps > 0
                         && matches!(side, Side::Buy)
                         && otype == OrderType::Fak
