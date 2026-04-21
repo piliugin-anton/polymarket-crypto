@@ -573,8 +573,8 @@ fn balance_allowance_error_text(msg: &str) -> bool {
     lower.contains("not enough balance") || lower.contains("balance / allowance")
 }
 
-/// Settle times (ms) after `GET /balance-allowance/update` before POST **SELL**. GTD take-profit
-/// right after a FAK BUY often needs multi-second CLOB cache catch-up.
+/// Back-off (ms) before re-reading conditional balance + POST **SELL** on retries. Used after a
+/// failed/zero-balance read or a balance/allowance rejection — not on the first FAK attempt (fast path).
 const SELL_ORDER_PREP_SETTLE_MS: [u64; 5] = [450, 900, 1_800, 3_000, 5_000];
 
 /// How long `GET /fee-rate` responses are reused per `token_id` (avoids an extra RTT on hot paths).
@@ -639,6 +639,19 @@ impl TradingClient {
         let mut state = self.state.write().await;
         state.cached_clob_order_version = Some(version);
         Ok(version)
+    }
+
+    /// Prime `/version` and (if CLOB returns signing v1) `/fee-rate` caches used by
+    /// [`Self::place_order`], so the first order avoids cold RTTs.
+    pub async fn prewarm_order_context(&self, token_ids: &[&str]) -> Result<()> {
+        self.ensure_creds().await?;
+        let v = self.fetch_clob_order_version().await?;
+        if v == 1 {
+            for tid in token_ids {
+                let _ = self.fetch_fee_rate_bps(*tid).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Derive (or create) the L2 API credentials by producing an EIP-712
@@ -1325,9 +1338,10 @@ impl TradingClient {
             args.price = snap_limit_order_price_to_tick(args.price, &args.tick_size);
         }
 
-        // SELL: size clamp uses `GET /balance-allowance` without a preceding `.../update` (post-BUY
-        // refresh in `main` + retries on POST errors mitigate stale cache). See Polymarket
-        // `balance-allowance/update` notes (clob-client#128).
+        // SELL: `GET /balance-allowance` (no preceding `.../update` — see clob-client#128). Market
+        // **FAK** skips that read on the first attempt so POST starts immediately; size comes from
+        // app state, and retries + clamp recover stale CLOB cache / allowance errors. **GTD** sells
+        // keep read+clamp every attempt (min size + maker path).
         let max_post_attempts: u32 = if matches!(args.side, Side::Sell) {
             SELL_ORDER_PREP_SETTLE_MS.len() as u32
         } else {
@@ -1336,40 +1350,55 @@ impl TradingClient {
 
         for post_attempt in 0..max_post_attempts {
             if matches!(args.side, Side::Sell) {
-                let settle_idx = post_attempt as usize;
-                let settle_idx = settle_idx.min(SELL_ORDER_PREP_SETTLE_MS.len() - 1);
-                tokio::time::sleep(Duration::from_millis(SELL_ORDER_PREP_SETTLE_MS[settle_idx]))
-                    .await;
+                let fast_fak_sell =
+                    post_attempt == 0 && matches!(order_type, OrderType::Fak);
+                if !fast_fak_sell {
+                    let settle_idx = post_attempt as usize;
+                    let settle_idx = settle_idx.min(SELL_ORDER_PREP_SETTLE_MS.len() - 1);
+                    tokio::time::sleep(Duration::from_millis(SELL_ORDER_PREP_SETTLE_MS[settle_idx]))
+                        .await;
 
-                let bal = self
-                    .fetch_conditional_balance_shares_impl(&args.token_id, false)
-                    .await?;
-                if bal < 1e-6
-                    && args.size > 1e-9
-                    && post_attempt + 1 < max_post_attempts
-                {
-                    tracing::warn!(
-                        post_attempt,
-                        bal,
-                        size = args.size,
-                        token_id = %args.token_id,
-                        "CLOB conditional balance read 0 after settle; retry before SELL POST"
-                    );
-                    continue;
-                }
-                if args.size > bal + 1e-12 {
-                    tracing::debug!(
-                        post_attempt,
-                        before = args.size,
-                        bal,
-                        "SELL size clamped to conditional balance (GET /balance-allowance)"
-                    );
-                    args.size = bal;
+                    let bal = self
+                        .fetch_conditional_balance_shares_impl(&args.token_id, false)
+                        .await?;
+                    if bal < 1e-6
+                        && args.size > 1e-9
+                        && post_attempt + 1 < max_post_attempts
+                    {
+                        tracing::warn!(
+                            post_attempt,
+                            bal,
+                            size = args.size,
+                            token_id = %args.token_id,
+                            "CLOB conditional balance read 0 after settle; retry before SELL POST"
+                        );
+                        continue;
+                    }
+                    if args.size > bal + 1e-12 {
+                        tracing::debug!(
+                            post_attempt,
+                            before = args.size,
+                            bal,
+                            "SELL size clamped to conditional balance (GET /balance-allowance)"
+                        );
+                        args.size = bal;
+                    }
                 }
             }
 
             let creds = self.ensure_creds().await?;
-            let fee_bps = self.fetch_fee_rate_bps(&args.token_id).await?;
+            let api_version = self.fetch_clob_order_version().await?;
+            if order_type == OrderType::Gtd && api_version != 1 {
+                bail!(
+                    "GTD orders need CLOB signing API version 1 (EIP-712 includes expiration); server returned {api_version}"
+                );
+            }
+            // EIP-712 V1 includes `feeRateBps`; V2 does not — skip `/fee-rate` on the hot path.
+            let fee_bps = if api_version == 1 {
+                self.fetch_fee_rate_bps(&args.token_id).await?
+            } else {
+                0u64
+            };
 
             let expiration_u256 = match order_type {
                 OrderType::Gtd => {
@@ -1414,12 +1443,6 @@ impl TradingClient {
             let ts_ms = chrono::Utc::now().timestamp_millis();
             let salt = (rand::random::<f64>() * ts_ms as f64).round() as u64;
 
-            let api_version = self.fetch_clob_order_version().await?;
-            if order_type == OrderType::Gtd && api_version != 1 {
-                bail!(
-                    "GTD orders need CLOB signing API version 1 (EIP-712 includes expiration); server returned {api_version}"
-                );
-            }
             let token_id_u256 = U256::from_str(&args.token_id).context("token_id")?;
 
             let verifying_v1 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V1 } else { CTF_EXCHANGE_V1 };

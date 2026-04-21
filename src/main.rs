@@ -278,6 +278,16 @@ async fn main() -> Result<()> {
             book_handle = Some(feeds::clob_ws::spawn(token_ids, clob_forwarder(tx_for_books.clone())));
             let _ = tx_for_books.send(AppEvent::MarketRoll(m.clone())).await;
 
+            let tw = trading_for_positions.clone();
+            let up_pw = m.up_token_id.clone();
+            let down_pw = m.down_token_id.clone();
+            tokio::spawn(async move {
+                let ids = [up_pw.as_str(), down_pw.as_str()];
+                if let Err(e) = tw.prewarm_order_context(&ids).await {
+                    debug!(error = %e, "CLOB order context prewarm failed");
+                }
+            });
+
             let t = trading_for_positions.clone();
             let txp = tx_for_books.clone();
             let up_id = m.up_token_id.clone();
