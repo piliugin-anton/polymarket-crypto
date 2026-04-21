@@ -45,7 +45,7 @@ use crossterm::{
 use events::Action;
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use std::{
     collections::HashMap,
     io::stdout,
@@ -75,7 +75,7 @@ const FEED_REDRAW_MIN: Duration = Duration::from_millis(50);
 fn apply_app_event(
     ev:     AppEvent,
     state:  &mut AppState,
-    trading:&Arc<Mutex<TradingClient>>,
+    trading:&Arc<TradingClient>,
     tx:     &mpsc::Sender<AppEvent>,
     cfg:    &Config,
 ) -> bool {
@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("debug-auth") => {
-            let mut t = TradingClient::new(cfg.clone())?;
+            let t = TradingClient::new(cfg.clone())?;
             return t.debug_auth_flow().await;
         }
         Some("help") | Some("-h") | Some("--help") => {
@@ -176,9 +176,8 @@ async fn main() -> Result<()> {
     spawn_ticker(tx.clone());
     spawn_key_reader(tx.clone());
 
-    // Trading client lives behind a Mutex so the order-placement task can
-    // mutate it without passing ownership around.
-    let trading = Arc::new(Mutex::new(TradingClient::new(cfg.clone())?));
+    // Shared `TradingClient` (interior `RwLock` for caches + `Mutex` for one-shot creds derive).
+    let trading = Arc::new(TradingClient::new(cfg.clone())?);
 
     // Best-effort: derive creds on startup. On failure we push the full
     // error into the TUI status line AND the log file — stderr alone is
@@ -187,7 +186,7 @@ async fn main() -> Result<()> {
         let t  = trading.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = t.lock().await.ensure_creds().await {
+            if let Err(e) = t.ensure_creds().await {
                 warn!(error = %e, "could not derive CLOB API credentials yet");
                 // Send each line of the error separately so the full chain
                 // scrolls through the status line — anyhow's chain has rich
@@ -312,7 +311,7 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                let mut cli = t.lock().await;
+                let cli = t.clone();
                 if let Err(e) = cli.ensure_creds().await {
                     debug!(error = %e, "positions sync skipped: no CLOB creds");
                     return;
@@ -381,20 +380,17 @@ async fn main() -> Result<()> {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval.tick().await;
                 loop {
-                    let mut cli = t2.lock().await;
+                    let cli = t2.clone();
                     if cli.ensure_creds().await.is_err() {
-                        drop(cli);
                         interval.tick().await;
                         continue;
                     }
                     match cli.fetch_open_orders_for_market(&cond2).await {
                         Ok(rows) => {
                             let orders = open_orders_from_clob(rows, &up2, &down2);
-                            drop(cli);
                             let _ = txp2.send(AppEvent::OpenOrdersLoaded { orders }).await;
                         }
                         Err(e) => {
-                            drop(cli);
                             debug!(error = %e, market = %cond2, "poll /data/orders failed");
                         }
                     }
@@ -699,7 +695,7 @@ fn spawn_claim(tx: mpsc::Sender<AppEvent>, cfg: Config) {
 fn dispatch_action(
     action:  Action,
     state:   &AppState,
-    trading: &Arc<Mutex<TradingClient>>,
+    trading: &Arc<TradingClient>,
     tx:      &mpsc::Sender<AppEvent>,
     cfg:     &Config,
 ) {
@@ -716,7 +712,7 @@ fn dispatch_action(
             let tx = tx.clone();
             let market = state.market.clone();
             tokio::spawn(async move {
-                match t.lock().await.cancel_all().await {
+                match t.cancel_all().await {
                     Ok(_) => {
                         let _ = tx
                             .send(AppEvent::StatusInfo("all open orders cancelled".into()))
@@ -814,7 +810,7 @@ fn dispatch_action(
 }
 
 fn spawn_open_orders_refresh(
-    trading: Arc<Mutex<TradingClient>>,
+    trading: Arc<TradingClient>,
     tx: mpsc::Sender<AppEvent>,
     market: gamma::ActiveMarket,
 ) {
@@ -823,7 +819,7 @@ fn spawn_open_orders_refresh(
     let down_id = market.down_token_id.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let mut cli = trading.lock().await;
+        let cli = trading.clone();
         if cli.ensure_creds().await.is_err() {
             return;
         }
@@ -837,7 +833,7 @@ fn spawn_open_orders_refresh(
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_order(
-    trading:  Arc<Mutex<TradingClient>>,
+    trading:  Arc<TradingClient>,
     tx:       mpsc::Sender<AppEvent>,
     market:   gamma::ActiveMarket,
     outcome:  Outcome,
@@ -876,7 +872,7 @@ fn spawn_order(
             buy_notional_usdc,
             expiration_unix_secs,
         };
-        let mut cli = trading.lock().await;
+        let cli = trading.clone();
         match cli.place_order(args, otype).await {
             Ok(resp) => {
                 match otype {

@@ -18,8 +18,10 @@ use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::debug;
 
 use crate::config::{
@@ -498,16 +500,26 @@ fn balance_allowance_error_text(msg: &str) -> bool {
 /// right after a FAK BUY often needs multi-second CLOB cache catch-up.
 const SELL_ORDER_PREP_SETTLE_MS: [u64; 5] = [450, 900, 1_800, 3_000, 5_000];
 
+/// How long `GET /fee-rate` responses are reused per `token_id` (avoids an extra RTT on hot paths).
+const FEE_RATE_CACHE_TTL: Duration = Duration::from_secs(600);
+
+struct TradingState {
+    creds: Option<ApiCreds>,
+    /// Cached `GET /version` → `version` field (1 or 2).
+    cached_clob_order_version: Option<u32>,
+    /// `(base_fee_bps, fetched_at)` per outcome token id.
+    fee_rate_cache: HashMap<String, (u64, Instant)>,
+}
+
 // ── Client ──────────────────────────────────────────────────────────
 
 pub struct TradingClient {
-    http:    reqwest::Client,
-    signer:  PrivateKeySigner,
-    creds:   Option<ApiCreds>,
-    config:  Config,
-    /// Cached `GET /version` → `version` field (1 or 2). Polymarket `clob-client-v2` uses this
-    /// to pick EIP-712 domain + struct; production Polygon currently returns **1**.
-    cached_clob_order_version: Option<u32>,
+    http:   reqwest::Client,
+    signer: PrivateKeySigner,
+    config: Config,
+    state:  RwLock<TradingState>,
+    /// Serializes the first L1→L2 credential derivation so concurrent callers don't race.
+    creds_derive_lock: AsyncMutex<()>,
 }
 
 impl TradingClient {
@@ -517,15 +529,22 @@ impl TradingClient {
         Ok(Self {
             http: crate::net::reqwest_client()?,
             signer,
-            creds: None,
             config,
-            cached_clob_order_version: None,
+            state: RwLock::new(TradingState {
+                creds: None,
+                cached_clob_order_version: None,
+                fee_rate_cache: HashMap::new(),
+            }),
+            creds_derive_lock: AsyncMutex::new(()),
         })
     }
 
-    async fn fetch_clob_order_version(&mut self) -> Result<u32> {
-        if let Some(v) = self.cached_clob_order_version {
-            return Ok(v);
+    async fn fetch_clob_order_version(&self) -> Result<u32> {
+        {
+            let state = self.state.read().await;
+            if let Some(v) = state.cached_clob_order_version {
+                return Ok(v);
+            }
         }
         let url = format!("{CLOB_HOST}/version");
         let resp = self.http.get(&url).send().await.with_context(|| url.clone())?;
@@ -540,15 +559,29 @@ impl TradingClient {
         }
         let VersionBody { version } = serde_json::from_str(&txt)
             .with_context(|| format!("decode GET /version: {}", snip(&txt)))?;
-        self.cached_clob_order_version = Some(version);
+        let mut state = self.state.write().await;
+        state.cached_clob_order_version = Some(version);
         Ok(version)
     }
 
     /// Derive (or create) the L2 API credentials by producing an EIP-712
     /// signature over the `ClobAuth` struct. Tries GET /auth/derive-api-key
     /// first and falls back to POST /auth/api-key if no keys exist yet.
-    pub async fn ensure_creds(&mut self) -> Result<ApiCreds> {
-        if let Some(c) = &self.creds { return Ok(c.clone()); }
+    pub async fn ensure_creds(&self) -> Result<ApiCreds> {
+        {
+            let state = self.state.read().await;
+            if let Some(c) = &state.creds {
+                return Ok(c.clone());
+            }
+        }
+
+        let _derive = self.creds_derive_lock.lock().await;
+        {
+            let state = self.state.read().await;
+            if let Some(c) = &state.creds {
+                return Ok(c.clone());
+            }
+        }
 
         let ts: i64   = chrono::Utc::now().timestamp();
         let nonce: u64 = 0;
@@ -578,7 +611,8 @@ impl TradingClient {
                 api_key_prefix = &creds.api_key[..std::cmp::min(8, creds.api_key.len())],
                 "derived existing CLOB API creds",
             );
-            self.creds = Some(creds.clone());
+            let mut state = self.state.write().await;
+            state.creds = Some(creds.clone());
             return Ok(creds);
         }
 
@@ -599,7 +633,8 @@ impl TradingClient {
                 api_key_prefix = &creds.api_key[..std::cmp::min(8, creds.api_key.len())],
                 "created new CLOB API creds",
             );
-            self.creds = Some(creds.clone());
+            let mut state = self.state.write().await;
+            state.creds = Some(creds.clone());
             return Ok(creds);
         }
 
@@ -698,7 +733,7 @@ impl TradingClient {
     /// One-shot diagnostic flow — prints every intermediate to stdout and
     /// attempts both auth endpoints, exiting after. Invoked via
     /// `polymarket-btc5m debug-auth`.
-    pub async fn debug_auth_flow(&mut self) -> Result<()> {
+    pub async fn debug_auth_flow(&self) -> Result<()> {
         println!("\n━━━ Polymarket CLOB auth diagnostic ━━━\n");
 
         let signer_addr = self.signer.address();
@@ -787,6 +822,27 @@ impl TradingClient {
     }
 
     async fn fetch_fee_rate_bps(&self, token_id: &str) -> Result<u64> {
+        let now = Instant::now();
+        {
+            let state = self.state.read().await;
+            if let Some((bps, t)) = state.fee_rate_cache.get(token_id) {
+                if now.duration_since(*t) < FEE_RATE_CACHE_TTL {
+                    return Ok(*bps);
+                }
+            }
+        }
+        let bps = self.fetch_fee_rate_bps_uncached(token_id).await?;
+        let mut state = self.state.write().await;
+        if let Some((cached, t)) = state.fee_rate_cache.get(token_id) {
+            if Instant::now().duration_since(*t) < FEE_RATE_CACHE_TTL {
+                return Ok(*cached);
+            }
+        }
+        state.fee_rate_cache.insert(token_id.to_string(), (bps, Instant::now()));
+        Ok(bps)
+    }
+
+    async fn fetch_fee_rate_bps_uncached(&self, token_id: &str) -> Result<u64> {
         let mut url = url::Url::parse(&format!("{CLOB_HOST}/fee-rate"))
             .context("parse /fee-rate URL")?;
         url.query_pairs_mut().append_pair("token_id", token_id);
@@ -809,7 +865,7 @@ impl TradingClient {
         debug!(
             token_id = %token_id,
             base_fee = fr.base_fee,
-            "fetch_fee_rate_bps"
+            "fetch_fee_rate_bps_uncached"
         );
         Ok(fr.base_fee)
     }
@@ -817,7 +873,7 @@ impl TradingClient {
     /// `GET /balance-allowance/update` — asks CLOB to refresh its balance cache before a read.
     /// Matches official `clob-client` `updateBalanceAllowance`; mitigates stale `0` balances
     /// ([clob-client#128](https://github.com/Polymarket/clob-client/issues/128)).
-    async fn update_conditional_balance_allowance(&mut self, token_id: &str) -> Result<()> {
+    async fn update_conditional_balance_allowance(&self, token_id: &str) -> Result<()> {
         let creds = self.ensure_creds().await?;
         let ts = chrono::Utc::now().timestamp();
         let path = "/balance-allowance/update";
@@ -857,7 +913,7 @@ impl TradingClient {
     ///
     /// Uses L2 auth — same as `clob-client-v2` `getBalanceAllowance` with
     /// `asset_type: CONDITIONAL`.
-    pub async fn fetch_conditional_balance_shares(&mut self, token_id: &str) -> Result<f64> {
+    pub async fn fetch_conditional_balance_shares(&self, token_id: &str) -> Result<f64> {
         let _ = self.update_conditional_balance_allowance(token_id).await;
         let creds = self.ensure_creds().await?;
         let ts = chrono::Utc::now().timestamp();
@@ -900,7 +956,7 @@ impl TradingClient {
 
     /// Double `balance-allowance/update` + pause so POST **SELL** validation sees non-stale inventory
     /// (take-profit immediately after BUY is the worst case).
-    async fn prime_conditional_cache_before_sell_post(&mut self, token_id: &str) -> Result<()> {
+    async fn prime_conditional_cache_before_sell_post(&self, token_id: &str) -> Result<()> {
         self.update_conditional_balance_allowance(token_id).await?;
         tokio::time::sleep(Duration::from_millis(120)).await;
         self.update_conditional_balance_allowance(token_id).await?;
@@ -920,7 +976,7 @@ impl TradingClient {
     ///
     /// Returns the **share count to pass into the GTD sell** (≤ `want_shares`).
     pub async fn wait_for_take_profit_sell_shares(
-        &mut self,
+        &self,
         condition_id: &str,
         token_id: &str,
         want_shares: f64,
@@ -1043,7 +1099,7 @@ impl TradingClient {
     /// Raw amounts use **6 decimals** (same as conditional shares in this client). The allowance
     /// is the ERC-20 approval the funder granted to Polymarket contracts — often near-unlimited.
     #[allow(dead_code)] // Balance panel uses on-chain USDC.e (`balances`); kept for debugging / scripts.
-    pub async fn fetch_collateral_cash_and_cashout_usdc(&mut self) -> Result<(f64, f64)> {
+    pub async fn fetch_collateral_cash_and_cashout_usdc(&self) -> Result<(f64, f64)> {
         let creds = self.ensure_creds().await?;
         let ts = chrono::Utc::now().timestamp();
         let path = "/balance-allowance";
@@ -1086,7 +1142,7 @@ impl TradingClient {
     }
 
     /// All trades for `condition_id` (Gamma `conditionId` / CLOB `market`), paginated like TS `getTrades`.
-    pub async fn fetch_trades_for_market(&mut self, condition_id: &str) -> Result<Vec<ClobTrade>> {
+    pub async fn fetch_trades_for_market(&self, condition_id: &str) -> Result<Vec<ClobTrade>> {
         let creds = self.ensure_creds().await?;
         let path = "/data/trades";
         let mut cursor = TRADES_INITIAL_CURSOR.to_string();
@@ -1132,7 +1188,7 @@ impl TradingClient {
     }
 
     /// Open orders for `condition_id` (Gamma `conditionId` / CLOB `market`).
-    pub async fn fetch_open_orders_for_market(&mut self, condition_id: &str) -> Result<Vec<ClobOpenOrder>> {
+    pub async fn fetch_open_orders_for_market(&self, condition_id: &str) -> Result<Vec<ClobOpenOrder>> {
         let creds = self.ensure_creds().await?;
         let path = "/data/orders";
         let mut cursor = TRADES_INITIAL_CURSOR.to_string();
@@ -1178,7 +1234,7 @@ impl TradingClient {
     }
 
     /// Build + sign an order and POST it to the CLOB.
-    pub async fn place_order(&mut self, mut args: OrderArgs, order_type: OrderType)
+    pub async fn place_order(&self, mut args: OrderArgs, order_type: OrderType)
         -> Result<PostOrderResponse>
     {
         if matches!(order_type, OrderType::Gtc | OrderType::Gtd) {
@@ -1466,7 +1522,7 @@ impl TradingClient {
     }
 
     async fn post_order_http(
-        &mut self,
+        &self,
         creds: &ApiCreds,
         body: String,
         order_type: OrderType,
@@ -1507,7 +1563,7 @@ impl TradingClient {
     }
 
     /// Cancel all open orders for this user.
-    pub async fn cancel_all(&mut self) -> Result<()> {
+    pub async fn cancel_all(&self) -> Result<()> {
         let creds = self.ensure_creds().await?;
         let ts = chrono::Utc::now().timestamp();
         let path = "/cancel-all";
