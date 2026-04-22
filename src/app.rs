@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
 use crate::fees::polymarket_crypto_taker_fee_usdc;
 use crate::gamma::ActiveMarket;
+use crate::gamma_series::SeriesRow;
+use crate::market_profile::MarketProfile;
 use crate::trading::{clob_asset_ids_match, ClobOpenOrder, ClobTrade, OrderType, Side};
 use tracing::debug;
 
@@ -41,6 +43,8 @@ pub enum AppEvent {
     Price(PriceTick),
     Book(BookSnapshot),
     MarketRoll(ActiveMarket),
+    /// Same slug as the active market — Polymarket crypto-price / Gamma refined `price_to_beat` (e.g. after a window roll). Must not trigger a full roll (positions would reset).
+    PriceToBeatRefresh { slug: String, price_to_beat: Option<f64> },
     /// CLOB positions for the current market: balances + cost basis replayed from `GET /data/trades`.
     PositionsLoaded {
         position_up:   Position,
@@ -78,6 +82,10 @@ pub enum AppEvent {
     /// `POST https://bridge.polymarket.com/deposit` → Solana (`svm`) address + terminal QR art.
     SolanaDepositFetched { svm_address: String, qr_unicode: String },
     SolanaDepositFailed(String),
+    /// Wizard: result of `GET /series?slug=…` (per-asset).
+    SeriesListReady(std::result::Result<Vec<SeriesRow>, String>),
+    /// Wizard complete — start RTDS + Gamma discovery (main spawns tasks; `apply` updates state).
+    StartTrading(std::sync::Arc<MarketProfile>),
 }
 
 // ── UI-level types ──────────────────────────────────────────────────
@@ -167,11 +175,32 @@ pub enum DepositModalPhase {
     Failed(String),
 }
 
+/// TUI bootstrap: pick asset → timeframe, then the legacy trading layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiPhase {
+    WizardLoading,
+    WizardPickAsset,
+    WizardPickTimeframe,
+    Trading,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
+    pub ui_phase: UiPhase,
+    /// Gamma rows + fallback labels for the first wizard screen.
+    pub wizard_rows:        Vec<SeriesRow>,
+    pub wizard_list_idx:     usize,
+    /// Selected line in timeframe list (0 = 5m, 1 = 15m).
+    pub wizard_tf_idx:      usize,
+    /// Last load error (wizard still usable via fallback list).
+    pub wizard_series_error: Option<String>,
+
     pub market:         Option<ActiveMarket>,
-    pub btc_price:      Option<f64>,
-    pub btc_price_ts:   Option<DateTime<Utc>>,
+    /// Chainlink spot (same stream as market resolution for crypto up/down).
+    pub spot_price:     Option<f64>,
+    pub spot_price_ts:   Option<DateTime<Utc>>,
+    /// `arc` of the same profile passed at [`AppEvent::StartTrading`].
+    pub market_profile: Option<Arc<MarketProfile>>,
 
     // One book per outcome token
     pub book_up:        Option<BookSnapshot>,
@@ -226,7 +255,15 @@ pub struct AppState {
 impl AppState {
     pub fn new(default_size_usdc: f64, user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>) -> Self {
         Self {
-            market: None, btc_price: None, btc_price_ts: None,
+            ui_phase:            UiPhase::WizardLoading,
+            wizard_rows:         Vec::new(),
+            wizard_list_idx:     0,
+            wizard_tf_idx:       0,
+            wizard_series_error:  None,
+            market: None,
+            spot_price: None,
+            spot_price_ts: None,
+            market_profile:       None,
             book_up: None, book_down: None,
             position_up: Default::default(), position_down: Default::default(),
             realized_pnl: 0.0,
@@ -234,7 +271,7 @@ impl AppState {
             fak_net_down: 0.0,
             fills: VecDeque::with_capacity(64),
             open_orders: Vec::new(),
-            status_line: "Waiting for market data…".into(),
+            status_line: "Loading Polymarket markets…".into(),
             collateral_cash_usdc: None,
             collateral_claimable_usdc: None,
             latched_price_to_beat: None,
@@ -259,13 +296,20 @@ impl AppState {
             .or(self.latched_price_to_beat)
     }
 
-    /// BTC colour: green when we're at/above the opening price (UP winning),
-    /// red when strictly below.
-    pub fn btc_above_target(&self) -> Option<bool> {
-        match (self.btc_price, self.price_to_beat()) {
+    /// Green when spot is at/above the opening "price to beat" (rough UP read).
+    pub fn spot_above_target(&self) -> Option<bool> {
+        match (self.spot_price, self.price_to_beat()) {
             (Some(p), Some(t)) => Some(p >= t),
             _ => None,
         }
+    }
+
+    /// Short label for the header (e.g. "BTC/USD" / "ETH/USD").
+    pub fn spot_pair_label(&self) -> String {
+        self.market_profile
+            .as_ref()
+            .map(|p| format!("{}/USD", p.asset.label))
+            .unwrap_or_else(|| "—/USD".to_string())
     }
 
     pub fn book_for(&self, outcome: Outcome) -> Option<&BookSnapshot> {
@@ -344,8 +388,8 @@ impl AppState {
                 }
             }
             AppEvent::Price(p) => {
-                self.btc_price    = Some(p.price);
-                self.btc_price_ts = chrono::DateTime::<Utc>::from_timestamp_millis(p.timestamp_ms as i64);
+                self.spot_price    = Some(p.price);
+                self.spot_price_ts = chrono::DateTime::<Utc>::from_timestamp_millis(p.timestamp_ms as i64);
                 if let Some(m) = &self.market {
                     if m.price_to_beat.is_none() && self.latched_price_to_beat.is_none() {
                         let open_ms = m.opens_at.timestamp_millis().max(0) as u64;
@@ -381,6 +425,16 @@ impl AppState {
                 self.open_orders.clear();
                 self.top_holders_up_sum = None;
                 self.top_holders_down_sum = None;
+            }
+            AppEvent::PriceToBeatRefresh { slug, price_to_beat } => {
+                if let Some(m) = &mut self.market {
+                    if m.slug == slug {
+                        m.price_to_beat = price_to_beat;
+                        if price_to_beat.is_some() {
+                            self.latched_price_to_beat = None;
+                        }
+                    }
+                }
             }
             AppEvent::PositionsLoaded {
                 position_up,
@@ -519,6 +573,34 @@ impl AppState {
                 if matches!(self.deposit_modal, Some(DepositModalPhase::Loading)) {
                     self.deposit_modal = Some(DepositModalPhase::Failed(msg));
                 }
+            }
+            AppEvent::SeriesListReady(res) => {
+                match res {
+                    Ok(rows) if !rows.is_empty() => {
+                        self.wizard_rows = rows;
+                        self.wizard_series_error = None;
+                    }
+                    Ok(_) => {
+                        self.wizard_rows = crate::gamma_series::static_fallback_rows();
+                        self.wizard_series_error = None;
+                    }
+                    Err(e) => {
+                        self.wizard_series_error = Some(e);
+                        self.wizard_rows = crate::gamma_series::static_fallback_rows();
+                    }
+                }
+                if self.wizard_rows.is_empty() {
+                    self.wizard_rows = crate::gamma_series::static_fallback_rows();
+                }
+                self.ui_phase = UiPhase::WizardPickAsset;
+                self.wizard_list_idx = 0;
+                self.wizard_tf_idx = 0;
+                self.status_line = "Select asset (↑/↓ Enter) — Q quit".into();
+            }
+            AppEvent::StartTrading(p) => {
+                self.market_profile = Some(p.clone());
+                self.ui_phase = UiPhase::Trading;
+                self.status_line = "Waiting for market data…".into();
             }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }

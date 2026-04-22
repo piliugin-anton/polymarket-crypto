@@ -16,10 +16,21 @@ use ratatui::{
 
 use std::time::Instant;
 
-use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome};
+use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome, UiPhase};
 use crate::bridge_deposit::SOLANA_MAINNET_USDC_MINT;
+use crate::market_profile::Timeframe;
 
 pub fn draw(f: &mut Frame, s: &AppState) {
+    if s.ui_phase != UiPhase::Trading {
+        draw_wizard(f, s);
+        if let Some(ref t) = s.order_error_toast {
+            if std::time::Instant::now() < t.until {
+                let area = f.area();
+                draw_order_error_toast(f, area, t.message.as_str());
+            }
+        }
+        return;
+    }
     let area = f.area();
     let chunks = Layout::vertical([
         Constraint::Length(4), // header
@@ -75,6 +86,96 @@ fn draw_balance_panel(f: &mut Frame, area: Rect, s: &AppState) {
     f.render_widget(p, area);
 }
 
+fn draw_wizard(f: &mut Frame, s: &AppState) {
+    let area = f.area();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Select market — Polymarket ");
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    match s.ui_phase {
+        UiPhase::WizardLoading => {
+            let t = "Loading series from Polymarket…";
+            let p = Paragraph::new(t).style(Style::default().fg(Color::Cyan));
+            f.render_widget(p, inner);
+        }
+        UiPhase::WizardPickAsset => {
+            let title = "Choose asset (↑/↓) then Enter  ·  Q quit";
+            let header: String = if let Some(ref e) = s.wizard_series_error {
+                format!("Warning: {e}\n{title}\n")
+            } else {
+                format!("{title}\n")
+            };
+            let p = Paragraph::new(header.as_str())
+                .style(Style::default().fg(Color::White));
+            f.render_widget(p, inner);
+            let start_row = 2u16;
+            let visible = (inner.height.saturating_sub(start_row as u16 + 1)) as usize;
+            for (i, row) in s.wizard_rows.iter().enumerate() {
+                if i >= visible {
+                    break;
+                }
+                let y = start_row as usize + i;
+                if y >= inner.y as usize + inner.height as usize {
+                    break;
+                }
+                let is_sel = i == s.wizard_list_idx;
+                let vol = row
+                    .volume_24h
+                    .map(|v| format!("  vol 24h ${:.0}", v))
+                    .unwrap_or_default();
+                let line = if is_sel {
+                    format!(" ▸ {} — {}{}", row.asset.label, row.title, vol)
+                } else {
+                    format!("   {} — {}{}", row.asset.label, row.title, vol)
+                };
+                let style = if is_sel {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let r = Rect {
+                    x:      inner.x + 1,
+                    y:      inner.y + start_row + i as u16,
+                    width:  inner.width.saturating_sub(2),
+                    height: 1,
+                };
+                f.render_widget(Paragraph::new(line).style(style), r);
+            }
+        }
+        UiPhase::WizardPickTimeframe => {
+            let p = Paragraph::new("Time window (↑/↓) Enter  ·  Esc/B back  ·  Q quit\n")
+                .style(Style::default().fg(Color::White));
+            f.render_widget(p, Rect { x: inner.x, y: inner.y, width: inner.width, height: 2 });
+            let options: [(usize, &str, Timeframe); 2] = [
+                (0, "5 minutes",  Timeframe::M5),
+                (1, "15 minutes", Timeframe::M15),
+            ];
+            for (idx, (i, desc, tf)) in options.iter().enumerate() {
+                let is_sel = *i == s.wizard_tf_idx;
+                let mark = if is_sel { " ▸ " } else { "   " };
+                let line = format!("{mark}{desc}  ·  {}", tf.label());
+                let style = if is_sel {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let r = Rect {
+                    x:      inner.x + 1,
+                    y:      inner.y + 3 + idx as u16,
+                    width:  inner.width.saturating_sub(2),
+                    height: 1,
+                };
+                f.render_widget(Paragraph::new(line).style(style), r);
+            }
+        }
+        UiPhase::Trading => {}
+    }
+}
+
 /// Label left, value flush to the right edge of the inner rect (`inner_width` cells).
 fn balance_row_right_aligned<'a>(
     label: &'a str,
@@ -96,19 +197,20 @@ fn balance_row_right_aligned<'a>(
 }
 
 fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
-    let price_cell = match s.btc_price {
+    let pair = s.spot_pair_label();
+    let price_cell = match s.spot_price {
         Some(p) => format!("${:>12}", fmt_money(p)),
         None    => "        ---     ".to_string(),
     };
-    let (colour, arrow) = match s.btc_above_target() {
+    let (colour, arrow) = match s.spot_above_target() {
         Some(true)  => (Color::Green, "▲"),
         Some(false) => (Color::Red,   "▼"),
         None        => (Color::Gray,  "·"),
     };
     let target = s.price_to_beat()
-        .map(|t| format!("Price to Beat: ${}", fmt_money(t)))
-        .unwrap_or_else(|| "Price to Beat: —".into());
-    let delta = match (s.btc_price, s.price_to_beat()) {
+        .map(|t| format!("Open: ${}", fmt_money(t)))
+        .unwrap_or_else(|| "Open: —".into());
+    let delta = match (s.spot_price, s.price_to_beat()) {
         (Some(p), Some(t)) => format!("{:+.2}", p - t),
         _ => "—".into(),
     };
@@ -157,7 +259,10 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
 
     // Line 1: price + oracle arrow + delta, then sentiment (CLOB mid, else top-holders) at end
     let mut line1_parts: Vec<Span> = vec![
-        Span::styled("BTC/USD (Chainlink)  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{pair} (Chainlink)  "),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(price_cell, Style::default().fg(colour).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(arrow, Style::default().fg(colour).add_modifier(Modifier::BOLD)),
@@ -186,8 +291,13 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
         ),
     ]);
 
+    let block_title = s
+        .market_profile
+        .as_ref()
+        .map(|p| format!(" {} {} ", p.asset.label, p.timeframe.tui_phrase()))
+        .unwrap_or_else(|| " — ".to_string());
     let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
-        .title(Span::styled(" BTC 5m Predictions ", Style::default().add_modifier(Modifier::BOLD)));
+        .title(Span::styled(block_title, Style::default().add_modifier(Modifier::BOLD)));
     let p = Paragraph::new(vec![line1, line2]).block(block).wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
@@ -401,6 +511,7 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         key("x", "redeem all"), sep(),
         key("f", "SOL USDC dep"), sep(),
         key("s", "resize"), sep(),
+        key("Esc", "timeframe"), sep(),
         key("q", "quit"),
     ]);
 

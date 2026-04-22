@@ -24,6 +24,8 @@ mod redeem;
 mod events;
 mod feeds;
 mod gamma;
+mod market_profile;
+mod gamma_series;
 mod net;
 mod trading;
 mod ui;
@@ -46,7 +48,7 @@ use crossterm::{
 use events::Action;
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use std::{
     collections::HashMap,
     io::stdout,
@@ -84,6 +86,9 @@ fn apply_app_event(
     tx:     &mpsc::Sender<AppEvent>,
     cfg:    &Config,
     user_open_ledger: &std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
+    rtds_sym_tx:     &watch::Sender<String>,
+    market_tx:       &mpsc::Sender<gamma::ActiveMarket>,
+    discovery_spawned: &mut bool,
 ) -> bool {
     match ev {
         AppEvent::Key(k) => {
@@ -102,6 +107,18 @@ fn apply_app_event(
             false
         }
         e => {
+            if let AppEvent::StartTrading(p) = &e {
+                let _ = rtds_sym_tx.send(p.asset.rtds_symbol.to_string());
+                if !*discovery_spawned {
+                    *discovery_spawned = true;
+                    let txi = tx.clone();
+                    let mtx = market_tx.clone();
+                    let prof = p.clone();
+                    tokio::spawn(async move {
+                        feeds::market_discovery_gamma::spawn(txi, mtx, prof);
+                    });
+                }
+            }
             state.apply(e);
             false
         }
@@ -166,8 +183,31 @@ async fn main() -> Result<()> {
     // Shared event channel — generous buffer so bursts from the book WS don't drop
     let (tx, mut rx) = mpsc::channel::<AppEvent>(512);
 
+    let (rtds_sym_tx, rtds_sym_rx) = watch::channel(String::new());
+
+    // Wizard: load Gamma /series (5m) metadata for the asset list.
+    {
+        let txx = tx.clone();
+        tokio::spawn(async move {
+            let client = match net::reqwest_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = txx
+                        .send(AppEvent::SeriesListReady(Err(e.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            let out = match crate::gamma_series::fetch_crypto_series_for_wizard(&client).await {
+                Ok(rows) => Ok(rows),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = txx.send(AppEvent::SeriesListReady(out)).await;
+        });
+    }
+
     // ── spawn feeds ──────────────────────────────────────────────────
-    spawn_price_feed(tx.clone());
+    spawn_price_feed(tx.clone(), rtds_sym_rx);
     spawn_ticker(tx.clone());
     spawn_key_reader(tx.clone());
 
@@ -255,9 +295,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Market discovery + book-subscription supervisor
+    // Market discovery: started after the wizard calls [`AppEvent::StartTrading`].
     let (market_tx, mut market_rx) = mpsc::channel::<gamma::ActiveMarket>(8);
-    feeds::market_discovery_gamma::spawn(tx.clone(), market_tx);
 
     // When a new market arrives, tear down the old book WS and start a new one.
     let tx_for_books = tx.clone();
@@ -589,6 +628,7 @@ async fn main() -> Result<()> {
     let mut term = Terminal::new(backend)?;
 
     let mut state = AppState::new(cfg.default_size_usdc, user_trade_sync.clone());
+    let mut discovery_spawned = false;
 
     // ── main loop ────────────────────────────────────────────────────
     /// Drain coalesced feed events in one frame so a burst of book updates
@@ -608,7 +648,17 @@ async fn main() -> Result<()> {
             if matches!(ev, AppEvent::Key(_)) {
                 had_key = true;
             }
-            if apply_app_event(ev, &mut state, &trading, &tx, &cfg, &user_open_ledger) {
+            if apply_app_event(
+                ev,
+                &mut state,
+                &trading,
+                &tx,
+                &cfg,
+                &user_open_ledger,
+                &rtds_sym_tx,
+                &market_tx,
+                &mut discovery_spawned,
+            ) {
                 should_quit = true;
                 break;
             }
@@ -636,7 +686,17 @@ async fn main() -> Result<()> {
                     maybe_ev = rx.recv() => {
                         let Some(mut ev) = maybe_ev else { break Ok(()) };
                         loop {
-                            if apply_app_event(ev, &mut state, &trading, &tx, &cfg, &user_open_ledger) {
+                            if apply_app_event(
+                                ev,
+                                &mut state,
+                                &trading,
+                                &tx,
+                                &cfg,
+                                &user_open_ledger,
+                                &rtds_sym_tx,
+                                &market_tx,
+                                &mut discovery_spawned,
+                            ) {
                                 should_quit = true;
                                 break;
                             }
@@ -653,7 +713,17 @@ async fn main() -> Result<()> {
                 }
             }
             while let Ok(next) = rx.try_recv() {
-                if apply_app_event(next, &mut state, &trading, &tx, &cfg, &user_open_ledger) {
+                if apply_app_event(
+                    next,
+                    &mut state,
+                    &trading,
+                    &tx,
+                    &cfg,
+                    &user_open_ledger,
+                    &rtds_sym_tx,
+                    &market_tx,
+                    &mut discovery_spawned,
+                ) {
                     should_quit = true;
                     break;
                 }
@@ -678,9 +748,9 @@ async fn main() -> Result<()> {
 
 // ── event forwarders ────────────────────────────────────────────────
 
-fn spawn_price_feed(tx: mpsc::Sender<AppEvent>) {
+fn spawn_price_feed(tx: mpsc::Sender<AppEvent>, rtds_sym_rx: watch::Receiver<String>) {
     let (ptx, mut prx) = mpsc::channel::<feeds::chainlink::PriceTick>(64);
-    feeds::chainlink::spawn(ptx);
+    let _ = feeds::chainlink::spawn(ptx, rtds_sym_rx);
     tokio::spawn(async move {
         while let Some(p) = prx.recv().await {
             // RTDS can outpace the TUI; forward only the latest tick per burst so
@@ -866,6 +936,9 @@ fn dispatch_action(
     user_open_ledger: &std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
 ) {
     match action {
+        Action::StartTrading(p) => {
+            let _ = tx.try_send(AppEvent::StartTrading(p));
+        }
         Action::None => {}
         // `main` handles `Action::Quit` before calling this; kept for an exhaustive `match`.
         Action::Quit => {}

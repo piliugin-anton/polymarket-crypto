@@ -30,7 +30,12 @@ use serde::Deserialize;
 use tracing::debug;
 use url::Url;
 
+use chrono_tz::America::New_York;
+
 use crate::config::{GAMMA_HOST, POLYMARKET_CRYPTO_PRICE_URL};
+use crate::market_profile::{
+    build_daily_event_slug, MarketProfile, Timeframe, CRYPTO_ASSETS,
+};
 
 /// Five-minute window length in seconds (matches Polymarket BTC 5m slugs).
 pub const BTC_5M_WINDOW_SEC: i64 = 300;
@@ -143,26 +148,40 @@ impl GammaClient {
         }
     }
 
-    /// Find the 5-min BTC market whose trading window contains `now`.
-    ///
-    /// Strategy: align `now` to the 5-minute grid, then request
-    /// `/markets/slug/btc-updown-5m-{unix}` for that window and neighbors.
-    /// Pick the market where `start <= now < end`, else the next upcoming window.
+    /// Default BTC 5m discovery (kept for external scripts / back-compat).
+    #[allow(dead_code)]
     pub async fn find_current_btc_5m(&self) -> Result<ActiveMarket> {
+        let p = MarketProfile {
+            asset:     CRYPTO_ASSETS[0].clone(),
+            timeframe: Timeframe::M5,
+        };
+        self.find_current_updown(&p).await
+    }
+
+    /// Find the up/down market for `profile` (rolling 5m/15m or daily calendar in ET).
+    pub async fn find_current_updown(&self, profile: &MarketProfile) -> Result<ActiveMarket> {
+        if profile.is_rolling() {
+            self.find_current_rolling_updown(profile).await
+        } else {
+            self.find_current_daily_updown(profile).await
+        }
+    }
+
+    /// Align `now` to the step grid, then request `/markets/slug/{…-updown-5m-…}` for that window
+    /// and neighbors. Pick the market where `start <= now < end`, else the next upcoming window.
+    async fn find_current_rolling_updown(&self, profile: &MarketProfile) -> Result<ActiveMarket> {
+        let step = profile
+            .timeframe
+            .window_sec_rolling()
+            .ok_or_else(|| anyhow!("not a rolling profile"))?;
         let now = Utc::now();
         let now_ts = now.timestamp();
-        let base = (now_ts / BTC_5M_WINDOW_SEC) * BTC_5M_WINDOW_SEC;
+        let base = (now_ts / step) * step;
 
         let mut candidates: Vec<RawMarket> = Vec::new();
-        for off in [
-            0,
-            BTC_5M_WINDOW_SEC,
-            -BTC_5M_WINDOW_SEC,
-            2 * BTC_5M_WINDOW_SEC,
-            -2 * BTC_5M_WINDOW_SEC,
-        ] {
+        for off in [0, step, -step, 2 * step, -2 * step] {
             let ts = base + off;
-            let slug = format!("btc-updown-5m-{ts}");
+            let Some(slug) = profile.rolling_slug_for_window_start(ts) else { continue; };
             let url = format!("{GAMMA_HOST}/markets/slug/{slug}");
             debug!(%url, "gamma: fetch market by slug");
 
@@ -190,9 +209,14 @@ impl GammaClient {
             candidates.push(m);
         }
 
+        let pfx = format!(
+            "{}-updown-{}-",
+            profile.asset.rolling_slug_prefix,
+            profile.timeframe.rolling_slug_token().unwrap_or("5m")
+        );
         candidates.sort_by_key(|m| {
             m.slug
-                .strip_prefix("btc-updown-5m-")
+                .strip_prefix(&pfx)
                 .and_then(|t| t.parse::<i64>().ok())
                 .unwrap_or(i64::MAX)
         });
@@ -212,21 +236,28 @@ impl GammaClient {
             })
             .ok_or_else(|| {
                 anyhow!(
-                    "no active or upcoming btc-updown-5m-* market (tried windows around unix {base})"
+                    "no active or upcoming {pfx}* market (tried windows around unix {base})",
+                    pfx = pfx,
+                    base = base
                 )
             })?;
 
-        self.active_market_from_raw_with_crypto(market).await
+        self.active_market_from_raw_with_crypto(market, profile).await
     }
 
-    /// `GET /markets/slug/btc-updown-5m-{window_start_ts}` only — for fast roll polling.
-    ///
+    /// `GET /markets/slug/…-updown-…- {window_start_ts}` — for fast roll polling.
     /// Returns `Ok(None)` on 404 or if Gamma marks the market closed (not ready yet).
-    pub async fn try_fetch_btc_5m_by_window_start_ts(
+    pub async fn try_fetch_rolling_by_window_start_ts(
         &self,
         window_start_ts: i64,
+        profile:         &MarketProfile,
     ) -> Result<Option<ActiveMarket>> {
-        let slug = format!("btc-updown-5m-{window_start_ts}");
+        if !profile.is_rolling() {
+            bail!("not a rolling profile");
+        }
+        let Some(slug) = profile.rolling_slug_for_window_start(window_start_ts) else {
+            bail!("invalid rolling profile");
+        };
         let url = format!("{GAMMA_HOST}/markets/slug/{slug}");
         debug!(%url, "gamma: fetch next window by slug");
 
@@ -252,20 +283,95 @@ impl GammaClient {
             return Ok(None);
         }
 
-        self.active_market_from_raw_with_crypto(&m).await.map(Some)
+        self.active_market_from_raw_with_crypto(&m, profile).await.map(Some)
     }
 
-    async fn active_market_from_raw_with_crypto(&self, market: &RawMarket) -> Result<ActiveMarket> {
+    /// Calendar-day markets in ET: `bitcoin-up-or-down-on-april-22-2026` etc.
+    async fn find_current_daily_updown(&self, profile: &MarketProfile) -> Result<ActiveMarket> {
+        if profile.timeframe != Timeframe::D1 {
+            bail!("not daily timeframe");
+        }
+        let now_ny = Utc::now().with_timezone(&New_York);
+        let today = now_ny.date_naive();
+        let mut d = today;
+        for _ in 0..5 {
+            let slug = build_daily_event_slug(&profile.asset.daily_event_prefix, d);
+            if let Some(m) = self.fetch_open_raw_market_by_slug(&slug).await? {
+                return self.active_market_from_raw_with_crypto(&m, profile).await;
+            }
+            d = d + chrono::Duration::days(1);
+        }
+        anyhow::bail!("no open daily up/down market (tried a few days from {today} for this asset)");
+    }
+
+    /// Next calendar day in ET after the previous market's end — poll for the next `…-on-mmm-d-yyyy` slug.
+    pub async fn try_fetch_next_daily_by_previous_close(
+        &self,
+        profile:             &MarketProfile,
+        last_window_end_utc: DateTime<Utc>,
+    ) -> Result<Option<ActiveMarket>> {
+        if profile.timeframe != Timeframe::D1 {
+            bail!("not daily timeframe");
+        }
+        let d0 = last_window_end_utc.with_timezone(&New_York).date_naive();
+        let start_date = d0 + chrono::Duration::days(1);
+        for add in 0i64..10i64 {
+            let d = start_date + chrono::Duration::days(add);
+            let slug = build_daily_event_slug(&profile.asset.daily_event_prefix, d);
+            if let Some(m) = self.fetch_open_raw_market_by_slug(&slug).await? {
+                return self.active_market_from_raw_with_crypto(&m, profile).await.map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn fetch_open_raw_market_by_slug(&self, slug: &str) -> Result<Option<RawMarket>> {
+        let url = format!("{GAMMA_HOST}/markets/slug/{slug}");
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("gamma GET {url} failed"))?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let m: RawMarket = resp
+            .error_for_status()
+            .with_context(|| format!("gamma GET {url} bad status"))?
+            .json()
+            .await
+            .with_context(|| format!("gamma GET {url} decode failed"))?;
+        if m.closed {
+            return Ok(None);
+        }
+        Ok(Some(m))
+    }
+
+    async fn active_market_from_raw_with_crypto(
+        &self,
+        market:  &RawMarket,
+        profile: &MarketProfile,
+    ) -> Result<ActiveMarket> {
         let mut m = active_market_from_raw_market(market, None)?;
-        let (win_start, win_end) = utc_five_minute_window_bounds(&m.slug, m.opens_at);
-        m.opens_at = win_start;
-        m.closes_at = win_end;
-        let event_start = format_crypto_price_query_time(win_start);
-        let end_date = format_crypto_price_query_time(win_end);
+        if profile.is_rolling() {
+            let (win_start, win_end) = utc_rolling_window_bounds(&m.slug, m.opens_at, profile);
+            m.opens_at = win_start;
+            m.closes_at = win_end;
+        } else {
+            // Daily: trust Gamma `eventStartTime` / `endDate` (already in `m`).
+        }
+        let event_start = format_crypto_price_query_time(m.opens_at);
+        let end_date = format_crypto_price_query_time(m.closes_at);
         m.crypto_price_query_start_utc = event_start.clone();
         m.crypto_price_query_end_utc = end_date.clone();
         if let Some(open) = self
-            .fetch_polymarket_btc_open_price(&event_start, &end_date)
+            .fetch_polymarket_open_price(
+                &profile.asset.crypto_price_symbol,
+                &event_start,
+                &end_date,
+                profile.timeframe.crypto_price_variant(),
+            )
             .await
         {
             m.price_to_beat = Some(open);
@@ -273,17 +379,19 @@ impl GammaClient {
         Ok(m)
     }
 
-    /// `GET /api/crypto/crypto-price` — `openPrice` for this 5-minute window.
-    async fn fetch_polymarket_btc_open_price(
+    /// `GET /api/crypto/crypto-price` — `openPrice` for the window.
+    async fn fetch_polymarket_open_price(
         &self,
-        event_start: &str,
-        end_date: &str,
+        symbol:        &str,
+        event_start:   &str,
+        end_date:      &str,
+        variant:       &str,
     ) -> Option<f64> {
         let mut u = Url::parse(POLYMARKET_CRYPTO_PRICE_URL).expect("POLYMARKET_CRYPTO_PRICE_URL");
         u.query_pairs_mut()
-            .append_pair("symbol", "BTC")
+            .append_pair("symbol", symbol)
             .append_pair("eventStartTime", event_start)
-            .append_pair("variant", "fiveminute")
+            .append_pair("variant", variant)
             .append_pair("endDate", end_date);
         let res = self.http.get(u.as_str()).send()
             .await
@@ -325,27 +433,36 @@ fn format_crypto_price_query_time(utc: DateTime<Utc>) -> String {
     utc.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// 5m BTC windows start on the UTC clock at :00, :05, …, :55 (epoch slice of 300s).
-///
-/// Prefer the **`btc-updown-5m-{unix}`** slug (authoritative window start); otherwise
-/// floor Gamma `opens_at` down to a 300s boundary. End is always start + 5 minutes.
-fn utc_five_minute_window_bounds(slug: &str, opens_at: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
-    const STEP: i64 = BTC_5M_WINDOW_SEC;
-    let start = if let Some(tail) = slug.strip_prefix("btc-updown-5m-") {
+/// Rolling windows: prefer slug tail `{prefix}-updown-{5m|15m}-{unix}`; else floor `opens_at` to the step grid.
+fn utc_rolling_window_bounds(
+    slug:     &str,
+    opens_at: DateTime<Utc>,
+    profile:  &MarketProfile,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    let step = profile
+        .timeframe
+        .window_sec_rolling()
+        .unwrap_or(BTC_5M_WINDOW_SEC);
+    let pfx = format!(
+        "{}-updown-{}-",
+        profile.asset.rolling_slug_prefix,
+        profile.timeframe.rolling_slug_token().unwrap_or("5m")
+    );
+    let start = if let Some(tail) = slug.strip_prefix(&pfx) {
         if let Ok(ts) = tail.parse::<i64>() {
             DateTime::<Utc>::from_timestamp(ts, 0).unwrap_or(opens_at)
         } else {
-            floor_utc_to_five_minutes(opens_at)
+            floor_utc_to_step(opens_at, step)
         }
     } else {
-        floor_utc_to_five_minutes(opens_at)
+        floor_utc_to_step(opens_at, step)
     };
-    let end = start + Duration::seconds(STEP);
+    let end = start + Duration::seconds(step);
     (start, end)
 }
 
-fn floor_utc_to_five_minutes(t: DateTime<Utc>) -> DateTime<Utc> {
-    let floored = (t.timestamp() / BTC_5M_WINDOW_SEC) * BTC_5M_WINDOW_SEC;
+fn floor_utc_to_step(t: DateTime<Utc>, step: i64) -> DateTime<Utc> {
+    let floored = (t.timestamp() / step) * step;
     DateTime::<Utc>::from_timestamp(floored, 0).unwrap_or(t)
 }
 

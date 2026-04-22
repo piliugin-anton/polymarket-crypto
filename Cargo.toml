@@ -41,6 +41,7 @@ base64    = "0.22"
 anyhow            = "1"
 thiserror         = "2"
 chrono            = { version = "0.4", features = ["serde"] }
+chrono-tz         = "0.10"
 uuid              = { version = "1", features = ["v4"] }
 rand              = "0.9"
 dotenvy           = "0.15"

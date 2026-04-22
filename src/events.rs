@@ -3,9 +3,12 @@
 //! `handle_key` returns an `Action` the runtime should dispatch. Keeping this
 //! pure (no I/O) makes the key logic unit-testable.
 
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
-use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome, MIN_LIMIT_ORDER_SHARES};
+use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome, UiPhase, MIN_LIMIT_ORDER_SHARES};
+use crate::market_profile::{MarketProfile, Timeframe};
 use crate::trading::Side;
 
 #[derive(Debug)]
@@ -22,6 +25,8 @@ pub enum Action {
     Claim,
     /// `POST` Polymarket Bridge `/deposit` for `POLYMARKET_FUNDER` → Solana address + QR.
     FetchSolanaDeposit,
+    /// After wizard: `main` dispatches `AppEvent::StartTrading` and spawns RTDS + Gamma.
+    StartTrading(Arc<MarketProfile>),
 }
 
 /// When the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) is
@@ -61,6 +66,10 @@ pub fn handle_key(state: &mut AppState, k: KeyEvent) -> Action {
         return Action::Quit;
     }
 
+    if state.ui_phase != UiPhase::Trading {
+        return handle_wizard_key(state, k);
+    }
+
     if state.deposit_modal.is_some() {
         return deposit_modal_key(state, k);
     }
@@ -72,6 +81,23 @@ pub fn handle_key(state: &mut AppState, k: KeyEvent) -> Action {
     }
 }
 
+/// Leave the trading screen and show the wizard’s 5m / 15m time-window list for the current asset.
+fn go_to_wizard_timeframe(state: &mut AppState) {
+    if let Some(ref profile) = state.market_profile {
+        if let Some(i) = state.wizard_rows.iter().position(|r| r.asset == profile.asset) {
+            state.wizard_list_idx = i;
+        }
+        state.wizard_tf_idx = match profile.timeframe {
+            Timeframe::M5 => 0,
+            Timeframe::M15 => 1,
+            // Wizard only offers rolling 5m / 15m; daily users land on 5m highlight.
+            Timeframe::D1 => 0,
+        };
+    }
+    state.ui_phase = UiPhase::WizardPickTimeframe;
+    state.status_line = "Timeframe: 5m / 15m (↑/↓ Enter) — B back".into();
+}
+
 fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
     // Avoid placing repeated market orders when a key is held (we now forward `Repeat`).
     if k.kind == KeyEventKind::Repeat {
@@ -79,7 +105,11 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
     }
     let size = state.current_size();
     match k.code {
-        KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+        KeyCode::Char('q') => Action::Quit,
+        KeyCode::Esc => {
+            go_to_wizard_timeframe(state);
+            Action::None
+        }
         // Quick market orders — lowercase buys, uppercase sells, matching convention
         KeyCode::Char('u') => Action::PlaceMarket { outcome: Outcome::Up,   side: Side::Buy,  size_usdc: size },
         KeyCode::Char('d') => Action::PlaceMarket { outcome: Outcome::Down, side: Side::Buy,  size_usdc: size },
@@ -118,6 +148,80 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
         }
 
         _ => Action::None,
+    }
+}
+
+fn handle_wizard_key(state: &mut AppState, k: KeyEvent) -> Action {
+    if k.kind == KeyEventKind::Repeat {
+        return Action::None;
+    }
+    if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('q')) {
+        return Action::Quit;
+    }
+    if matches!(k.code, KeyCode::Char('q')) {
+        return Action::Quit;
+    }
+    match state.ui_phase {
+        UiPhase::WizardLoading => {
+            if matches!(k.code, KeyCode::Esc) {
+                return Action::Quit;
+            }
+            Action::None
+        }
+        UiPhase::WizardPickAsset => {
+            if matches!(k.code, KeyCode::Esc) {
+                return Action::Quit;
+            }
+            if state.wizard_rows.is_empty() {
+                return Action::None;
+            }
+            let n = state.wizard_rows.len();
+            match k.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.wizard_list_idx = state.wizard_list_idx.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.wizard_list_idx = (state.wizard_list_idx + 1).min(n - 1);
+                }
+                KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                    state.ui_phase = UiPhase::WizardPickTimeframe;
+                    state.wizard_tf_idx = 0;
+                    state.status_line = "Timeframe: 5m / 15m (↑/↓ Enter) — B back".into();
+                }
+                _ => {}
+            }
+            Action::None
+        }
+        UiPhase::WizardPickTimeframe => {
+            if state.wizard_rows.is_empty() {
+                return Action::None;
+            }
+            let n_tf = 2;
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
+                    state.ui_phase = UiPhase::WizardPickAsset;
+                    state.status_line = "Select asset (↑/↓ Enter) — Q quit".into();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.wizard_tf_idx = state.wizard_tf_idx.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.wizard_tf_idx = (state.wizard_tf_idx + 1).min(n_tf - 1);
+                }
+                KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                    let asset = state.wizard_rows[state.wizard_list_idx].asset.clone();
+                    let tf = match state.wizard_tf_idx.min(1) {
+                        0 => Timeframe::M5,
+                        _ => Timeframe::M15,
+                    };
+                    let p = Arc::new(MarketProfile { asset, timeframe: tf });
+                    return Action::StartTrading(p);
+                }
+                _ => {}
+            }
+            Action::None
+        }
+        UiPhase::Trading => Action::None,
     }
 }
 
@@ -279,10 +383,13 @@ mod tests {
 
     use crossterm::event::{KeyEvent, KeyModifiers};
 
+    use crate::app::UiPhase;
     use crate::feeds::user_trade_sync::UserTradeSync;
 
     fn test_state() -> AppState {
-        AppState::new(5.0, Arc::new(UserTradeSync::new()))
+        let mut s = AppState::new(5.0, Arc::new(UserTradeSync::new()));
+        s.ui_phase = UiPhase::Trading;
+        s
     }
 
     #[test]

@@ -1,16 +1,12 @@
-//! Polymarket RTDS — Chainlink BTC/USD feed.
+//! Polymarket RTDS — Chainlink crypto/USD feed (symbol chosen after the TUI wizard).
 //!
-//! No authentication required. We subscribe to the `crypto_prices_chainlink`
-//! topic with filter `symbol=btc/usd` and emit a `PriceTick` on every update.
-//!
-//! RTDS expects `action` + a **`subscriptions`** array, and Chainlink filters
-//! must be a **JSON string** (e.g. `"{\"symbol\":\"btc/usd\"}"`), not a nested
-//! object — see <https://docs.polymarket.com/developers/RTDS/RTDS-crypto-prices>.
+//! No authentication. We subscribe to the `crypto_prices_chainlink` topic with
+//! `filters: "{\"symbol\":\"eth/usd\"}"` (see Polymarket RTDS crypto prices docs).
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
@@ -45,7 +41,6 @@ struct Payload {
     #[serde(default)] symbol:    String,
     #[serde(default)] value:     Option<f64>,
     #[serde(default)] timestamp: Option<u64>,
-    /// For "subscribe" envelopes the payload is a batch of points.
     #[serde(default)] data:      Vec<DataPoint>,
 }
 
@@ -55,29 +50,41 @@ struct DataPoint {
     #[serde(default)] timestamp: u64,
 }
 
-/// Spawns a task that maintains the WS connection with reconnect-on-error,
-/// pushing every new price tick into `tx`.
-pub fn spawn(tx: mpsc::Sender<PriceTick>) -> tokio::task::JoinHandle<()> {
+/// Waits for a **non-empty** `symbol` on `symbol_rx` (e.g. `btc/usd`), then connects, reconnects
+/// on drop/failure, and re-reads the watch value so symbol changes can take effect.
+pub fn spawn(
+    tx:         mpsc::Sender<PriceTick>,
+    mut symbol_rx: watch::Receiver<String>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = run_once(&tx).await {
-                warn!(error = %e, "chainlink WS disconnected — reconnecting in 2s");
+            if symbol_rx.borrow().is_empty() {
+                if symbol_rx.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            let sym = symbol_rx.borrow().clone();
+            if sym.is_empty() {
+                continue;
+            }
+            if let Err(e) = run_once(&tx, &sym).await {
+                warn!(error = %e, sym = %sym, "RTDS (Chainlink) disconnected — retry in 2s");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
     })
 }
 
-async fn run_once(tx: &mpsc::Sender<PriceTick>) -> Result<()> {
+async fn run_once(tx: &mpsc::Sender<PriceTick>, rtds_symbol: &str) -> Result<()> {
     let (mut ws, _) = crate::net::ws_connect(RTDS_WS_URL)
         .await
         .context("connect to Polymarket RTDS")?;
 
-    info!(url = %RTDS_WS_URL, "RTDS (Chainlink) connected");
+    info!(url = %RTDS_WS_URL, %rtds_symbol, "RTDS (Chainlink) connected");
 
-    // Documented shape: filters is a string containing JSON, inside `subscriptions`.
-    let filters = serde_json::to_string(&serde_json::json!({ "symbol": "btc/usd" }))
-        .expect("static json");
+    let filters = serde_json::to_string(&serde_json::json!({ "symbol": rtds_symbol }))
+        .expect("static json to string");
     let sub = serde_json::json!({
         "action": "subscribe",
         "subscriptions": [
@@ -92,11 +99,11 @@ async fn run_once(tx: &mpsc::Sender<PriceTick>) -> Result<()> {
     info!(payload = %snip(&sub_txt, 200), "RTDS subscribe sent");
     ws.send(Message::Text(sub_txt.into())).await?;
 
-    // Heartbeat — docs: PING every 5s.
     let mut ping_iv = tokio::time::interval(std::time::Duration::from_secs(5));
     ping_iv.tick().await;
 
     let mut first_text = true;
+    let sym_expect = rtds_symbol.to_ascii_lowercase();
 
     loop {
         tokio::select! {
@@ -127,7 +134,7 @@ async fn run_once(tx: &mpsc::Sender<PriceTick>) -> Result<()> {
                             Ok(env) if env.topic == "crypto_prices_chainlink" => {
                                 if let Some(p) = env.payload {
                                     let sym_ok = p.symbol.is_empty()
-                                        || p.symbol.eq_ignore_ascii_case("btc/usd");
+                                        || p.symbol.to_ascii_lowercase() == sym_expect;
                                     if !sym_ok {
                                         continue;
                                     }
