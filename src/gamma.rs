@@ -1,8 +1,7 @@
 //! Gamma API client.
 //!
 //! Used exclusively for market *discovery*: the app’s Gamma poll task calls into
-//! this no-auth REST API on a **configurable in-window interval** (see
-//! `GAMMA_POLL_IN_WINDOW_SECS` in [`crate::feeds::market_discovery_gamma`]); **after** `closes_at` the
+//! this no-auth REST API on a **fixed in-window interval** ([`crate::feeds::market_discovery_gamma::GAMMA_POLL_IN_WINDOW_SECS`]); **after** `closes_at` the
 //! discovery task polls only **`/markets/slug/btc-updown-5m-{start+300}`** (next window) once per
 //! second until the slug resolves (see [`crate::feeds::market_discovery_gamma`]) — no broad search.
 //! Requests are mutex-serialized. The initial lookup still uses a multi-slug search around

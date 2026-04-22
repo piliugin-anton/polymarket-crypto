@@ -1,7 +1,7 @@
 //! BTC 5m market discovery via **Gamma REST** (`find_current_btc_5m`).
 //!
-//! While the current 5m window is open we sleep at most the configured interval (`GAMMA_POLL_IN_WINDOW_SECS`,
-//! default 15s), but we also **wake at `closes_at`** (`min` of the two) so the next tick runs as soon as the window ends,
+//! While the current 5m window is open we sleep at most [`GAMMA_POLL_IN_WINDOW_SECS`] (15s),
+//! but we also **wake at `closes_at`** (`min` of the two) so the next tick runs as soon as the window ends,
 //! with **no** extra post-close delay before the slug poll. **After `closes_at`** we only hit
 //! **`GET /markets/slug/btc-updown-5m-{previous_closes_at_unix}`** (the next 5m window, +300s from
 //! the last start) once per second until that slug returns 200 — no multi-slug search (faster
@@ -19,20 +19,10 @@ use tracing::{info, warn};
 use crate::app::AppEvent;
 use crate::gamma::{self, GammaClient};
 
-/// Default while the current 5m window is open (`GAMMA_POLL_IN_WINDOW_SECS` overrides).
+/// Seconds between Gamma discovery ticks while the current 5m window is open.
 /// `find_current_btc_5m` does up to 5 GETs per tick — keep this well above 1s to avoid
 /// hammering Gamma; 15s is ~4× more responsive than the old 60s default.
-const GAMMA_POLL_IN_WINDOW_DEFAULT: u64 = 15;
-const GAMMA_POLL_IN_WINDOW_MIN: u64 = 5;
-const GAMMA_POLL_IN_WINDOW_MAX: u64 = 120;
-
-fn gamma_poll_in_window_secs_from_env() -> u64 {
-    std::env::var("GAMMA_POLL_IN_WINDOW_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(GAMMA_POLL_IN_WINDOW_DEFAULT)
-        .clamp(GAMMA_POLL_IN_WINDOW_MIN, GAMMA_POLL_IN_WINDOW_MAX)
-}
+pub const GAMMA_POLL_IN_WINDOW_SECS: u64 = 15;
 
 async fn apply_resolved_market(
     m:            gamma::ActiveMarket,
@@ -135,10 +125,10 @@ pub fn spawn(tx: mpsc::Sender<AppEvent>, market_tx: mpsc::Sender<gamma::ActiveMa
         let mut current_slug: Option<String> = None;
         let mut last_window_end: Option<DateTime<Utc>> = None;
 
-        let in_window_secs = gamma_poll_in_window_secs_from_env();
+        let in_window_secs = GAMMA_POLL_IN_WINDOW_SECS;
         info!(
             in_window_sec = in_window_secs,
-            "market discovery: Gamma poll (mutex-serialized; sleeps until min(in_window, until closes_at), then slug poll; GAMMA_POLL_IN_WINDOW_SECS clamp 5..=120, default 15)"
+            "market discovery: Gamma poll (mutex-serialized; sleeps until min(in_window, until closes_at), then slug poll)"
         );
 
         if !try_roll_market(
