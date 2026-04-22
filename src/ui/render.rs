@@ -69,11 +69,11 @@ fn draw_header_row(f: &mut Frame, area: Rect, s: &AppState) {
 fn draw_balance_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let cash = s
         .collateral_cash_usdc
-        .map(|v| format!("${}", fmt_money(v)))
+        .map(|v| format!("${}", fmt_balance_usdc(v)))
         .unwrap_or_else(|| "—".to_string());
     let claimable = s
         .collateral_claimable_usdc
-        .map(|v| format!("${}", fmt_money(v)))
+        .map(|v| format!("${}", fmt_balance_usdc(v)))
         .unwrap_or_else(|| "—".to_string());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -913,16 +913,26 @@ fn bottom_right_rect(screen: Rect, w: u16, h: u16, margin: u16) -> Rect {
     let y = screen.y + screen.height.saturating_sub(h + margin);
     Rect { x, y, width: w, height: h }
 }
-fn fmt_money(v: f64) -> String {
-    fmt_money_decimals(v, 2)
+/// Cash / claimable: floor fractional cents so the panel never reads higher than on-chain amounts.
+fn fmt_balance_usdc(v: f64) -> String {
+    fmt_money_decimals_inner(v, 2, true)
 }
 
 fn fmt_money_decimals(v: f64, decimal_places: u32) -> String {
+    fmt_money_decimals_inner(v, decimal_places, false)
+}
+
+fn fmt_money_decimals_inner(v: f64, decimal_places: u32, floor_frac: bool) -> String {
     // e.g. 67_432.51 or 2.3456 (decimal_places = 4)
     let whole = v as i64;
     let mult = 10_f64.powi(decimal_places as i32);
     let max_frac = mult as u64;
-    let mut frac = ((v - whole as f64).abs() * mult).round() as u64;
+    let raw_frac = (v - whole as f64).abs() * mult;
+    let mut frac = if floor_frac {
+        raw_frac.floor() as u64
+    } else {
+        raw_frac.round() as u64
+    };
     let mut w = whole;
     if frac >= max_frac {
         w += if v >= 0.0 { 1 } else { -1 };

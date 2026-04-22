@@ -2055,11 +2055,12 @@ fn round_up_f64(num: f64, decimals: u32) -> f64 {
 }
 
 /// USDC on the wire: **exactly 2** fractional digits → micros are multiples of `10_000`.
+/// FAK/FOK: cents are **floored** so we never encode more USDC than the human amount (no `round` up).
 fn usdc_human_to_wire_micros(human: f64) -> U256 {
     if !human.is_finite() || human <= 0.0 {
         return U256::ZERO;
     }
-    let cents = (human * 100.0).round() as i64;
+    let cents = (human * 100.0).floor() as i64;
     let cents = cents.max(0) as u128;
     U256::from(cents * 10_000u128)
 }
@@ -2211,8 +2212,8 @@ fn amounts_for(
             if raw_taker <= 0.0 {
                 raw_taker = round_up_f64(product, USDC_DECIMALS);
             }
-            // `usdc_human_to_wire_micros` maps to whole cents; e.g. $0.004 rounds to 0¢.
-            let cents_wire = (raw_taker * 100.0).round() as i64;
+            // Same as `usdc_human_to_wire_micros`: floor to whole cents; sub-cent → 0¢ unless we bump below.
+            let cents_wire = (raw_taker * 100.0).floor() as i64;
             if cents_wire == 0 && raw_taker > 0.0 {
                 raw_taker = 0.01;
             }
