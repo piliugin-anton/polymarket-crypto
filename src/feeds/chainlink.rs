@@ -68,7 +68,7 @@ pub fn spawn(
             if sym.is_empty() {
                 continue;
             }
-            if let Err(e) = run_once(&tx, &sym).await {
+            if let Err(e) = run_once(&tx, &sym, &mut symbol_rx).await {
                 warn!(error = %e, sym = %sym, "RTDS (Chainlink) disconnected — retry in 2s");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
@@ -76,7 +76,11 @@ pub fn spawn(
     })
 }
 
-async fn run_once(tx: &mpsc::Sender<PriceTick>, rtds_symbol: &str) -> Result<()> {
+async fn run_once(
+    tx: &mpsc::Sender<PriceTick>,
+    rtds_symbol: &str,
+    symbol_rx: &mut watch::Receiver<String>,
+) -> Result<()> {
     let (mut ws, _) = crate::net::ws_connect(RTDS_WS_URL)
         .await
         .context("connect to Polymarket RTDS")?;
@@ -107,6 +111,18 @@ async fn run_once(tx: &mpsc::Sender<PriceTick>, rtds_symbol: &str) -> Result<()>
 
     loop {
         tokio::select! {
+            biased;
+            ch = symbol_rx.changed() => {
+                ch.map_err(|_| anyhow::anyhow!("RTDS symbol watch closed"))?;
+                if symbol_rx.borrow().as_str() != rtds_symbol {
+                    info!(
+                        old = %rtds_symbol,
+                        new = %symbol_rx.borrow().as_str(),
+                        "RTDS resubscribe: symbol changed"
+                    );
+                    return Ok(());
+                }
+            }
             _ = ping_iv.tick() => {
                 let _ = ws.send(Message::Text("PING".into())).await;
             }

@@ -197,10 +197,11 @@ fn balance_row_right_aligned<'a>(
 }
 
 fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
+    let dec = s.spot_usd_decimal_places();
     let pair = s.spot_pair_label();
     let price_cell = match s.spot_price {
-        Some(p) => format!("${:>12}", fmt_money(p)),
-        None    => "        ---     ".to_string(),
+        Some(p) => format!("${}", fmt_money_decimals(p, dec as u32)),
+        None    => "—".to_string(),
     };
     let (colour, arrow) = match s.spot_above_target() {
         Some(true)  => (Color::Green, "▲"),
@@ -208,10 +209,10 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
         None        => (Color::Gray,  "·"),
     };
     let target = s.price_to_beat()
-        .map(|t| format!("Open: ${}", fmt_money(t)))
+        .map(|t| format!("Open: ${}", fmt_money_decimals(t, dec as u32)))
         .unwrap_or_else(|| "Open: —".into());
     let delta = match (s.spot_price, s.price_to_beat()) {
-        (Some(p), Some(t)) => format!("{:+.2}", p - t),
+        (Some(p), Some(t)) => format!("{:+.*}", dec, p - t),
         _ => "—".into(),
     };
 
@@ -901,10 +902,21 @@ fn bottom_right_rect(screen: Rect, w: u16, h: u16, margin: u16) -> Rect {
     Rect { x, y, width: w, height: h }
 }
 fn fmt_money(v: f64) -> String {
-    // e.g. 67_432.51
+    fmt_money_decimals(v, 2)
+}
+
+fn fmt_money_decimals(v: f64, decimal_places: u32) -> String {
+    // e.g. 67_432.51 or 2.3456 (decimal_places = 4)
     let whole = v as i64;
-    let frac  = ((v - whole as f64).abs() * 100.0).round() as u64;
-    let mut ws = whole.to_string().into_bytes();
+    let mult = 10_f64.powi(decimal_places as i32);
+    let max_frac = mult as u64;
+    let mut frac = ((v - whole as f64).abs() * mult).round() as u64;
+    let mut w = whole;
+    if frac >= max_frac {
+        w += if v >= 0.0 { 1 } else { -1 };
+        frac = 0;
+    }
+    let mut ws = w.to_string().into_bytes();
     let mut with_commas = Vec::with_capacity(ws.len() + ws.len() / 3);
     let skip_sign = if ws.first() == Some(&b'-') { with_commas.push(b'-'); 1 } else { 0 };
     let digits = &ws[skip_sign..];
@@ -913,7 +925,12 @@ fn fmt_money(v: f64) -> String {
         with_commas.push(c);
     }
     let _ = &mut ws;
-    format!("{}.{:02}", String::from_utf8_lossy(&with_commas), frac)
+    format!(
+        "{}.{:0width$}",
+        String::from_utf8_lossy(&with_commas),
+        frac,
+        width = decimal_places as usize
+    )
 }
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() }

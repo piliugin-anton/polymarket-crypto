@@ -312,6 +312,14 @@ impl AppState {
             .unwrap_or_else(|| "—/USD".to_string())
     }
 
+    /// Fraction digits for Chainlink spot / open / delta in the header (XRP needs finer quotes).
+    pub fn spot_usd_decimal_places(&self) -> usize {
+        match self.market_profile.as_ref().map(|p| p.asset.label) {
+            Some("XRP") => 4,
+            _ => 2,
+        }
+    }
+
     pub fn book_for(&self, outcome: Outcome) -> Option<&BookSnapshot> {
         match outcome { Outcome::Up => self.book_up.as_ref(), Outcome::Down => self.book_down.as_ref() }
     }
@@ -601,6 +609,8 @@ impl AppState {
                 // Clear the previous market’s UI until Gamma resolves the new profile’s window.
                 self.input_mode = InputMode::Normal;
                 self.order_error_toast = None;
+                self.spot_price = None;
+                self.spot_price_ts = None;
                 self.market = None;
                 self.book_up = None;
                 self.book_down = None;
