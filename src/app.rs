@@ -53,7 +53,7 @@ pub enum AppEvent {
     OpenOrdersLoaded { orders: Vec<OpenOrderRow> },
     /// USDC.e cash + claimable from on-chain reads (Multicall3); neg-risk redeemable sums still use Data API.
     BalancePanelLoaded { cash_usdc: f64, claimable_usdc: f64 },
-    /// `GET /holders` — sum of top holders' outcome amounts per side (fallback for header Sentiment when CLOB mids missing).
+    /// `GET /holders` — per-`proxyWallet` sums: if a wallet holds both outcomes, only the larger leg counts; then summed per side (Sentiment).
     TopHoldersSentiment { up_sum: f64, down_sum: f64 },
     Key(crossterm::event::KeyEvent),
     OrderAck { side: Side, outcome: Outcome, qty: f64, price: f64 },
@@ -201,7 +201,7 @@ pub struct AppState {
     /// `f` — Solana USDC deposit address + QR (Bridge API).
     pub deposit_modal: Option<DepositModalPhase>,
 
-    /// Top-holder amount sums from Data API `/holders` (header Sentiment fallback if book mids unavailable).
+    /// Net UP vs DOWN after per-wallet “max of UP/DOWN position” (see `fetch_top_holders_amount_sums`); header Sentiment.
     pub top_holders_up_sum:   Option<f64>,
     pub top_holders_down_sum: Option<f64>,
 }

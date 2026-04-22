@@ -7,6 +7,8 @@
 //! [`fetch_positions_for_market`] returns **total** outcome size (incl. shares escrowed for resting SELLs),
 //! useful when CLOB spendable balance + trade replay are both empty or inconsistent.
 
+use std::collections::{HashMap, HashSet};
+
 use alloy_primitives::Address;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -156,18 +158,23 @@ struct MetaHolder {
 
 #[derive(Debug, Clone, Deserialize)]
 struct HolderRow {
+    #[serde(default, rename = "proxyWallet")]
+    proxy_wallet: String,
     #[serde(default)]
-    amount: f64,
+    amount:         f64,
 }
 
-/// `GET /holders?market=<conditionId>&limit=[`HOLDERS_REQUEST_LIMIT`]` — sums [`HolderRow::amount`]
-/// per outcome token. Totals are **top-N holder** sums (not full open interest).
+/// `GET /holders?...&limit=[`HOLDERS_REQUEST_LIMIT`]` — sentiment sums with **per-wallet** netting:
+/// if a `proxyWallet` has both UP and DOWN positions, only the **larger** `amount` counts (toward that side).
+/// Rows with missing/empty `proxyWallet` are skipped.
 pub async fn fetch_top_holders_amount_sums(
     http: &reqwest::Client,
     market_condition_id: &str,
     up_token_id: &str,
     down_token_id: &str,
 ) -> Result<(f64, f64)> {
+    const WALLET_EPS: f64 = 1e-9;
+
     let url = format!(
         "{DATA_API_HOST}/holders?market={}&limit={}",
         market_condition_id,
@@ -181,20 +188,56 @@ pub async fn fetch_top_holders_amount_sums(
     }
     let meta: Vec<MetaHolder> =
         serde_json::from_str(&txt).with_context(|| format!("decode /holders: {}", txt.trim()))?;
+
+    let mut by_wallet_up: HashMap<String, f64> = HashMap::new();
+    let mut by_wallet_down: HashMap<String, f64> = HashMap::new();
+    for block in &meta {
+        let is_up = clob_asset_ids_match(&block.token, up_token_id);
+        let is_down = if is_up { false } else { clob_asset_ids_match(&block.token, down_token_id) };
+        if !is_up && !is_down {
+            continue;
+        }
+        let side = if is_up { &mut by_wallet_up } else { &mut by_wallet_down };
+        for h in &block.holders {
+            if !h.amount.is_finite() || h.amount < 0.0 {
+                continue;
+            }
+            let w = norm_proxy_wallet_id(&h.proxy_wallet);
+            if w.is_empty() {
+                continue;
+            }
+            *side.entry(w).or_insert(0.0) += h.amount;
+        }
+    }
+
+    let keys: HashSet<String> = by_wallet_up
+        .keys()
+        .chain(by_wallet_down.keys())
+        .cloned()
+        .collect();
     let mut up_sum = 0.0f64;
     let mut down_sum = 0.0f64;
-    for block in meta {
-        let chunk: f64 = block
-            .holders
-            .iter()
-            .map(|h| h.amount)
-            .filter(|a| a.is_finite())
-            .sum();
-        if clob_asset_ids_match(&block.token, up_token_id) {
-            up_sum += chunk;
-        } else if clob_asset_ids_match(&block.token, down_token_id) {
-            down_sum += chunk;
+    for w in keys {
+        let u = *by_wallet_up.get(&w).unwrap_or(&0.0);
+        let d = *by_wallet_down.get(&w).unwrap_or(&0.0);
+        if u < WALLET_EPS && d < WALLET_EPS {
+            continue;
+        }
+        if d < WALLET_EPS {
+            up_sum += u;
+        } else if u < WALLET_EPS {
+            down_sum += d;
+        } else if (u - d).abs() <= WALLET_EPS {
+            // Equal UP/DOWN: no unique "higher" leg — omit both from sentiment sums.
+        } else if u > d {
+            up_sum += u;
+        } else {
+            down_sum += d;
         }
     }
     Ok((up_sum, down_sum))
+}
+
+fn norm_proxy_wallet_id(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
 }
