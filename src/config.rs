@@ -12,6 +12,8 @@ pub const GAMMA_HOST: &str  = "https://gamma-api.polymarket.com";
 /// Official rolling-window crypto reference price (open / close) for 5m BTC markets.
 pub const POLYMARKET_CRYPTO_PRICE_URL: &str = "https://polymarket.com/api/crypto/crypto-price";
 pub const CLOB_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+/// Authenticated user stream (`trade` / `order`). See Polymarket user channel docs.
+pub const CLOB_WS_USER_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 pub const RTDS_WS_URL: &str = "wss://ws-live-data.polymarket.com";
 
 // ── Polygon ─────────────────────────────────────────────────────────

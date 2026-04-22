@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{oneshot, Mutex as AsyncMutex, RwLock};
 use tracing::debug;
 
 use crate::config::{
@@ -135,6 +136,10 @@ pub struct OrderArgs {
     /// EIP-712 / JSON `expiration`: UTC unix seconds. `0` for GTC / FOK / FAK. For GTD, must be
     /// non-zero (see Polymarket GTD +60s security offset in order docs).
     pub expiration_unix_secs: u64,
+    /// **Sell only:** skip the pre-POST settle sleep and balance read on the first attempt (same as
+    /// FAK sell). Set for take-profit GTD right after a BUY so `place_order` does not add ~450ms
+    /// before the first POST; balance/allowance errors still trigger the existing retry+clamp path.
+    pub sell_skip_pre_post_settle: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,8 +319,10 @@ struct FeeRateResponse {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ClobMakerOrder {
     #[serde(default, rename = "order_id", alias = "orderID", alias = "orderId")]
+    #[allow(dead_code)] // API payload; read in tests / future fill-by-order reconciliation
     pub order_id: String,
     #[serde(default, rename = "matched_amount", alias = "matchedAmount")]
+    #[allow(dead_code)]
     pub matched_amount: String,
 }
 
@@ -333,11 +340,14 @@ pub struct ClobTrade {
     pub match_time: String,
     /// When the authenticated user was **taker**, this matches `orderID` from `postOrder`.
     #[serde(default, rename = "taker_order_id", alias = "takerOrderId")]
+    #[allow(dead_code)]
     pub taker_order_id: Option<String>,
     #[serde(default, rename = "maker_orders", alias = "makerOrders")]
+    #[allow(dead_code)]
     pub maker_orders: Vec<ClobMakerOrder>,
     /// `"TAKER"` | `"MAKER"` — disambiguates which leg to use with `order_id`.
     #[serde(default, rename = "trader_side", alias = "traderSide")]
+    #[allow(dead_code)]
     pub trader_side: Option<String>,
 }
 
@@ -375,6 +385,7 @@ struct OrdersPage {
 const TRADES_INITIAL_CURSOR: &str = "MA==";
 const TRADES_END_CURSOR: &str = "LTE=";
 
+#[cfg(test)]
 fn parse_clob_side_str(s: &str) -> Option<Side> {
     match s.trim().to_ascii_uppercase().as_str() {
         "BUY" => Some(Side::Buy),
@@ -408,15 +419,138 @@ fn norm_order_id_fragment(s: &str) -> String {
 }
 
 /// Compare Polymarket order ids from `orderID` / `taker_order_id` / `maker_orders.order_id`.
+#[cfg(test)]
 fn order_ids_match(a: &str, b: &str) -> bool {
     let a = norm_order_id_fragment(a);
     let b = norm_order_id_fragment(b);
     !a.is_empty() && a == b
 }
 
+/// Fill size from a CLOB **user** WebSocket `trade` event (Polymarket user channel).
+#[derive(Debug, Clone)]
+pub struct UserTradeFill {
+    pub size_shares: f64,
+    pub status: String,
+    pub asset_id: String,
+}
+
+/// Lets tasks wait for a user-channel `trade` that references a given order id (taker or maker leg).
+pub struct FillWaitRegistry {
+    pending: AsyncMutex<HashMap<String, Vec<oneshot::Sender<UserTradeFill>>>>,
+}
+
+impl FillWaitRegistry {
+    pub fn new() -> Self {
+        Self {
+            pending: AsyncMutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn register_buy_fill_waiter(&self, order_id: &str) -> oneshot::Receiver<UserTradeFill> {
+        let (tx, rx) = oneshot::channel();
+        let key = norm_order_id_fragment(order_id);
+        if !key.is_empty() {
+            self.pending.lock().await.entry(key).or_default().push(tx);
+        }
+        rx
+    }
+
+    pub async fn dispatch_from_ws_text(&self, txt: &str) {
+        let values: Vec<serde_json::Value> =
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(txt) {
+                arr
+            } else if let Ok(one) = serde_json::from_str::<serde_json::Value>(txt) {
+                vec![one]
+            } else {
+                return;
+            };
+        for v in values {
+            if !Self::is_trade_event(&v) {
+                continue;
+            }
+            self.dispatch_trade_value(&v).await;
+        }
+    }
+
+    fn is_trade_event(v: &serde_json::Value) -> bool {
+        let t = v
+            .get("event_type")
+            .and_then(|x| x.as_str())
+            .or_else(|| v.get("type").and_then(|x| x.as_str()));
+        matches!(t, Some(s) if s.eq_ignore_ascii_case("trade"))
+    }
+
+    async fn dispatch_trade_value(&self, v: &serde_json::Value) {
+        let status = v
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        if status.eq_ignore_ascii_case("FAILED") {
+            return;
+        }
+
+        let asset_id = v
+            .get("asset_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let mut legs: Vec<(String, f64)> = Vec::new();
+
+        if let Some(tid) = v.get("taker_order_id").and_then(|x| x.as_str()) {
+            if let Some(s) = v.get("size").and_then(|x| x.as_str()) {
+                if let Ok(sz) = s.parse::<f64>() {
+                    if sz.is_finite() && sz > 0.0 {
+                        legs.push((norm_order_id_fragment(tid), sz));
+                    }
+                }
+            }
+        }
+
+        if let Some(arr) = v.get("maker_orders").and_then(|x| x.as_array()) {
+            for mo in arr {
+                let oid = mo
+                    .get("order_id")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| mo.get("orderId").and_then(|x| x.as_str()));
+                let amt = mo
+                    .get("matched_amount")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| mo.get("matchedAmount").and_then(|x| x.as_str()));
+                if let (Some(o), Some(a)) = (oid, amt) {
+                    if let Ok(sz) = a.parse::<f64>() {
+                        if sz.is_finite() && sz > 0.0 {
+                            legs.push((norm_order_id_fragment(o), sz));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut guard = self.pending.lock().await;
+        for (key, sz) in legs {
+            if key.is_empty() {
+                continue;
+            }
+            if let Some(waiters) = guard.remove(&key) {
+                let msg = UserTradeFill {
+                    size_shares: sz,
+                    status: status.clone(),
+                    asset_id: asset_id.clone(),
+                };
+                for w in waiters {
+                    let _ = w.send(msg.clone());
+                }
+            }
+        }
+    }
+}
+
 /// Sum **BUY** fill size for `token_id` across trades that reference `buy_order_id`
 /// ([Polymarket L2 `Trade`](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
 /// Returns `None` if no matching fill row exists yet.
+#[cfg(test)]
 fn buy_fill_shares_from_trades_for_order(
     trades: &[ClobTrade],
     buy_order_id: &str,
@@ -496,6 +630,7 @@ fn buy_fill_shares_from_trades_for_order(
 }
 
 /// Net outcome-token shares implied by `GET /data/trades` for this `asset_id` (buys − sells).
+#[cfg(test)]
 fn net_shares_on_token_from_trades(trades: &[ClobTrade], token_id: &str) -> f64 {
     let mut sh = 0.0_f64;
     for t in trades {
@@ -521,6 +656,7 @@ fn net_shares_on_token_from_trades(trades: &[ClobTrade], token_id: &str) -> f64 
 
 /// Reconcile desired take-profit size with **conditional** balance and trade replay (see Polymarket
 /// `GET /data/trades`). Avoids insisting on `takingAmount` when it rounds above wallet/trades.
+#[cfg(test)]
 fn take_profit_sell_cap(need: f64, bal: f64, replay: f64) -> f64 {
     const EPS: f64 = 1e-9;
     let bal = if bal.is_finite() { bal.max(0.0) } else { 0.0 };
@@ -597,6 +733,8 @@ pub struct TradingClient {
     state:  RwLock<TradingState>,
     /// Serializes the first L1→L2 credential derivation so concurrent callers don't race.
     creds_derive_lock: AsyncMutex<()>,
+    /// User-channel `trade` events (see `feeds::clob_user_ws`) wake these waiters by order id.
+    fill_waits: Arc<FillWaitRegistry>,
 }
 
 impl TradingClient {
@@ -613,7 +751,19 @@ impl TradingClient {
                 fee_rate_cache: HashMap::new(),
             }),
             creds_derive_lock: AsyncMutex::new(()),
+            fill_waits: Arc::new(FillWaitRegistry::new()),
         })
+    }
+
+    pub fn fill_wait_registry(&self) -> Arc<FillWaitRegistry> {
+        self.fill_waits.clone()
+    }
+
+    /// Await the first user-channel **`trade`** that references `order_id` (taker or maker leg).
+    pub async fn wait_user_channel_buy_fill(&self, order_id: &str) -> Result<UserTradeFill> {
+        let rx = self.fill_waits.register_buy_fill_waiter(order_id).await;
+        rx.await
+            .map_err(|_| anyhow!("user WS closed before a trade event for this order"))
     }
 
     async fn fetch_clob_order_version(&self) -> Result<u32> {
@@ -1063,147 +1213,6 @@ impl TradingClient {
         Ok(shares)
     }
 
-    /// After a market **BUY**, wait until we can size a take-profit **SELL** safely.
-    ///
-    /// Combines `GET /balance-allowance` (CONDITIONAL) with Polymarket `GET /data/trades` so we:
-    /// - do not block on `takingAmount` when it is slightly above wallet/trade replay, and
-    /// - can proceed when fills appear in trade history before the balance endpoint updates.
-    ///
-    /// When `buy_order_id` is set (`orderID` from the BUY response), we **require** a matching row
-    /// in `/data/trades` (`taker_order_id` / `maker_orders[].order_id`) before sizing, and cap
-    /// `want_shares` by that fill sum.
-    ///
-    /// Returns the **share count to pass into the GTD sell** (≤ `want_shares`).
-    pub async fn wait_for_take_profit_sell_shares(
-        &self,
-        condition_id: &str,
-        token_id: &str,
-        want_shares: f64,
-        min_executable: f64,
-        buy_order_id: Option<&str>,
-    ) -> Result<f64> {
-        /// Shorter interval than legacy 250ms: take-profit should post as soon as CLOB/balance agree.
-        const DELAY_MS: u64 = 100;
-        /// Worst-case wall time if every iteration sleeps once (~10s, same ballpark as 40×250ms).
-        const MAX_ATTEMPTS: u32 = 100;
-        if !want_shares.is_finite() || want_shares <= 0.0 {
-            return self.fetch_conditional_balance_shares_impl(token_id, true).await;
-        }
-        if !min_executable.is_finite() || min_executable <= 0.0 {
-            bail!("min_executable must be positive");
-        }
-        let need = want_shares;
-        let require_trade_for_order = buy_order_id.is_some_and(|s| !s.trim().is_empty());
-
-        for attempt in 0..MAX_ATTEMPTS {
-            // When we must see the BUY `orderID` in `/data/trades`, polling balance every tick only
-            // adds an extra RTT. Fetch trades first; once the fill row exists, read balance once.
-            // Otherwise: one round-trip via parallel balance + trades.
-            let (bal, trades, order_fill) = if require_trade_for_order {
-                let trades = self.fetch_trades_for_market(condition_id).await?;
-                let order_fill = match buy_order_id {
-                    Some(oid) if !oid.trim().is_empty() => {
-                        buy_fill_shares_from_trades_for_order(&trades, oid, token_id)
-                    }
-                    _ => None,
-                };
-                if order_fill.is_none() {
-                    tracing::debug!(
-                        attempt,
-                        buy_order_id = ?buy_order_id,
-                        "take-profit: waiting for BUY orderID to appear in /data/trades"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
-                    continue;
-                }
-                let bal = self.fetch_conditional_balance_shares_impl(token_id, true).await?;
-                (bal, trades, order_fill)
-            } else {
-                let (bal, trades) = tokio::try_join!(
-                    self.fetch_conditional_balance_shares_impl(token_id, true),
-                    self.fetch_trades_for_market(condition_id),
-                )?;
-                (bal, trades, None)
-            };
-
-            let need_for_cap = order_fill
-                .map(|f| want_shares.min(f))
-                .unwrap_or(want_shares);
-            let replay = net_shares_on_token_from_trades(&trades, token_id);
-            let sell_cap = take_profit_sell_cap(need_for_cap, bal, replay);
-
-            if sell_cap + 1e-6 >= min_executable {
-                if sell_cap + 1e-6 < need {
-                    tracing::info!(
-                        attempt,
-                        want = need,
-                        need_for_cap,
-                        order_fill,
-                        bal,
-                        replay,
-                        sell_cap,
-                        "take-profit: sell size reconciled (order fill + balance / trades replay)"
-                    );
-                } else if attempt > 0 {
-                    tracing::info!(
-                        attempt,
-                        bal,
-                        replay,
-                        sell_cap,
-                        order_fill,
-                        "take-profit: inventory ready for GTD sell (balance + trades)"
-                    );
-                }
-                return Ok(sell_cap);
-            }
-            tracing::debug!(
-                attempt,
-                bal,
-                replay,
-                need,
-                need_for_cap,
-                order_fill,
-                sell_cap,
-                min_executable,
-                "waiting for take-profit inventory (balance + /data/trades vs min size)"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
-        }
-
-        let trades = self.fetch_trades_for_market(condition_id).await?;
-        let order_fill = match buy_order_id {
-            Some(oid) if !oid.trim().is_empty() => {
-                buy_fill_shares_from_trades_for_order(&trades, oid, token_id)
-            }
-            _ => None,
-        };
-        if require_trade_for_order && order_fill.is_none() {
-            return Err(anyhow!(
-                "take-profit: BUY orderID {:?} not found in /data/trades after ~{}ms",
-                buy_order_id,
-                u64::from(MAX_ATTEMPTS) * DELAY_MS
-            ));
-        }
-        let bal = self.fetch_conditional_balance_shares(token_id).await?;
-        let need_for_cap = order_fill
-            .map(|f| want_shares.min(f))
-            .unwrap_or(want_shares);
-        let replay = net_shares_on_token_from_trades(&trades, token_id);
-        let sell_cap = take_profit_sell_cap(need_for_cap, bal, replay);
-        if sell_cap + 1e-6 >= min_executable {
-            return Ok(sell_cap);
-        }
-        Err(anyhow!(
-            "take-profit: only {:.6} sh sellable (want {:.6}, bal {:.6}, trades-replay {:.6}, min {:.1}) after ~{}ms",
-            sell_cap,
-            need,
-            bal,
-            replay,
-            min_executable,
-            u64::from(MAX_ATTEMPTS) * DELAY_MS
-        ))
-    }
-
     /// USDC **collateral** balance + spending allowance (`GET /balance-allowance`, `asset_type=COLLATERAL`).
     ///
     /// Raw amounts use **6 decimals** (same as conditional shares in this client). The allowance
@@ -1364,9 +1373,9 @@ impl TradingClient {
         }
 
         // SELL: `GET /balance-allowance` (no preceding `.../update` — see clob-client#128). Market
-        // **FAK** skips that read on the first attempt so POST starts immediately; size comes from
-        // app state, and retries + clamp recover stale CLOB cache / allowance errors. **GTD** sells
-        // keep read+clamp every attempt (min size + maker path).
+        // **FAK** and take-profit **GTD** (`OrderArgs::sell_skip_pre_post_settle`) skip settle sleep +
+        // balance read on the first attempt so POST starts immediately; retries + clamp recover
+        // stale CLOB cache / allowance errors. Other **GTD** sells keep read+clamp every attempt.
         let max_post_attempts: u32 = if matches!(args.side, Side::Sell) {
             SELL_ORDER_PREP_SETTLE_MS.len() as u32
         } else {
@@ -1375,9 +1384,9 @@ impl TradingClient {
 
         for post_attempt in 0..max_post_attempts {
             if matches!(args.side, Side::Sell) {
-                let fast_fak_sell =
-                    post_attempt == 0 && matches!(order_type, OrderType::Fak);
-                if !fast_fak_sell {
+                let fast_first_sell_post = post_attempt == 0
+                    && (matches!(order_type, OrderType::Fak) || args.sell_skip_pre_post_settle);
+                if !fast_first_sell_post {
                     let settle_idx = post_attempt as usize;
                     let settle_idx = settle_idx.min(SELL_ORDER_PREP_SETTLE_MS.len() - 1);
                     tokio::time::sleep(Duration::from_millis(SELL_ORDER_PREP_SETTLE_MS[settle_idx]))
@@ -2650,5 +2659,24 @@ mod fak_market_sell_amounts_tests {
         let (mk, tk) = amounts_for(Side::Sell, 0.04, 0.10, "0.01", None, OrderType::Fak);
         assert!(!mk.is_zero() && !tk.is_zero());
         assert_eq!(tk, U256::from(10_000u64));
+    }
+}
+
+#[cfg(test)]
+mod fill_wait_registry_tests {
+    use super::FillWaitRegistry;
+
+    #[tokio::test]
+    async fn dispatch_ws_trade_notifies_taker_order_waiter() {
+        let r = FillWaitRegistry::new();
+        let oid = "0x06bc63e346ed4ceddce9efd6b3af37c8f8f440c92fe7da6b2d0f9e4ccbc50c42";
+        let rx = r.register_buy_fill_waiter(oid).await;
+        let sample = format!(
+            r#"{{"event_type":"trade","taker_order_id":"{oid}","size":"10","status":"MATCHED","asset_id":"52114319501245915516"}}"#
+        );
+        r.dispatch_from_ws_text(&sample).await;
+        let fill = rx.await.expect("oneshot");
+        assert!((fill.size_shares - 10.0).abs() < 1e-9);
+        assert_eq!(fill.status, "MATCHED");
     }
 }

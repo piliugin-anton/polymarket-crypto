@@ -3,9 +3,7 @@
 //! We subscribe to the two token IDs (UP and DOWN) of the active market and
 //! consume book snapshots + price changes. The feed may send either tagged
 //! `event_type` messages, or a wrapped `{ "market", "price_changes": [...] }`
-//! batch with per-row `asset_id`. For user-specific fills we'd need
-//! the `user` channel with signed auth — left as a follow-up (see trading.rs
-//! for how we'd derive the L2 creds).
+//! batch with per-row `asset_id`. User fills / orders use [`super::clob_user_ws`].
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};

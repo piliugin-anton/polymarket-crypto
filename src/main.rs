@@ -72,6 +72,10 @@ fn keyboard_protocol_flags() -> KeyboardEnhancementFlags {
 /// Caps redraw rate from Chainlink + CLOB (~20 Hz) without delaying key handling.
 const FEED_REDRAW_MIN: Duration = Duration::from_millis(50);
 
+/// After a market BUY, wait briefly for a **`trade`** on the CLOB user WebSocket so take-profit
+/// size matches the pushed fill (often arrives before REST trade history).
+const USER_WS_TP_FILL_WAIT: Duration = Duration::from_millis(80);
+
 /// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
 fn apply_app_event(
     ev:     AppEvent,
@@ -262,10 +266,21 @@ async fn main() -> Result<()> {
         let mut book_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut orders_poll: Option<tokio::task::JoinHandle<()>> = None;
         let mut holders_poll: Option<tokio::task::JoinHandle<()>> = None;
+
+        // User WS: one long-lived connection; market switches via watch + dynamic subscribe
+        // (Polymarket WSS `operation`: subscribe / unsubscribe on `markets`).
+        let (user_market_tx, user_market_rx) = tokio::sync::watch::channel(String::new());
+        let _user_ws = feeds::clob_user_ws::spawn(
+            trading_for_positions.fill_wait_registry(),
+            trading_for_positions.clone(),
+            user_market_rx,
+        );
+
         while let Some(m) = market_rx.recv().await {
             if let Some(h) = book_handle.take() { h.abort(); }
             if let Some(h) = orders_poll.take() { h.abort(); }
             if let Some(h) = holders_poll.take() { h.abort(); }
+            let _ = user_market_tx.send(m.condition_id.clone());
             let token_ids = vec![m.up_token_id.clone(), m.down_token_id.clone()];
             book_handle = Some(feeds::clob_ws::spawn(token_ids, clob_forwarder(tx_for_books.clone())));
             let _ = tx_for_books.send(AppEvent::MarketRoll(m.clone())).await;
@@ -1024,6 +1039,7 @@ fn spawn_order(
             tick_size: market.tick_size.clone(),
             buy_notional_usdc,
             expiration_unix_secs,
+            sell_skip_pre_post_settle: is_take_profit_placement,
         };
         let cli = trading.clone();
         match cli.place_order(args, otype).await {
@@ -1225,55 +1241,65 @@ fn spawn_order(
                                     return;
                                 }
                             };
+                            let mut tp_sell_shares = sell_shares;
+                            if let Some(oid) = resp.order_id.as_deref() {
+                                match tokio::time::timeout(
+                                    USER_WS_TP_FILL_WAIT,
+                                    cli.wait_user_channel_buy_fill(oid),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(ws_fill)) => {
+                                        if ws_fill.size_shares.is_finite()
+                                            && ws_fill.size_shares > 1e-9
+                                        {
+                                            tp_sell_shares = ws_fill.size_shares;
+                                            debug!(
+                                                shares = ws_fill.size_shares,
+                                                status = %ws_fill.status,
+                                                asset_id = %ws_fill.asset_id,
+                                                order_id = %oid,
+                                                "take-profit: size from CLOB user WS trade"
+                                            );
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        debug!(
+                                            error = %e,
+                                            order_id = %oid,
+                                            "take-profit: user WS did not deliver fill (using REST estimate)"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        debug!(
+                                            order_id = %oid,
+                                            "take-profit: user WS fill wait timed out (using REST estimate)"
+                                        );
+                                    }
+                                }
+                            }
                             info!(
-                                sell_shares,
+                                tp_sell_shares,
                                 entry_px,
                                 tp_limit_px = tp_px,
                                 gtd_expiration_unix_secs = exp_secs,
                                 outcome = ?outcome,
-                                "take-profit: scheduling GTD limit SELL (spawn_order)",
+                                "take-profit: scheduling GTD limit SELL (POST /order; retries if balance lags)",
                             );
-                            let tp_token_id = match outcome {
-                                Outcome::Up => market_for_refresh.up_token_id.clone(),
-                                Outcome::Down => market_for_refresh.down_token_id.clone(),
-                            };
-                            match cli
-                                .wait_for_take_profit_sell_shares(
-                                    &market_for_refresh.condition_id,
-                                    &tp_token_id,
-                                    sell_shares,
-                                    MIN_LIMIT_ORDER_SHARES,
-                                    resp.order_id.as_deref(),
-                                )
-                                .await
-                            {
-                                Ok(tp_sell_shares) => {
-                                    spawn_order(
-                                        trading.clone(),
-                                        tx.clone(),
-                                        market_for_refresh,
-                                        outcome,
-                                        Side::Sell,
-                                        tp_sell_shares,
-                                        tp_px,
-                                        OrderType::Gtd,
-                                        None,
-                                        exp_secs,
-                                        0,
-                                        true,
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        error = %e,
-                                        outcome = ?outcome,
-                                        "take-profit: skipped — conditional balance not ready in time"
-                                    );
-                                    let _ = tx
-                                        .send(AppEvent::OrderErrModal(format!("take-profit: {e}")))
-                                        .await;
-                                }
-                            }
+                            spawn_order(
+                                trading.clone(),
+                                tx.clone(),
+                                market_for_refresh,
+                                outcome,
+                                Side::Sell,
+                                tp_sell_shares,
+                                tp_px,
+                                OrderType::Gtd,
+                                None,
+                                exp_secs,
+                                0,
+                                true,
+                            );
                         }
                     }
                 } else {
