@@ -4,9 +4,9 @@
 //! - [`TrailingStop`] is a pure in-memory state machine guarding one position.
 //!   No allocations on the hot path. No mutexes. Feed it prices, react to the
 //!   returned [`TickOutcome`].
-//! - All mutable state is held in `AtomicU64` with `f64` bit-casts and CAS
-//!   loops. Throughput on the hot path is limited by cache line contention,
-//!   not by a lock.
+//! - Peak and stop are held as **integer price ticks** (`0.01` per tick) in
+//!   `AtomicI64` with CAS loops. No `f64` in the hot ratchet. Throughput is
+//!   still limited by cache line contention, not a lock.
 //! - Venue-agnostic. Plug in Binance / Bybit / Drift / Aster / Jupiter / …
 //!   by providing a price feed and an order executor on top.
 //!
@@ -21,15 +21,32 @@
 //!   market order is a slippage blank check; an aggressive IOC (a few ticks
 //!   past the opposite top-of-book) gives you a bounded worst-case fill while
 //!   still clearing in volatile conditions.
-//! - **Prices are `f64`**. Fine for BTC/ETH/majors. If you're trading a
-//!   long-tail token quoted as `0.0000001234`, switch to fixed-point (`i64`
-//!   ticks with a per-market scalar) to avoid precision drift.
+//! - The public API still takes `f64` prices. Internally the contract assumes
+//!   a **0.01 quote tick** (same as many USDⓈ-quoted perps/spot). Stops and
+//!   best track are rounded to that grid; for sub-tick instruments, lower
+//!   `TICK` or a separate fixed-point type.
 //!
 //! The binary only uses a subset of this module (e.g. long, percent trail,
 //! `Immediate`); the rest is public for reuse — suppress `dead_code` for it.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+/// Quote tick in price units. One `i64` step is one `TICK` of price.
+pub const TICK: f64 = 0.01;
+
+/// Unarmed or unset: no best/stop tick stored yet.
+pub const UNSET: i64 = i64::MIN;
+
+#[inline]
+pub fn to_tick(p: f64) -> i64 {
+    (p / TICK).round() as i64
+}
+
+#[inline]
+pub const fn from_tick(t: i64) -> f64 {
+    t as f64 * TICK
+}
 
 /// Side of the underlying position the stop protects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,17 +100,12 @@ pub struct TrailingStop {
     entry_price: f64,
     activation: Activation,
 
-    /// Best favorable price since arming. `f64::NAN` sentinel = unarmed.
-    best_price_bits: AtomicU64,
-    /// Current stop price. `f64::NAN` sentinel = unarmed.
-    stop_price_bits: AtomicU64,
+    /// Best favorable **tick** since arming; [`UNSET`] if not set.
+    best_tick: AtomicI64,
+    /// Current stop **tick**; [`UNSET`] if not set.
+    stop_tick: AtomicI64,
     armed: AtomicBool,
     triggered: AtomicBool,
-}
-
-#[inline]
-fn load_f64(a: &AtomicU64) -> f64 {
-    f64::from_bits(a.load(Ordering::Acquire))
 }
 
 impl TrailingStop {
@@ -103,36 +115,37 @@ impl TrailingStop {
         spec: TrailSpec,
         activation: Activation,
     ) -> Self {
-        let nan = f64::NAN.to_bits();
-        let stop = Self {
+        let best = to_tick(entry_price);
+        let (initial_best, initial_stop) = if matches!(activation, Activation::Immediate) {
+            let s = Self::stop_tick_for_best(side, &spec, best);
+            (best, s)
+        } else {
+            (UNSET, UNSET)
+        };
+        Self {
             side,
             spec,
             entry_price,
             activation,
-            best_price_bits: AtomicU64::new(nan),
-            stop_price_bits: AtomicU64::new(nan),
+            best_tick: AtomicI64::new(initial_best),
+            stop_tick: AtomicI64::new(initial_stop),
             armed: AtomicBool::new(matches!(activation, Activation::Immediate)),
             triggered: AtomicBool::new(false),
-        };
-        if matches!(activation, Activation::Immediate) {
-            stop.best_price_bits
-                .store(entry_price.to_bits(), Ordering::Release);
-            stop.stop_price_bits
-                .store(stop.compute_stop(entry_price).to_bits(), Ordering::Release);
         }
-        stop
     }
 
+    /// Stop tick for a given best tick. Quantizes continuous trail math to the tick grid.
     #[inline]
-    fn compute_stop(&self, best: f64) -> f64 {
-        let dist = match self.spec {
-            TrailSpec::Percent(p) => best * p,
+    pub(crate) fn stop_tick_for_best(side: Side, spec: &TrailSpec, best: i64) -> i64 {
+        let b = from_tick(best);
+        let dist = match *spec {
+            TrailSpec::Percent(p) => b * p,
             TrailSpec::Absolute(d) => d,
         };
-        match self.side {
-            Side::Long => best - dist,
-            Side::Short => best + dist,
-        }
+        to_tick(match side {
+            Side::Long => b - dist,
+            Side::Short => b + dist,
+        })
     }
 
     #[inline]
@@ -151,21 +164,37 @@ impl TrailingStop {
     }
 
     #[inline]
-    fn is_breached(&self, price: f64, stop: f64) -> bool {
+    fn is_breached_tick(&self, price_tick: i64, stop_tick: i64) -> bool {
+        if stop_tick == UNSET {
+            return false;
+        }
         match self.side {
-            Side::Long => price <= stop,
-            Side::Short => price >= stop,
+            Side::Long => price_tick <= stop_tick,
+            Side::Short => price_tick >= stop_tick,
         }
     }
 
+    /// More favorable *underlying* print than the stored best.
     #[inline]
-    fn is_better(&self, new: f64, best: f64) -> bool {
-        if best.is_nan() {
+    fn is_better_tick(&self, new_tick: i64, best_tick: i64) -> bool {
+        if best_tick == UNSET {
             return true;
         }
         match self.side {
-            Side::Long => new > best,
-            Side::Short => new < best,
+            Side::Long => new_tick > best_tick,
+            Side::Short => new_tick < best_tick,
+        }
+    }
+
+    /// Favorable move for a *trailing* stop: higher is better (long) / lower (short).
+    #[inline]
+    fn is_favorable_stop_vs(&self, new_stop: i64, cur: i64) -> bool {
+        if cur == UNSET {
+            return true;
+        }
+        match self.side {
+            Side::Long => new_stop > cur,
+            Side::Short => new_stop < cur,
         }
     }
 
@@ -174,6 +203,8 @@ impl TrailingStop {
         if self.triggered.load(Ordering::Acquire) {
             return TickOutcome::AlreadyTriggered;
         }
+
+        let price_tick = to_tick(price);
 
         // 1. Activation gate.
         if !self.armed.load(Ordering::Acquire) {
@@ -186,46 +217,46 @@ impl TrailingStop {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                self.best_price_bits.store(price.to_bits(), Ordering::Release);
-                let stop = self.compute_stop(price);
-                self.stop_price_bits.store(stop.to_bits(), Ordering::Release);
-                return TickOutcome::Armed { stop_price: stop };
+                self.best_tick.store(price_tick, Ordering::Release);
+                let stop_t = Self::stop_tick_for_best(self.side, &self.spec, price_tick);
+                self.stop_tick.store(stop_t, Ordering::Release);
+                return TickOutcome::Armed {
+                    stop_price: from_tick(stop_t),
+                };
             }
             // Lost the race. Fall through — now armed by someone else.
         }
 
         // 2. Ratchet the peak via CAS. Monotonic in the favorable direction.
-        let mut new_stop: Option<f64> = None;
+        let mut new_stop: Option<i64> = None;
         loop {
-            let best_bits = self.best_price_bits.load(Ordering::Acquire);
-            let best = f64::from_bits(best_bits);
-            if !self.is_better(price, best) {
+            let best = self.best_tick.load(Ordering::Acquire);
+            if !self.is_better_tick(price_tick, best) {
                 break;
             }
             if self
-                .best_price_bits
+                .best_tick
                 .compare_exchange_weak(
-                    best_bits,
-                    price.to_bits(),
+                    best,
+                    price_tick,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
                 .is_ok()
             {
-                let candidate = self.compute_stop(price);
+                let candidate = Self::stop_tick_for_best(self.side, &self.spec, price_tick);
                 // Publish the new stop, but don't overwrite a concurrently-set
                 // better stop from a racing thread.
                 loop {
-                    let cur_bits = self.stop_price_bits.load(Ordering::Acquire);
-                    let cur = f64::from_bits(cur_bits);
-                    if !cur.is_nan() && !self.is_better(candidate, cur) {
+                    let cur = self.stop_tick.load(Ordering::Acquire);
+                    if cur != UNSET && !self.is_favorable_stop_vs(candidate, cur) {
                         break;
                     }
                     if self
-                        .stop_price_bits
+                        .stop_tick
                         .compare_exchange_weak(
-                            cur_bits,
-                            candidate.to_bits(),
+                            cur,
+                            candidate,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
@@ -240,8 +271,14 @@ impl TrailingStop {
         }
 
         // 3. Breach check against whatever stop is currently published.
-        let stop = load_f64(&self.stop_price_bits);
-        if !stop.is_nan() && self.is_breached(price, stop) {
+        let st = self.stop_tick.load(Ordering::Acquire);
+        // If we just ratcheted, the new stop may round to the *same* tick as the
+        // last print. That is not a “through the stop” breach; skip until the
+        // next tick, otherwise a favorable move can spuriously trigger.
+        if st != UNSET
+            && self.is_breached_tick(price_tick, st)
+            && !matches!(&new_stop, Some(n) if *n == st && *n == price_tick)
+        {
             if self
                 .triggered
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -249,14 +286,16 @@ impl TrailingStop {
             {
                 return TickOutcome::Triggered {
                     trigger_price: price,
-                    stop_price: stop,
+                    stop_price: from_tick(st),
                 };
             }
             return TickOutcome::AlreadyTriggered;
         }
 
         match new_stop {
-            Some(s) => TickOutcome::Trailed { new_stop: s },
+            Some(s) => TickOutcome::Trailed {
+                new_stop: from_tick(s),
+            },
             None => TickOutcome::NoOp,
         }
     }
@@ -265,12 +304,12 @@ impl TrailingStop {
     pub fn entry_price(&self) -> f64 { self.entry_price }
 
     pub fn stop_price(&self) -> Option<f64> {
-        let v = load_f64(&self.stop_price_bits);
-        if v.is_nan() { None } else { Some(v) }
+        let t = self.stop_tick.load(Ordering::Acquire);
+        if t == UNSET { None } else { Some(from_tick(t)) }
     }
     pub fn best_price(&self) -> Option<f64> {
-        let v = load_f64(&self.best_price_bits);
-        if v.is_nan() { None } else { Some(v) }
+        let t = self.best_tick.load(Ordering::Acquire);
+        if t == UNSET { None } else { Some(from_tick(t)) }
     }
     pub fn is_armed(&self) -> bool { self.armed.load(Ordering::Acquire) }
     pub fn is_triggered(&self) -> bool { self.triggered.load(Ordering::Acquire) }
@@ -279,6 +318,11 @@ impl TrailingStop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Expected `stop_price` when `best` prints at `at_price` (0.01 grid).
+    fn want_stop_at(side: Side, spec: TrailSpec, at_price: f64) -> f64 {
+        from_tick(TrailingStop::stop_tick_for_best(side, &spec, to_tick(at_price)))
+    }
 
     fn approx_eq(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
@@ -405,7 +449,7 @@ mod tests {
             Activation::Immediate,
         );
         assert!(ts.is_armed());
-        let initial_stop = entry * (1.0 - pct);
+        let initial_stop = want_stop_at(Side::Long, TrailSpec::Percent(pct), entry);
         assert!(
             approx_eq_frac(ts.stop_price().unwrap(), initial_stop),
             "stop={:?} want {}",
@@ -416,22 +460,27 @@ mod tests {
         let peak = 0.66;
         match ts.on_price(peak) {
             TickOutcome::Trailed { new_stop } => {
-                let want = peak * (1.0 - pct);
+                let want = want_stop_at(Side::Long, TrailSpec::Percent(pct), peak);
                 assert!(approx_eq_frac(new_stop, want), "got {} want {}", new_stop, want);
             }
             o => panic!("expected Trailed, got {:?}", o),
         }
 
         let new_stop = ts.stop_price().unwrap();
-        assert!(approx_eq_frac(new_stop, peak * (1.0 - pct)));
+        assert!(approx_eq_frac(
+            new_stop,
+            want_stop_at(Side::Long, TrailSpec::Percent(pct), peak)
+        ));
 
-        // Pullback above stop but below prior peak — no-op.
-        let mid = 0.65;
+        // Pullback above the quantized stop but still below the peak; on a 0.01 grid
+        // there is no print strictly between 0.65 and 0.66—use 0.656 (tick 66) which
+        // is not a new best vs 0.66 but above stop tick 0.65.
+        let mid = 0.656;
         assert!(mid > new_stop && mid < peak);
         assert_eq!(ts.on_price(mid), TickOutcome::NoOp);
 
-        let breach = new_stop - 0.005;
-        assert!(breach > 0.01);
+        let breach = 0.64;
+        assert!(breach < new_stop);
         match ts.on_price(breach) {
             TickOutcome::Triggered { trigger_price, stop_price } => {
                 assert!(approx_eq_frac(trigger_price, breach));
@@ -496,7 +545,7 @@ mod tests {
         let cross = 0.46;
         match ts.on_price(cross) {
             TickOutcome::Armed { stop_price } => {
-                let want = cross * (1.0 - pct);
+                let want = want_stop_at(Side::Long, TrailSpec::Percent(pct), cross);
                 assert!(approx_eq_frac(stop_price, want));
             }
             o => panic!("expected Armed, got {:?}", o),
@@ -518,7 +567,7 @@ mod tests {
         assert_eq!(ts.on_price(0.50), TickOutcome::NoOp);
         match ts.on_price(0.34) {
             TickOutcome::Armed { stop_price } => {
-                let want = 0.34 * (1.0 + pct);
+                let want = want_stop_at(Side::Short, TrailSpec::Percent(pct), 0.34);
                 assert!(approx_eq_frac(stop_price, want));
             }
             o => panic!("expected Armed, got {:?}", o),
@@ -541,7 +590,8 @@ mod tests {
         assert!(arm_price - entry > need - 1e-12);
         match ts.on_price(arm_price) {
             TickOutcome::Armed { stop_price } => {
-                assert!(approx_eq_frac(stop_price, arm_price * 0.98));
+                let want = want_stop_at(Side::Long, TrailSpec::Percent(0.02), arm_price);
+                assert!(approx_eq_frac(stop_price, want));
             }
             o => panic!("expected Armed, got {:?}", o),
         }
@@ -562,7 +612,12 @@ mod tests {
         assert!(entry - arm_price > need - 1e-12);
         match ts.on_price(arm_price) {
             TickOutcome::Armed { stop_price } => {
-                assert!(approx_eq_frac(stop_price, arm_price + 0.015));
+                let want = want_stop_at(
+                    Side::Short,
+                    TrailSpec::Absolute(0.015),
+                    arm_price,
+                );
+                assert!(approx_eq_frac(stop_price, want));
             }
             o => panic!("expected Armed, got {:?}", o),
         }
@@ -648,12 +703,13 @@ mod tests {
             TrailSpec::Percent(pct),
             Activation::Immediate,
         );
-        let stop0 = entry * (1.0 - pct);
+        let stop0 = want_stop_at(Side::Long, TrailSpec::Percent(pct), entry);
         assert!(approx_eq_frac(ts.stop_price().unwrap(), stop0));
 
         match ts.on_price(0.99) {
             TickOutcome::Trailed { new_stop } => {
-                assert!(approx_eq_frac(new_stop, 0.99 * (1.0 - pct)));
+                let want = want_stop_at(Side::Long, TrailSpec::Percent(pct), 0.99);
+                assert!(approx_eq_frac(new_stop, want));
             }
             o => panic!("expected Trailed, got {:?}", o),
         }
@@ -669,11 +725,13 @@ mod tests {
             Activation::Immediate,
         );
         let mut last_stop = ts.stop_price().unwrap();
+        let spec = TrailSpec::Percent(0.01);
         for p in [0.26, 0.27, 0.28, 0.29, 0.30, 0.31] {
             match ts.on_price(p) {
                 TickOutcome::Trailed { new_stop } => {
                     assert!(new_stop > last_stop, "stop should ratchet up");
-                    assert!(approx_eq_frac(new_stop, p * 0.99));
+                    let want = want_stop_at(Side::Long, spec, p);
+                    assert!(approx_eq_frac(new_stop, want));
                     last_stop = new_stop;
                 }
                 TickOutcome::NoOp => panic!("expected Trailed at {}", p),
@@ -691,11 +749,13 @@ mod tests {
             Activation::Immediate,
         );
         let mut last_stop = ts.stop_price().unwrap();
+        let spec = TrailSpec::Percent(0.01);
         for p in [0.74, 0.73, 0.72, 0.71, 0.70] {
             match ts.on_price(p) {
                 TickOutcome::Trailed { new_stop } => {
                     assert!(new_stop < last_stop, "short stop should ratchet down");
-                    assert!(approx_eq_frac(new_stop, p * 1.01));
+                    let want = want_stop_at(Side::Short, spec, p);
+                    assert!(approx_eq_frac(new_stop, want));
                     last_stop = new_stop;
                 }
                 TickOutcome::NoOp => panic!("expected Trailed at {}", p),
