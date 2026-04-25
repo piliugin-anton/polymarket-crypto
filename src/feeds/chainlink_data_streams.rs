@@ -13,6 +13,7 @@ use num_bigint::BigInt;
 use num_traits::Signed;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use super::chainlink::PriceTick;
 
@@ -45,15 +46,36 @@ fn resolve_feed_id(rtds_symbol: &str) -> Result<ID> {
     ID::from_hex_str(hex.trim()).with_context(|| format!("invalid feed id hex: {}", snip(&hex, 20)))
 }
 
+/// Data Engine expects `Authorization` = client UUID and HMAC `user_secret` = longer secret.
+/// Env files often swap the two; that produces HTTP 400 on the WS handshake (runtime evidence).
+fn normalize_chainlink_credentials(raw_key: &str, raw_secret: &str) -> (String, String, bool) {
+    let k = raw_key.trim();
+    let s = raw_secret.trim();
+    let key_is_uuid = Uuid::parse_str(k).is_ok();
+    let secret_is_uuid = Uuid::parse_str(s).is_ok();
+    if !key_is_uuid && secret_is_uuid {
+        (s.to_string(), k.to_string(), true)
+    } else {
+        (k.to_string(), s.to_string(), false)
+    }
+}
+
 fn build_sdk_config() -> Result<Config> {
-    let api_key = std::env::var("CHAINLINK_API_KEY")
+    let api_key_raw = std::env::var("CHAINLINK_API_KEY")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .context("CHAINLINK_API_KEY missing")?;
-    let user_secret = std::env::var("CHAINLINK_USER_SECRET")
+    let user_secret_raw = std::env::var("CHAINLINK_USER_SECRET")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .context("CHAINLINK_USER_SECRET missing")?;
+    let (api_key, user_secret, swapped) =
+        normalize_chainlink_credentials(&api_key_raw, &user_secret_raw);
+    if swapped {
+        warn!(
+            "CHAINLINK_API_KEY did not parse as UUID but CHAINLINK_USER_SECRET did — using swapped order (API key must be the Data Engine client UUID)"
+        );
+    }
     let rest = std::env::var("CHAINLINK_DATA_ENGINE_REST_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -105,7 +127,9 @@ async fn run_once(
         "Chainlink Data Streams connecting"
     );
 
-    let mut stream = Stream::new(&cfg, vec![feed_id]).await.context("Data Streams Stream::new")?;
+    let mut stream = Stream::new(&cfg, vec![feed_id])
+        .await
+        .context("Data Streams Stream::new")?;
     stream.listen().await.context("Data Streams listen (WS handshake)")?;
 
     loop {
