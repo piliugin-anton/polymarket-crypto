@@ -362,8 +362,9 @@ pub struct AppState {
     pub market_profile: Option<Arc<MarketProfile>>,
 
     // One book per outcome token
-    pub book_up:        Option<BookSnapshot>,
-    pub book_down:      Option<BookSnapshot>,
+    /// Shared with [`Self::watched_books`] when the same token is both on-screen and trail-watched.
+    pub book_up:        Option<Arc<BookSnapshot>>,
+    pub book_down:      Option<Arc<BookSnapshot>>,
 
     pub position_up:    Position,
     pub position_down:  Position,
@@ -415,7 +416,7 @@ pub struct AppState {
     /// Buy registered; waiting for **mid** to reach entry × (1 + TP bps) before arming the trail.
     pub pending_trail_arms: HashMap<String, PendingTrailArm>,
     /// Books for tokens that are not the active UI pair but still have trailing / pending arms.
-    pub watched_books: HashMap<String, BookSnapshot>,
+    pub watched_books: HashMap<String, Arc<BookSnapshot>>,
     /// FAK SELLs queued: priced on dispatch (empty book → stays queued until a later book tick).
     /// FIFO per enqueue; the same `token_id` is not enqueued while already queued or in-flight.
     pub pending_trailing_sells: VecDeque<TrailingExit>,
@@ -509,7 +510,10 @@ impl AppState {
     }
 
     pub fn book_for(&self, outcome: Outcome) -> Option<&BookSnapshot> {
-        match outcome { Outcome::Up => self.book_up.as_ref(), Outcome::Down => self.book_down.as_ref() }
+        match outcome {
+            Outcome::Up => self.book_up.as_deref(),
+            Outcome::Down => self.book_down.as_deref(),
+        }
     }
 
     /// Best ask on the outcome side we'd hit when buying YES(outcome).
@@ -531,10 +535,10 @@ impl AppState {
     pub fn mid_for_token(&self, token_id: &str) -> Option<f64> {
         if let Some(m) = &self.market {
             if token_id == m.up_token_id.as_str() {
-                return self.book_up.as_ref().and_then(book_mid);
+                return self.book_up.as_deref().and_then(book_mid);
             }
             if token_id == m.down_token_id.as_str() {
-                return self.book_down.as_ref().and_then(book_mid);
+                return self.book_down.as_deref().and_then(book_mid);
             }
         }
         self.watched_books
@@ -547,6 +551,7 @@ impl AppState {
                     None
                 }
             })
+            .map(|b| b.as_ref())
             .and_then(book_mid)
     }
 
@@ -559,10 +564,10 @@ impl AppState {
     fn book_snapshot_for_token(&self, token_id: &str) -> Option<&BookSnapshot> {
         if let Some(m) = &self.market {
             if token_id == m.up_token_id.as_str() {
-                return self.book_up.as_ref();
+                return self.book_up.as_deref();
             }
             if token_id == m.down_token_id.as_str() {
-                return self.book_down.as_ref();
+                return self.book_down.as_deref();
             }
         }
         self.watched_books
@@ -575,6 +580,7 @@ impl AppState {
                     None
                 }
             })
+            .map(|b| b.as_ref())
     }
 
     /// If `token_id` belongs to the active UI market, return its UP/DOWN side.
@@ -879,19 +885,17 @@ impl AppState {
             AppEvent::Book(mut b) => {
                 b.asset_id = canonical_clob_token_id(&b.asset_id);
                 let id_for_trail = b.asset_id.clone();
+                let snap = Arc::new(b);
                 if let Some(m) = &self.market {
-                    if b.asset_id == m.up_token_id {
-                        self.book_up = Some(b.clone());
-                    } else if b.asset_id == m.down_token_id {
-                        self.book_down = Some(b.clone());
+                    if snap.asset_id == m.up_token_id {
+                        self.book_up = Some(Arc::clone(&snap));
+                    } else if snap.asset_id == m.down_token_id {
+                        self.book_down = Some(Arc::clone(&snap));
                     }
                 }
                 let watch = collect_book_watch_token_ids(self);
                 if watch.contains(&id_for_trail) {
-                    self.watched_books
-                        .insert(b.asset_id.clone(), b);
-                } else {
-                    drop(b);
+                    self.watched_books.insert(id_for_trail.clone(), snap);
                 }
                 let keep: HashSet<String> = watch.into_iter().collect();
                 self.watched_books.retain(|k, _| keep.contains(k));
@@ -1650,7 +1654,6 @@ pub fn resolve_trailing_sell(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     use chrono::Utc;
     use crate::feeds::clob_ws::{BookLevel, BookSnapshot};
@@ -1753,11 +1756,11 @@ mod tests {
     #[test]
     fn market_sell_sells_full_tracked_position_ignores_small_usdc_ticket() {
         let mut state = test_state();
-        state.book_up = Some(BookSnapshot {
+        state.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "1".into(),
             bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
             asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
-        });
+        }));
         state.position_up.shares = 7.25;
         // $1 ticket → would be 2 shares via USDC/bid; we still exit the full 7.25 sh.
         let (shares, price, _) =
@@ -1769,11 +1772,11 @@ mod tests {
     #[test]
     fn market_sell_without_position_uses_usdc_over_bid() {
         let mut state = test_state();
-        state.book_up = Some(BookSnapshot {
+        state.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "1".into(),
             bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
             asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
-        });
+        }));
         state.position_up = Position::default();
         let (shares, _, _) =
             resolve_market_order(&state, Outcome::Up, Side::Sell, 10.0, 0, 0).unwrap();
@@ -1783,11 +1786,11 @@ mod tests {
     #[test]
     fn market_sell_uses_fill_net_when_larger_than_position() {
         let mut state = test_state();
-        state.book_up = Some(BookSnapshot {
+        state.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "1".into(),
             bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
             asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
-        });
+        }));
         state.position_up.shares = 10.0;
         state.fills.push_back(Fill {
             ts: Utc::now(),
@@ -1806,11 +1809,11 @@ mod tests {
     #[test]
     fn market_sell_uses_fak_net_when_larger_than_position_and_fills() {
         let mut state = test_state();
-        state.book_up = Some(BookSnapshot {
+        state.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "1".into(),
             bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
             asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
-        });
+        }));
         state.position_up.shares = 10.0;
         state.fak_net_up = 10.11;
         let (shares, _, _) =
@@ -2013,11 +2016,11 @@ mod tests {
         let mut s = test_state();
         let m = test_market("U_MER", "D_MER", "0xmerge2");
         s.market = Some(m.clone());
-        s.book_up = Some(BookSnapshot {
+        s.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "U_MER".into(),
             bids:     vec![BookLevel { price: 0.52, size: 100.0 }],
             asks:     vec![BookLevel { price: 0.54, size: 100.0 }],
-        });
+        }));
         s.apply(AppEvent::RequestTrailingArm {
             outcome:          Outcome::Up,
             entry_price:      0.50,
@@ -2063,11 +2066,11 @@ mod tests {
         let tid_hex = "0x0a";
         let m = test_market(tid_decimal, "222", "0xcondhex");
         s.market = Some(m.clone());
-        s.book_up = Some(BookSnapshot {
+        s.book_up = Some(Arc::new(BookSnapshot {
             asset_id: tid_hex.into(),
             bids:     vec![BookLevel { price: 0.52, size: 100.0 }],
             asks:     vec![BookLevel { price: 0.54, size: 100.0 }],
-        });
+        }));
         s.apply(AppEvent::RequestTrailingArm {
             outcome:          Outcome::Up,
             entry_price:      0.50,
