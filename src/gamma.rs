@@ -492,8 +492,8 @@ fn active_market_from_raw_market(m: &RawMarket, event: Option<&RawEvent>) -> Res
     } else {
         (token_ids[1].as_str(), token_ids[0].as_str())
     };
-    let up_token_id = canonical_clob_token_id(u0);
-    let down_token_id = canonical_clob_token_id(d0);
+    let up_token_id = canonical_clob_token_id(u0).into_owned();
+    let down_token_id = canonical_clob_token_id(d0).into_owned();
 
     let price_to_beat = extract_price_to_beat(&m.description); // overridden in find_current_btc_5m when API returns openPrice
     // Canonical tick strings for `ROUNDING_CONFIG` parity (avoid `0.001 → "0.00"` with `:.2`).

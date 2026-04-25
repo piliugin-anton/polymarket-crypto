@@ -327,7 +327,7 @@ fn desired_condition_ids(b: &UserWsBundle) -> HashSet<String> {
 
 fn resolve_trade_outcome(bundle: &UserWsBundle, asset_id: &str) -> Option<Outcome> {
     let token = canonical_clob_token_id(asset_id);
-    let token_s = token.as_str();
+    let token_s = token.as_ref();
     let markets = std::iter::once(&bundle.active).chain(bundle.extras.iter());
     for m in markets {
         if m.condition_id.is_empty() {

@@ -42,8 +42,8 @@ fn trailing_map_key_for_asset(
         return Some(asset_id.to_string());
     }
     let c = canonical_clob_token_id(asset_id);
-    if c != asset_id && trailing.contains_key(&c) {
-        return Some(c);
+    if c.as_ref() != asset_id && trailing.contains_key(c.as_ref()) {
+        return Some(c.into_owned());
     }
     trailing
         .keys()
@@ -60,8 +60,8 @@ fn pending_trail_map_key_for_asset(
         return Some(asset_id.to_string());
     }
     let c = canonical_clob_token_id(asset_id);
-    if c != asset_id && pending.contains_key(&c) {
-        return Some(c);
+    if c.as_ref() != asset_id && pending.contains_key(c.as_ref()) {
+        return Some(c.into_owned());
     }
     pending
         .keys()
@@ -468,13 +468,15 @@ impl AppState {
 
     /// True if `token_id` already has a queued trailing exit or an in-flight FAK SELL.
     fn trailing_sell_queued_or_in_flight(&self, token_id: &str) -> bool {
+        debug_assert_eq!(
+            token_id,
+            canonical_clob_token_id(token_id).as_ref(),
+            "token_id must be canonical before calling this"
+        );
         self.pending_trailing_sells
             .iter()
-            .any(|e| e.token_id == token_id || clob_asset_ids_match(&e.token_id, token_id))
-            || self
-                .trailing_sell_in_flight
-                .iter()
-                .any(|k| *k == token_id || clob_asset_ids_match(k, token_id))
+            .any(|e| e.token_id == token_id)
+            || self.trailing_sell_in_flight.contains(token_id)
     }
 
     // ── Queries ─────────────────────────────────────────────────────
@@ -545,8 +547,8 @@ impl AppState {
             .get(token_id)
             .or_else(|| {
                 let c = canonical_clob_token_id(token_id);
-                if c != token_id {
-                    self.watched_books.get(c.as_str())
+                if c.as_ref() != token_id {
+                    self.watched_books.get(c.as_ref())
                 } else {
                     None
                 }
@@ -574,8 +576,8 @@ impl AppState {
             .get(token_id)
             .or_else(|| {
                 let c = canonical_clob_token_id(token_id);
-                if c != token_id {
-                    self.watched_books.get(c.as_str())
+                if c.as_ref() != token_id {
+                    self.watched_books.get(c.as_ref())
                 } else {
                     None
                 }
@@ -675,7 +677,7 @@ impl AppState {
         trail_bps:       u32,
         tracked_shares:  f64,
     ) {
-        let token_id = canonical_clob_token_id(&token_id);
+        let token_id = canonical_clob_token_id(&token_id).into_owned();
         if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
             return;
         }
@@ -883,7 +885,7 @@ impl AppState {
                 }
             }
             AppEvent::Book(mut b) => {
-                b.asset_id = canonical_clob_token_id(&b.asset_id);
+                b.asset_id = canonical_clob_token_id(&b.asset_id).into_owned();
                 let id_for_trail = b.asset_id.clone();
                 let snap = Arc::new(b);
                 if let Some(m) = &self.market {
@@ -995,7 +997,7 @@ impl AppState {
                 price,
                 ts,
             } => {
-                let token_id = canonical_clob_token_id(&token_id);
+                let token_id = canonical_clob_token_id(&token_id).into_owned();
                 if let Some(ui_oc) = self.outcome_for_active_token(&token_id) {
                     let realized = self.position_mut(ui_oc).apply_fill(side, qty, price);
                     self.realized_pnl += realized;
@@ -1049,7 +1051,7 @@ impl AppState {
                 clob_order_id,
                 token_id,
             } => {
-                let token_id = canonical_clob_token_id(&token_id);
+                let token_id = canonical_clob_token_id(&token_id).into_owned();
                 let mut do_pnl = true;
                 if let Some(ref oid) = clob_order_id {
                     if !self.user_trade_sync.before_order_ack_apply(oid, qty, price).await {
@@ -1105,7 +1107,7 @@ impl AppState {
                 activation_bps,
                 market,
             } => {
-                let token_id = canonical_clob_token_id(&token_id);
+                let token_id = canonical_clob_token_id(&token_id).into_owned();
                 if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
                     // Misconfiguration — main should not send; ignore.
                 } else {
@@ -1231,7 +1233,7 @@ impl AppState {
                 success,
                 error,
             } => {
-                let token_id = canonical_clob_token_id(&token_id);
+                let token_id = canonical_clob_token_id(&token_id).into_owned();
                 self.trailing_sell_in_flight
                     .retain(|k| *k != token_id && !clob_asset_ids_match(k, &token_id));
                 self.pending_trailing_sells
