@@ -149,6 +149,16 @@ fn send_book_watch_if_changed(state: &AppState, book_token_tx: &watch::Sender<Ve
     let _ = book_token_tx.send(state.cached_book_watch_tokens.clone());
 }
 
+/// Only sends when the bundle has changed — avoids waking the user-WS supervisor
+/// on every price tick and book snapshot (which cannot change market/trailing IDs).
+fn send_user_bundle_if_changed(state: &AppState, tx: &watch::Sender<UserWsBundle>) {
+    let next = build_user_ws_bundle(state);
+    if *tx.borrow() == next {
+        return;
+    }
+    let _ = tx.send(next);
+}
+
 /// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
 async fn apply_app_event(
     ev:     AppEvent,
@@ -181,6 +191,10 @@ async fn apply_app_event(
             dispatch_action(action, state, trading, tx, cfg, user_open_ledger);
             false
         }
+        AppEvent::Tick => {
+            state.apply(AppEvent::Tick).await;
+            false
+        }
         e => {
             if let AppEvent::StartTrading(p) = &e {
                 let _ = rtds_sym_tx.send(p.asset.rtds_symbol.to_string());
@@ -206,7 +220,7 @@ async fn apply_app_event(
                 user_open_ledger,
                 cfg,
             );
-            let _ = user_bundle_tx.send(build_user_ws_bundle(state));
+            send_user_bundle_if_changed(state, user_bundle_tx);
             send_book_watch_if_changed(state, book_token_tx);
             false
         }
@@ -561,17 +575,17 @@ async fn main() -> Result<()> {
         };
         if let Some(rpc_http) = rpc_http {
             tokio::spawn(async move {
+                let data_http = match net::reqwest_client() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        debug!(error = %e, "reqwest client for Data API (balance index) — balance disabled");
+                        return;
+                    }
+                };
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
                 interval.tick().await;
                 loop {
                     interval.tick().await;
-                    let data_http = match net::reqwest_client() {
-                        Ok(h) => h,
-                        Err(e) => {
-                            debug!(error = %e, "reqwest client for Data API (balance index)");
-                            continue;
-                        }
-                    };
                     match crate::balances::fetch_balance_panel_usdc(
                         &data_http,
                         &rpc_http,
