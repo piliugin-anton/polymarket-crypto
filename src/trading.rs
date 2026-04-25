@@ -411,11 +411,16 @@ pub fn parse_clob_token_id(s: &str) -> Option<U256> {
 /// **Decimal** string unique per token. Use for map keys and `==` on hot paths after normalizing
 /// at boundaries; [`clob_asset_ids_match`] on every compare is much slower.
 #[inline]
-pub fn canonical_clob_token_id(s: &str) -> String {
+pub fn canonical_clob_token_id(s: &str) -> std::borrow::Cow<'_, str> {
     if let Some(u) = parse_clob_token_id(s) {
-        u.to_string()
+        std::borrow::Cow::Owned(u.to_string())
     } else {
-        s.trim().to_string()
+        let trimmed = s.trim();
+        if trimmed.len() == s.len() {
+            std::borrow::Cow::Borrowed(s)
+        } else {
+            std::borrow::Cow::Owned(trimmed.to_string())
+        }
     }
 }
 

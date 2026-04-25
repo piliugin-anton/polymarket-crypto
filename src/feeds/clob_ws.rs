@@ -214,7 +214,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                 if t.contains("price_changes") && t.trim_start().starts_with('{') {
                     if let Ok(msg) = serde_json::from_str::<MarketPriceChangesMsg>(t) {
                         for ch in &msg.price_changes {
-                            let aid = canonical_clob_token_id(&ch.asset_id);
+                            let aid = canonical_clob_token_id(&ch.asset_id).into_owned();
                             let entry = books.entry(aid.clone()).or_default();
                             let (Ok(p), Ok(s)) = (ch.price.parse::<f64>(), ch.size.parse::<f64>()) else { continue };
                             let key = price_to_key(p);
@@ -255,7 +255,7 @@ async fn apply_raw_event(
 ) {
     match ev {
         RawEvent::Book { asset_id, bids, asks } => {
-            let asset_id = canonical_clob_token_id(&asset_id);
+            let asset_id = canonical_clob_token_id(&asset_id).into_owned();
             let entry = books.entry(asset_id.clone()).or_default();
             entry.0.clear();
             entry.1.clear();
@@ -279,7 +279,7 @@ async fn apply_raw_event(
             .await;
         }
         RawEvent::PriceChange { asset_id, changes } => {
-            let asset_id = canonical_clob_token_id(&asset_id);
+            let asset_id = canonical_clob_token_id(&asset_id).into_owned();
             let entry = books.entry(asset_id.clone()).or_default();
             for c in &changes {
                 let (Ok(p), Ok(s)) = (c.price.parse::<f64>(), c.size.parse::<f64>()) else { continue };
