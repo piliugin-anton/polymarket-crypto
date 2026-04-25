@@ -32,6 +32,28 @@ pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
 /// `main.rs`).
 pub const TRAILING_SELL_MAX_PARALLEL: usize = 8;
 
+/// Map key in [`AppState::trailing`] for this CLOB asset (decimal vs `0x` hex must match).
+fn trailing_map_key_for_asset(
+    trailing: &HashMap<String, TrailingSession>,
+    asset_id: &str,
+) -> Option<String> {
+    trailing
+        .keys()
+        .find(|k| clob_asset_ids_match(k, asset_id))
+        .cloned()
+}
+
+/// Map key in [`AppState::pending_trail_arms`] for this CLOB asset.
+fn pending_trail_map_key_for_asset(
+    pending: &HashMap<String, PendingTrailArm>,
+    asset_id: &str,
+) -> Option<String> {
+    pending
+        .keys()
+        .find(|k| clob_asset_ids_match(k, asset_id))
+        .cloned()
+}
+
 /// How long an [`AppState::order_error_toast`] stays visible.
 pub const ORDER_ERROR_TOAST_TTL: Duration = Duration::from_secs(10);
 
@@ -595,9 +617,15 @@ impl AppState {
 
     /// Drop a trailing plan when the user (or the exchange) reduces position via a SELL fill.
     fn clear_trailing_on_sell_token(&mut self, token_id: &str) {
-        self.trailing.remove(token_id);
-        self.pending_trail_arms.remove(token_id);
-        self.watched_books.remove(token_id);
+        self
+            .trailing
+            .retain(|k, _| !clob_asset_ids_match(k, token_id));
+        self
+            .pending_trail_arms
+            .retain(|k, _| !clob_asset_ids_match(k, token_id));
+        self
+            .watched_books
+            .retain(|k, _| !clob_asset_ids_match(k, token_id));
         self.pending_trailing_sells
             .retain(|e| !clob_asset_ids_match(&e.token_id, token_id));
         self.trailing_sell_in_flight.retain(|k| !clob_asset_ids_match(k, token_id));
@@ -618,14 +646,16 @@ impl AppState {
         }
         // Second (or later) market buy on the same `token_id` promotes or installs again; merge
         // with the existing session so `plan_sell_shares` caps the combined trailed inventory.
-        let tid_merge = token_id.clone();
-        let (plan_sell_shares, tracked_shares) = match self.trailing.remove(&tid_merge) {
-            Some(prev) => (
-                plan_sell_shares + prev.plan_sell_shares,
-                tracked_shares.max(prev.tracked_shares),
-            ),
-            None => (plan_sell_shares, tracked_shares),
-        };
+        let (plan_sell_shares, tracked_shares) =
+            match trailing_map_key_for_asset(&self.trailing, token_id.as_str())
+                .and_then(|k| self.trailing.remove(&k))
+            {
+                Some(prev) => (
+                    plan_sell_shares + prev.plan_sell_shares,
+                    tracked_shares.max(prev.tracked_shares),
+                ),
+                None => (plan_sell_shares, tracked_shares),
+            };
         let p = (trail_bps as f64 / 10_000.0).max(1e-12);
         let stop = TrailingStop::new(
             TrailSide::Long,
@@ -656,7 +686,11 @@ impl AppState {
     /// [`Self::trailing`]. Entry for the threshold is live `avg_entry` when the outcome has
     /// shares on the **active** UI market for that token, else the pending REST/fill `entry_price`.
     fn try_promote_pending_trail_token(&mut self, token_id: &str) {
-        let p0 = match self.pending_trail_arms.get(token_id) {
+        let map_key = match pending_trail_map_key_for_asset(&self.pending_trail_arms, token_id) {
+            Some(k) => k,
+            None => return,
+        };
+        let p0 = match self.pending_trail_arms.get(&map_key) {
             Some(n) => n.clone(),
             None => return,
         };
@@ -681,7 +715,7 @@ impl AppState {
         if mid + 1e-12 < min_mid {
             return;
         }
-        self.pending_trail_arms.remove(token_id);
+        self.pending_trail_arms.remove(&map_key);
         let tracked = p0.plan_sell_shares;
         self.install_trailing_session(
             p0.market,
@@ -703,8 +737,12 @@ impl AppState {
     }
 
     fn apply_trailing_book_tick(&mut self, asset_id: &str, mid: f64) {
+        let map_key = match trailing_map_key_for_asset(&self.trailing, asset_id) {
+            Some(k) => k,
+            None => return,
+        };
         let tick = {
-            let Some(sess) = self.trailing.get(asset_id) else {
+            let Some(sess) = self.trailing.get(&map_key) else {
                 return;
             };
             if !clob_asset_ids_match(asset_id, &sess.token_id) {
@@ -716,8 +754,8 @@ impl AppState {
             return;
         };
         let (token_id, market, outcome, plan, tracked, entry_px) = {
-            let sess = self.trailing.get(asset_id).expect("trailing session");
-            let entry_px = if let Some(oc) = self.outcome_for_active_token(asset_id) {
+            let sess = self.trailing.get(&map_key).expect("trailing session");
+            let entry_px = if let Some(oc) = self.outcome_for_active_token(&map_key) {
                 let pos = self.position(oc);
                 if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
                     pos.avg_entry
@@ -737,7 +775,7 @@ impl AppState {
             )
         };
         if mid > entry_px {
-            let pos_sh = if let Some(oc) = self.outcome_for_active_token(asset_id) {
+            let pos_sh = if let Some(oc) = self.outcome_for_active_token(&map_key) {
                 self.position(oc).shares.max(0.0)
             } else {
                 tracked.max(0.0)
@@ -768,7 +806,10 @@ impl AppState {
     /// Update [`TrailingSession::tracked_shares`] when fills arrive on a token that may not map
     /// to the active UI pair.
     fn bump_trailing_tracked_shares(&mut self, token_id: &str, side: Side, qty: f64) {
-        if let Some(sess) = self.trailing.get_mut(token_id) {
+        let Some(map_key) = trailing_map_key_for_asset(&self.trailing, token_id) else {
+            return;
+        };
+        if let Some(sess) = self.trailing.get_mut(&map_key) {
             match side {
                 Side::Buy => sess.tracked_shares += qty,
                 Side::Sell => sess.tracked_shares = (sess.tracked_shares - qty).max(0.0),
@@ -818,9 +859,10 @@ impl AppState {
                 if watch.iter().any(|t| clob_asset_ids_match(t, aid_s)) {
                     self.watched_books.insert(aid.clone(), b);
                 }
-                let keep: std::collections::HashSet<String> =
-                    watch.into_iter().collect();
-                self.watched_books.retain(|k, _| keep.contains(k));
+                let keep: HashSet<String> = watch.into_iter().collect();
+                self.watched_books.retain(|k, _| {
+                    keep.iter().any(|w| clob_asset_ids_match(w, k))
+                });
 
                 self.try_promote_pending_trail_any(aid_s);
                 if let Some(mid) = self.mid_for_token(aid_s) {
@@ -1029,7 +1071,9 @@ impl AppState {
                     // Misconfiguration — main should not send; ignore.
                 } else {
                     let tid = token_id.clone();
-                    match self.pending_trail_arms.entry(tid.clone()) {
+                    let entry_key = pending_trail_map_key_for_asset(&self.pending_trail_arms, tid.as_str())
+                        .unwrap_or_else(|| tid.clone());
+                    match self.pending_trail_arms.entry(entry_key) {
                         Entry::Occupied(mut e) => {
                             let p = e.get_mut();
                             let add_plan = plan_sell_shares;
@@ -1148,12 +1192,15 @@ impl AppState {
                 success,
                 error,
             } => {
-                self.trailing_sell_in_flight.remove(&token_id);
+                self
+                    .trailing_sell_in_flight
+                    .retain(|k| !clob_asset_ids_match(k, &token_id));
                 self.pending_trailing_sells
                     .retain(|p| !clob_asset_ids_match(&p.token_id, &token_id));
                 let tid = token_id.clone();
                 if !success {
-                    let had_sess = self.trailing.remove(&tid);
+                    let had_sess = trailing_map_key_for_asset(&self.trailing, tid.as_str())
+                        .and_then(|k| self.trailing.remove(&k));
                     let session_outcome = had_sess.as_ref().map(|s| s.outcome);
                     let mut re_armed = false;
                     if let Some(sess) = had_sess {
@@ -1208,7 +1255,9 @@ impl AppState {
                             format!("trailing {} re-armed after exit failure", oc.as_str());
                     }
                 } else {
-                    self.trailing.remove(&tid);
+                    if let Some(k) = trailing_map_key_for_asset(&self.trailing, tid.as_str()) {
+                        self.trailing.remove(&k);
+                    }
                 }
             }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
@@ -1969,5 +2018,46 @@ mod tests {
 
         let sess = s.trailing.get("U_MER").expect("session after second promote");
         assert!((sess.plan_sell_shares - 15.0).abs() < 1e-9, "plan={}", sess.plan_sell_shares);
+    }
+
+    /// CLOB book `asset_id` may be `0x…` while the armed session key is decimal — the same logical token.
+    #[tokio::test]
+    async fn trailing_book_tick_finds_session_when_ws_asset_id_hex_map_key_decimal() {
+        let mut s = test_state();
+        let tid_decimal = "10";
+        let tid_hex = "0x0a";
+        let m = test_market(tid_decimal, "222", "0xcondhex");
+        s.market = Some(m.clone());
+        s.book_up = Some(BookSnapshot {
+            asset_id: tid_hex.into(),
+            bids:     vec![BookLevel { price: 0.52, size: 100.0 }],
+            asks:     vec![BookLevel { price: 0.54, size: 100.0 }],
+        });
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome:          Outcome::Up,
+            entry_price:      0.50,
+            plan_sell_shares: 10.0,
+            token_id:         tid_decimal.into(),
+            trail_bps:        200,
+            activation_bps:   0,
+            market:           m,
+        })
+        .await;
+        assert!(
+            s.trailing.contains_key(tid_decimal),
+            "session keyed by decimal id from arm request"
+        );
+        let b = BookSnapshot {
+            asset_id: tid_hex.into(),
+            bids:     vec![BookLevel { price: 0.90, size: 10.0 }],
+            asks:     vec![BookLevel { price: 0.92, size: 10.0 }],
+        };
+        s.apply(AppEvent::Book(b)).await;
+        let sess = s.trailing.get(tid_decimal).expect("session");
+        let best = sess.stop.best_price().expect("best after ratchet");
+        assert!(
+            best > 0.51,
+            "trailing must follow book updates when asset_id string form differs; best={best}"
+        );
     }
 }
