@@ -955,7 +955,7 @@ impl TradingClient {
         let v = self.fetch_clob_order_version().await?;
         if v == 1 {
             for tid in token_ids {
-                let _ = self.fetch_fee_rate_bps(*tid).await?;
+                let _ = self.fetch_fee_rate_bps(tid).await?;
             }
         }
         Ok(())
@@ -1067,7 +1067,7 @@ impl TradingClient {
             .header("POLY_SIGNATURE", &auth.signature)
             .header("POLY_TIMESTAMP", auth.timestamp.to_string())
             .header("POLY_NONCE",     auth.nonce.to_string());
-        let resp = req.send().await.with_context(|| format!("{url}"))?;
+        let resp = req.send().await.with_context(|| url.to_string())?;
         let status = resp.status();
         let body   = resp.text().await.unwrap_or_default();
         Ok((status, body))
@@ -1111,7 +1111,7 @@ impl TradingClient {
         digest_in[1] = 0x01;
         digest_in[2..34].copy_from_slice(domain_sep.as_slice());
         digest_in[34..].copy_from_slice(struct_hash.as_slice());
-        let digest: B256 = keccak256(&digest_in);
+        let digest: B256 = keccak256(digest_in);
 
         let sig = self.signer.sign_hash(&digest).await?;
 
@@ -1195,10 +1195,7 @@ impl TradingClient {
         // Neither worked. Print a tailored troubleshooting hint.
         println!("✗ both endpoints failed.  Likely causes:");
         println!();
-        match s.as_u16() {
-            401 => println!("  401 on derive → L1 signature does not recover to POLY_ADDRESS."),
-            _ => {}
-        }
+        if s.as_u16() == 401 { println!("  401 on derive → L1 signature does not recover to POLY_ADDRESS.") }
         match s2.as_u16() {
             401 => println!("  401 on create → L1 signature does not recover to POLY_ADDRESS."),
             403 => println!("  403 on create → wallet is recognised but not permitted (region block?)."),
@@ -2136,7 +2133,7 @@ fn amounts_for(
                     return (U256::ZERO, U256::ZERO);
                 }
 
-                let scale = 10_i64.pow(share_dec.min(6) as u32);
+                let scale = 10_i64.pow(share_dec.min(6));
                 let mut taker_ticks = ((size_shares * scale as f64).ceil() as i64).max(1);
                 for _ in 0..50_000u32 {
                     let s = taker_ticks as f64 / scale as f64;
@@ -2196,7 +2193,7 @@ fn amounts_for(
             }
 
             // Integer share ticks so we never get stuck on float `1.92 + 0.01`.
-            let scale = 10_i64.pow(share_dec.min(6) as u32);
+            let scale = 10_i64.pow(share_dec.min(6));
             let mut taker_ticks = ((size_shares * scale as f64).ceil() as i64).max(1);
             let mut raw_maker = 0.0_f64;
             let mut raw_taker = 0.0_f64;

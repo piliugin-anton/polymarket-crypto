@@ -136,7 +136,7 @@ pub struct MarketProfile {
 }
 
 impl MarketProfile {
-    pub fn rolling_slug_for_window_start(self: &Self, window_start_ts: i64) -> Option<String> {
+    pub fn rolling_slug_for_window_start(&self, window_start_ts: i64) -> Option<String> {
         let _ = self.timeframe.window_sec_rolling()?;
         let token = self.timeframe.rolling_slug_token()?;
         Some(format!(
@@ -146,7 +146,7 @@ impl MarketProfile {
     }
 
     /// Whether discovery uses the rolling 5m/15m grid (vs calendar daily slug).
-    pub fn is_rolling(self: &Self) -> bool {
+    pub fn is_rolling(&self) -> bool {
         self.timeframe.window_sec_rolling().is_some()
     }
 }

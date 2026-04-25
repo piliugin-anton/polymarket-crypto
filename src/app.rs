@@ -566,30 +566,6 @@ impl AppState {
         book_mid(b)
     }
 
-    /// Mid for a CLOB `token_id`: active UI books first, else [`Self::watched_books`].
-    pub fn mid_for_token(&self, token_id: &str) -> Option<f64> {
-        if let Some(m) = &self.market {
-            if token_id == m.up_token_id.as_str() {
-                return self.book_up.as_deref().and_then(book_mid);
-            }
-            if token_id == m.down_token_id.as_str() {
-                return self.book_down.as_deref().and_then(book_mid);
-            }
-        }
-        self.watched_books
-            .get(token_id)
-            .or_else(|| {
-                let c = canonical_clob_token_id(token_id);
-                if c.as_ref() != token_id {
-                    self.watched_books.get(c.as_ref())
-                } else {
-                    None
-                }
-            })
-            .map(|b| b.as_ref())
-            .and_then(book_mid)
-    }
-
     /// Best bid for `token_id` (UI or watched book).
     pub fn best_bid_for_token(&self, token_id: &str) -> Option<f64> {
         let b = self.book_snapshot_for_token(token_id)?;
@@ -747,6 +723,7 @@ impl AppState {
             .retain(|k| *k != token_id && !clob_asset_ids_match(k, token_id));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn install_trailing_session(
         &mut self,
         market:          ActiveMarket,
@@ -1430,10 +1407,8 @@ impl AppState {
                         self.status_line =
                             format!("trailing {} re-armed after exit failure", oc.as_str());
                     }
-                } else {
-                    if let Some(k) = trailing_map_key_for_asset(&self.trailing, tid.as_str()) {
-                        self.trailing.remove(&k);
-                    }
+                } else if let Some(k) = trailing_map_key_for_asset(&self.trailing, tid.as_str()) {
+                    self.trailing.remove(&k);
                 }
             }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
@@ -1640,6 +1615,7 @@ fn merge_chain_balance(
 }
 
 /// Replay Polymarket `GET /data/trades` for the active market to recover VWAP entries and fills.
+#[allow(clippy::too_many_arguments)]
 pub fn hydrate_positions_from_trades(
     trades: &[ClobTrade],
     up_token_id: &str,
@@ -2112,7 +2088,7 @@ mod tests {
             s.trailing.contains_key("OLD_UP") || s.pending_trail_arms.contains_key("OLD_UP"),
             "OLD_UP trail should not be dropped when NEW_UP book updates"
         );
-        assert!(s.mid_for_token("OLD_UP").is_some());
+        assert!(s.best_bid_for_token("OLD_UP").is_some());
     }
 
     /// Two FAK buys on the same outcome token before arming: pending plans must add, not overwrite.

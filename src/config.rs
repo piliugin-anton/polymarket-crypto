@@ -34,7 +34,7 @@ pub const NEG_RISK_CTF_EXCHANGE_V2: &str = "0xe2222d279d744050d28e00520010520000
 /// * 0 = `EOA` — you hold a plain wallet and trade directly (rare on Polymarket).
 /// * 1 = `POLY_PROXY` — legacy magic/email-based proxy wallet.
 /// * 2 = `POLY_GNOSIS_SAFE` — the current default: your EOA owns a Gnosis Safe that
-///       holds the USDC. `funder` = safe address, `signer` = EOA address.
+///   holds the USDC. `funder` = safe address, `signer` = EOA address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureType {
     Eoa           = 0,

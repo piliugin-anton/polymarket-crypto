@@ -303,7 +303,7 @@ fn bundle_has_markets(b: &UserWsBundle) -> bool {
 
 async fn wait_nonempty_bundle(rx: &mut watch::Receiver<UserWsBundle>) -> Result<()> {
     loop {
-        if bundle_has_markets(&*rx.borrow()) {
+        if bundle_has_markets(&rx.borrow()) {
             return Ok(());
         }
         rx.changed()
@@ -437,7 +437,7 @@ async fn run_session(
 
     loop {
         wait_nonempty_bundle(market_watch).await?;
-        let mut desired = desired_condition_ids(&*market_watch.borrow());
+        let mut desired = desired_condition_ids(&market_watch.borrow());
         sync_condition_subscriptions(
             ws,
             creds,
@@ -450,7 +450,7 @@ async fn run_session(
         tokio::select! {
             r = market_watch.changed() => {
                 r.map_err(|_| anyhow::anyhow!("user WS: market watch closed"))?;
-                desired = desired_condition_ids(&*market_watch.borrow());
+                desired = desired_condition_ids(&market_watch.borrow());
                 sync_condition_subscriptions(
                     ws,
                     creds,

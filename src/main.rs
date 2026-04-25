@@ -160,6 +160,7 @@ fn send_user_bundle_if_changed(state: &AppState, tx: &watch::Sender<UserWsBundle
 }
 
 /// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
+#[allow(clippy::too_many_arguments)]
 async fn apply_app_event(
     ev:     AppEvent,
     state:  &mut AppState,
@@ -1139,7 +1140,7 @@ async fn main() -> Result<()> {
 
 fn spawn_price_feed(tx: mpsc::Sender<AppEvent>, rtds_sym_rx: watch::Receiver<String>) {
     let (ptx, mut prx) = mpsc::channel::<feeds::chainlink::PriceTick>(64);
-    let _ = feeds::chainlink::spawn(ptx, rtds_sym_rx);
+    std::mem::drop(feeds::chainlink::spawn(ptx, rtds_sym_rx));
     tokio::spawn(async move {
         while let Some(p) = prx.recv().await {
             // RTDS can outpace the TUI; forward only the latest tick per burst so

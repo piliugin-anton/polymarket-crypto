@@ -16,6 +16,9 @@ use tracing::{info, warn};
 use crate::config::CLOB_WS_URL;
 use crate::trading::canonical_clob_token_id;
 
+type BookSideMaps = (BTreeMap<i64, f64>, BTreeMap<i64, f64>);
+type BooksState = HashMap<String, BookSideMaps>;
+
 /// Book map key: price quantized to 1e-6 (supports ticks finer than 0.01; `(p*100).round()` collided).
 const PRICE_KEY_SCALE: f64 = 1_000_000.0;
 
@@ -139,7 +142,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
 
     // Keep local book state so price_change events can be applied
     // asset_id → (bids map, asks map). Keys are micro-ticks (`price_to_key`).
-    let mut books: HashMap<String, (BTreeMap<i64, f64>, BTreeMap<i64, f64>)> = HashMap::new();
+    let mut books: BooksState = HashMap::new();
     // Reuse allocation across snapshots (CLOB can burst price_change updates).
     let mut out_bids: Vec<BookLevel> = Vec::new();
     let mut out_asks: Vec<BookLevel> = Vec::new();
@@ -259,7 +262,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
 /// event touched a book (i.e., `Book` or `PriceChange`); `None` for `Other`.
 /// Does NOT send a snapshot — callers batch and send after the whole message.
 fn apply_raw_event_to_books(
-    books: &mut HashMap<String, (BTreeMap<i64, f64>, BTreeMap<i64, f64>)>,
+    books: &mut BooksState,
     ev: RawEvent,
 ) -> Option<String> {
     match ev {

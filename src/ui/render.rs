@@ -128,7 +128,7 @@ fn draw_wizard(f: &mut Frame, s: &AppState) {
                 .style(Style::default().fg(Color::White));
             f.render_widget(p, inner);
             let start_row = 2u16;
-            let visible = (inner.height.saturating_sub(start_row as u16 + 1)) as usize;
+            let visible = (inner.height.saturating_sub(start_row + 1)) as usize;
             for (i, row) in s.wizard_rows.iter().enumerate() {
                 if i >= visible {
                     break;
@@ -539,14 +539,14 @@ fn sep() -> Span<'static> { Span::styled("  ", Style::default()) }
 // ── Order error toast (bottom-right; non-blocking) ───────────────────
 fn draw_order_error_toast(f: &mut Frame, screen: Rect, message: &str) {
     let margin = 1u16;
-    let max_box_w = screen.width.saturating_sub(margin * 2).min(50).max(24);
+    let max_box_w = screen.width.saturating_sub(margin * 2).clamp(24, 50);
     let inner_w = (max_box_w as usize).saturating_sub(2).max(8);
     let nchars = message.chars().count();
     let nlines = nchars
         .saturating_add(inner_w.saturating_sub(1))
         / inner_w
         .max(1);
-    let content_lines = (nlines as u16).max(1).min(5);
+    let content_lines = (nlines as u16).clamp(1, 5);
     let box_h = (2u16 + content_lines).min(screen.height.saturating_sub(margin * 2));
     let area = bottom_right_rect(screen, max_box_w, box_h, margin);
     f.render_widget(Clear, area);
@@ -695,7 +695,7 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
             );
         }
         DepositModalPhase::Failed(msg) => {
-            let inner_w = (screen.width.saturating_sub(8).min(58).max(40)) as usize;
+            let inner_w = screen.width.saturating_sub(8).clamp(40, 58) as usize;
             let wrapped = wrap_deposit_error(msg, inner_w);
             let n = wrapped.len().max(1) as u16;
             let h = (6 + n).min(screen.height.saturating_sub(2)).max(8);

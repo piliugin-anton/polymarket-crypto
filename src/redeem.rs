@@ -198,10 +198,7 @@ fn safe_typed_data_digest(
 }
 
 async fn relayer_get_nonce(http: &Client, signer: Address) -> Result<String> {
-    let url = format!(
-        "{RELAYER_HOST}/nonce?address={}&type=SAFE",
-        format!("{signer:#x}")
-    );
+    let url = format!("{RELAYER_HOST}/nonce?address={signer:#x}&type=SAFE");
     let resp = http.get(&url).send().await.context("relayer GET /nonce")?;
     let status = resp.status();
     let txt = resp.text().await.unwrap_or_default();
@@ -214,10 +211,7 @@ async fn relayer_get_nonce(http: &Client, signer: Address) -> Result<String> {
 }
 
 async fn relayer_deployed(http: &Client, proxy_wallet: Address) -> Result<bool> {
-    let url = format!(
-        "{RELAYER_HOST}/deployed?address={}",
-        format!("{proxy_wallet:#x}")
-    );
+    let url = format!("{RELAYER_HOST}/deployed?address={proxy_wallet:#x}");
     let resp = http
         .get(&url)
         .send()

@@ -48,6 +48,9 @@ const POSITIONS_PAGE: u32 = 500;
 /// Data API caps `offset` at 10_000 (`offset` + page must stay within spec).
 const POSITIONS_MAX_OFFSET: u32 = 10_000;
 
+/// `(shares, avg_price)` for one UP/DOWN leg from Data API rows.
+pub type PositionsTokenSizeAvg = Option<(f64, f64)>;
+
 /// `GET /positions?user=0x...&redeemable=true` with pagination.
 ///
 /// Without `redeemable=true`, the default sort (`TOKENS` DESC) returns only the first `limit`
@@ -62,8 +65,7 @@ pub async fn fetch_redeemable_positions(
     loop {
         // API default `sizeThreshold` is 1; omitting it drops positions with size < 1 (site/scripts use 0).
         let url = format!(
-            "{DATA_API_HOST}/positions?user={}&limit={POSITIONS_PAGE}&offset={offset}&redeemable=true&sizeThreshold=0",
-            format!("{user:#x}")
+            "{DATA_API_HOST}/positions?user={user:#x}&limit={POSITIONS_PAGE}&offset={offset}&redeemable=true&sizeThreshold=0",
         );
         let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
         let status = resp.status();
@@ -103,9 +105,7 @@ pub async fn fetch_positions_for_market(
     market_condition_id: &str,
 ) -> Result<Vec<DataPosition>> {
     let url = format!(
-        "{DATA_API_HOST}/positions?user={}&market={}&sizeThreshold=0&limit=500",
-        format!("{user:#x}"),
-        market_condition_id
+        "{DATA_API_HOST}/positions?user={user:#x}&market={market_condition_id}&sizeThreshold=0&limit=500",
     );
     let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
     let status = resp.status();
@@ -123,7 +123,7 @@ pub fn positions_size_avg_for_tokens(
     rows: &[DataPosition],
     up_token_id: &str,
     down_token_id: &str,
-) -> (Option<(f64, f64)>, Option<(f64, f64)>) {
+) -> (PositionsTokenSizeAvg, PositionsTokenSizeAvg) {
     let mut up: Option<(f64, f64)> = None;
     let mut down: Option<(f64, f64)> = None;
     for p in rows {

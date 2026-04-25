@@ -233,7 +233,7 @@ impl GammaClient {
             })
             .or_else(|| {
                 candidates.iter().find(|m| {
-                    gamma_market_window_start(m).map_or(false, |s| s >= now)
+                    gamma_market_window_start(m).is_some_and(|s| s >= now)
                 })
             })
             .ok_or_else(|| {
@@ -297,11 +297,11 @@ impl GammaClient {
         let today = now_ny.date_naive();
         let mut d = today;
         for _ in 0..5 {
-            let slug = build_daily_event_slug(&profile.asset.daily_event_prefix, d);
+            let slug = build_daily_event_slug(profile.asset.daily_event_prefix, d);
             if let Some(m) = self.fetch_open_raw_market_by_slug(&slug).await? {
                 return self.active_market_from_raw_with_crypto(&m, profile).await;
             }
-            d = d + chrono::Duration::days(1);
+            d += chrono::Duration::days(1);
         }
         anyhow::bail!("no open daily up/down market (tried a few days from {today} for this asset)");
     }
@@ -319,7 +319,7 @@ impl GammaClient {
         let start_date = d0 + chrono::Duration::days(1);
         for add in 0i64..10i64 {
             let d = start_date + chrono::Duration::days(add);
-            let slug = build_daily_event_slug(&profile.asset.daily_event_prefix, d);
+            let slug = build_daily_event_slug(profile.asset.daily_event_prefix, d);
             if let Some(m) = self.fetch_open_raw_market_by_slug(&slug).await? {
                 return self.active_market_from_raw_with_crypto(&m, profile).await.map(Some);
             }
@@ -369,7 +369,7 @@ impl GammaClient {
         m.crypto_price_query_end_utc = end_date.clone();
         if let Some(open) = self
             .fetch_polymarket_open_price(
-                &profile.asset.crypto_price_symbol,
+                profile.asset.crypto_price_symbol,
                 &event_start,
                 &end_date,
                 profile.timeframe.crypto_price_variant(),
