@@ -14,6 +14,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::config::CLOB_WS_URL;
+use crate::trading::canonical_clob_token_id;
 
 /// Book map key: price quantized to 1e-6 (supports ticks finer than 0.01; `(p*100).round()` collided).
 const PRICE_KEY_SCALE: f64 = 1_000_000.0;
@@ -35,6 +36,14 @@ fn snip_frame(txt: &str, max: usize) -> String {
     } else {
         format!("{}…", &t[..max])
     }
+}
+
+fn warn_unparsed_clob(txt: &str) {
+    warn!(
+        len = txt.len(),
+        snippet = %snip_frame(txt, 280),
+        "CLOB WS text not parsed (book / price_change / market price_changes)",
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +140,9 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
     // Keep local book state so price_change events can be applied
     // asset_id → (bids map, asks map). Keys are micro-ticks (`price_to_key`).
     let mut books: HashMap<String, (BTreeMap<i64, f64>, BTreeMap<i64, f64>)> = HashMap::new();
+    // Reuse allocation across snapshots (CLOB can burst price_change updates).
+    let mut out_bids: Vec<BookLevel> = Vec::new();
+    let mut out_asks: Vec<BookLevel> = Vec::new();
 
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(10));
     ping.tick().await;
@@ -180,33 +192,55 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                 }
 
                 // CLOB: `[{event_type:...}]`, single event, or `{ market, price_changes:[...] }`.
-                if let Ok(events) = serde_json::from_str::<Vec<RawEvent>>(&txt) {
-                    for ev in events {
-                        apply_raw_event(&mut books, ev, tx).await;
+                // Heuristic branch avoids 2–3 `from_str` attempts on every frame.
+                let t = txt.as_str();
+                if t.trim_start().starts_with('[') {
+                    if let Ok(events) = serde_json::from_str::<Vec<RawEvent>>(t) {
+                        for ev in events {
+                            apply_raw_event(
+                                &mut books,
+                                ev,
+                                &mut out_bids,
+                                &mut out_asks,
+                                tx,
+                            )
+                            .await;
+                        }
+                    } else {
+                        warn_unparsed_clob(&txt);
                     }
                     continue;
                 }
-                if let Ok(ev) = serde_json::from_str::<RawEvent>(&txt) {
-                    apply_raw_event(&mut books, ev, tx).await;
+                if t.contains("price_changes") && t.trim_start().starts_with('{') {
+                    if let Ok(msg) = serde_json::from_str::<MarketPriceChangesMsg>(t) {
+                        for ch in &msg.price_changes {
+                            let aid = canonical_clob_token_id(&ch.asset_id);
+                            let entry = books.entry(aid.clone()).or_default();
+                            let (Ok(p), Ok(s)) = (ch.price.parse::<f64>(), ch.size.parse::<f64>()) else { continue };
+                            let key = price_to_key(p);
+                            let map = if ch.side == "BUY" { &mut entry.0 } else { &mut entry.1 };
+                            if s == 0.0 { map.remove(&key); } else { map.insert(key, s); }
+                            send_snapshot(
+                                &aid,
+                                entry,
+                                &mut out_bids,
+                                &mut out_asks,
+                                tx,
+                            )
+                            .await;
+                        }
+                    } else {
+                        warn_unparsed_clob(t);
+                    }
                     continue;
                 }
-                if let Ok(msg) = serde_json::from_str::<MarketPriceChangesMsg>(&txt) {
-                    for ch in &msg.price_changes {
-                        let entry = books.entry(ch.asset_id.clone()).or_default();
-                        let (Ok(p), Ok(s)) = (ch.price.parse::<f64>(), ch.size.parse::<f64>()) else { continue };
-                        let key = price_to_key(p);
-                        let map = if ch.side == "BUY" { &mut entry.0 } else { &mut entry.1 };
-                        if s == 0.0 { map.remove(&key); } else { map.insert(key, s); }
-                        send_snapshot(&ch.asset_id, entry, tx).await;
-                    }
+                if let Ok(ev) = serde_json::from_str::<RawEvent>(t) {
+                    apply_raw_event(&mut books, ev, &mut out_bids, &mut out_asks, tx)
+                        .await;
                     continue;
                 }
 
-                warn!(
-                    len = txt.len(),
-                    snippet = %snip_frame(&txt, 280),
-                    "CLOB WS text not parsed (book / price_change / market price_changes)",
-                );
+                warn_unparsed_clob(&txt);
             }
         }
     }
@@ -215,10 +249,13 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
 async fn apply_raw_event(
     books: &mut HashMap<String, (BTreeMap<i64, f64>, BTreeMap<i64, f64>)>,
     ev: RawEvent,
+    out_bids: &mut Vec<BookLevel>,
+    out_asks: &mut Vec<BookLevel>,
     tx: &mpsc::Sender<BookSnapshot>,
 ) {
     match ev {
         RawEvent::Book { asset_id, bids, asks } => {
+            let asset_id = canonical_clob_token_id(&asset_id);
             let entry = books.entry(asset_id.clone()).or_default();
             entry.0.clear();
             entry.1.clear();
@@ -232,9 +269,17 @@ async fn apply_raw_event(
                     entry.1.insert(price_to_key(p), s);
                 }
             }
-            send_snapshot(&asset_id, entry, tx).await;
+            send_snapshot(
+                &asset_id,
+                entry,
+                out_bids,
+                out_asks,
+                tx,
+            )
+            .await;
         }
         RawEvent::PriceChange { asset_id, changes } => {
+            let asset_id = canonical_clob_token_id(&asset_id);
             let entry = books.entry(asset_id.clone()).or_default();
             for c in &changes {
                 let (Ok(p), Ok(s)) = (c.price.parse::<f64>(), c.size.parse::<f64>()) else { continue };
@@ -242,7 +287,14 @@ async fn apply_raw_event(
                 let map = if c.side == "BUY" { &mut entry.0 } else { &mut entry.1 };
                 if s == 0.0 { map.remove(&key); } else { map.insert(key, s); }
             }
-            send_snapshot(&asset_id, entry, tx).await;
+            send_snapshot(
+                &asset_id,
+                entry,
+                out_bids,
+                out_asks,
+                tx,
+            )
+            .await;
         }
         RawEvent::Other => {}
     }
@@ -251,23 +303,35 @@ async fn apply_raw_event(
 async fn send_snapshot(
     asset_id: &str,
     (bids, asks): &(BTreeMap<i64, f64>, BTreeMap<i64, f64>),
+    out_bids: &mut Vec<BookLevel>,
+    out_asks: &mut Vec<BookLevel>,
     tx: &mpsc::Sender<BookSnapshot>,
 ) {
     // bids: high→low, asks: low→high
-    let bids: Vec<_> = bids
-        .iter()
-        .rev()
-        .map(|(p, s)| BookLevel {
-            price: key_to_price(*p),
-            size: *s,
+    out_bids.clear();
+    out_asks.clear();
+    out_bids.reserve(bids.len().min(4096));
+    out_asks.reserve(asks.len().min(4096));
+    out_bids.extend(bids.iter().rev().map(|(p, s)| BookLevel {
+        price: key_to_price(*p),
+        size: *s,
+    }));
+    out_asks.extend(asks.iter().map(|(p, s)| BookLevel {
+        price: key_to_price(*p),
+        size: *s,
+    }));
+    // Swap the filled `Vec` out, leave an empty one with headroom to reduce realloc on the next
+    // snapshot in this WS session.
+    let (nb, na) = (out_bids.len(), out_asks.len());
+    let b_cap = (nb * 2).clamp(8, 4096);
+    let a_cap = (na * 2).clamp(8, 4096);
+    let to_send_b = std::mem::replace(out_bids, Vec::with_capacity(b_cap));
+    let to_send_a = std::mem::replace(out_asks, Vec::with_capacity(a_cap));
+    let _ = tx
+        .send(BookSnapshot {
+            asset_id: asset_id.to_string(),
+            bids:     to_send_b,
+            asks:     to_send_a,
         })
-        .collect();
-    let asks: Vec<_> = asks
-        .iter()
-        .map(|(p, s)| BookLevel {
-            price: key_to_price(*p),
-            size: *s,
-        })
-        .collect();
-    let _ = tx.send(BookSnapshot { asset_id: asset_id.to_string(), bids, asks }).await;
+        .await;
 }

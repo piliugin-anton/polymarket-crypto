@@ -21,10 +21,11 @@ use crate::bridge_deposit::SOLANA_MAINNET_USDC_MINT;
 use crate::market_profile::Timeframe;
 
 pub fn draw(f: &mut Frame, s: &AppState) {
+    let now = Instant::now();
     if s.ui_phase != UiPhase::Trading {
         draw_wizard(f, s);
         if let Some(ref t) = s.order_error_toast {
-            if std::time::Instant::now() < t.until {
+            if now < t.until {
                 let area = f.area();
                 draw_order_error_toast(f, area, t.message.as_str());
             }
@@ -53,7 +54,7 @@ pub fn draw(f: &mut Frame, s: &AppState) {
         draw_deposit_modal(f, area, phase);
     }
     if let Some(ref t) = s.order_error_toast {
-        if Instant::now() < t.until {
+        if now < t.until {
             draw_order_error_toast(f, area, t.message.as_str());
         }
     }

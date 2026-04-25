@@ -28,6 +28,8 @@ use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use tracing::debug;
+
+use crate::trading::canonical_clob_token_id;
 use url::Url;
 
 use chrono_tz::America::New_York;
@@ -481,15 +483,17 @@ fn active_market_from_raw_market(m: &RawMarket, event: Option<&RawEvent>) -> Res
     let outcomes: Vec<String> = serde_json::from_str(&m.outcomes)
         .unwrap_or_else(|_| vec!["Up".into(), "Down".into()]);
 
-    let (up_token_id, down_token_id) = if outcomes
+    let (u0, d0) = if outcomes
         .first()
         .map(|s| s.eq_ignore_ascii_case("up"))
         .unwrap_or(true)
     {
-        (token_ids[0].clone(), token_ids[1].clone())
+        (token_ids[0].as_str(), token_ids[1].as_str())
     } else {
-        (token_ids[1].clone(), token_ids[0].clone())
+        (token_ids[1].as_str(), token_ids[0].as_str())
     };
+    let up_token_id = canonical_clob_token_id(u0);
+    let down_token_id = canonical_clob_token_id(d0);
 
     let price_to_beat = extract_price_to_beat(&m.description); // overridden in find_current_btc_5m when API returns openPrice
     // Canonical tick strings for `ROUNDING_CONFIG` parity (avoid `0.001 → "0.00"` with `:.2`).

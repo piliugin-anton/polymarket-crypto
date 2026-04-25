@@ -30,7 +30,7 @@ use crate::config::CLOB_WS_USER_URL;
 use crate::feeds::user_trade_sync::UserTradeSync;
 use crate::net;
 use crate::trading::{
-    clob_asset_ids_match, parse_user_channel_values, try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, TradingClient, norm_order_id_key,
+    canonical_clob_token_id, clob_asset_ids_match, parse_user_channel_values, try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, TradingClient, norm_order_id_key,
 };
 
 type UserWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -149,8 +149,14 @@ impl UserOpenOrdersLedger {
                 return false;
             }
         } else if let Some(a) = jstr2(v, "asset_id", "assetId") {
-            if !g.up.is_empty() && !clob_asset_ids_match(a, g.up.as_str()) && !clob_asset_ids_match(a, g.down.as_str()) {
-                return false;
+            if !g.up.is_empty() {
+                let t = canonical_clob_token_id(a);
+                if t != g.up && t != g.down
+                    && !clob_asset_ids_match(a, g.up.as_str())
+                    && !clob_asset_ids_match(a, g.down.as_str())
+                {
+                    return false;
+                }
             }
         }
         let raw_id = v
@@ -320,15 +326,21 @@ fn desired_condition_ids(b: &UserWsBundle) -> HashSet<String> {
 }
 
 fn resolve_trade_outcome(bundle: &UserWsBundle, asset_id: &str) -> Option<Outcome> {
+    let token = canonical_clob_token_id(asset_id);
+    let token_s = token.as_str();
     let markets = std::iter::once(&bundle.active).chain(bundle.extras.iter());
     for m in markets {
         if m.condition_id.is_empty() {
             continue;
         }
-        if clob_asset_ids_match(asset_id, &m.up_token_id) {
+        if token_s == m.up_token_id
+            || clob_asset_ids_match(asset_id, &m.up_token_id)
+        {
             return Some(Outcome::Up);
         }
-        if clob_asset_ids_match(asset_id, &m.down_token_id) {
+        if token_s == m.down_token_id
+            || clob_asset_ids_match(asset_id, &m.down_token_id)
+        {
             return Some(Outcome::Down);
         }
     }

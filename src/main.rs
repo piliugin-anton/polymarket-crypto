@@ -141,6 +141,15 @@ fn merge_ui_and_extra_book_tokens(ui_pair: &[String], extra: &[String]) -> Vec<S
     v
 }
 
+/// Skip `watch` notify when the token set is unchanged (avoids supervisor work + CLOB WS restarts).
+fn send_book_watch_if_changed(state: &AppState, book_token_tx: &watch::Sender<Vec<String>>) {
+    let next = collect_book_watch_token_ids(state);
+    if next.as_slice() == book_token_tx.borrow().as_slice() {
+        return;
+    }
+    let _ = book_token_tx.send(next);
+}
+
 /// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
 async fn apply_app_event(
     ev:     AppEvent,
@@ -199,7 +208,7 @@ async fn apply_app_event(
                 cfg,
             );
             let _ = user_bundle_tx.send(build_user_ws_bundle(state));
-            let _ = book_token_tx.send(collect_book_watch_token_ids(state));
+            send_book_watch_if_changed(state, book_token_tx);
             false
         }
     }
@@ -977,7 +986,7 @@ async fn main() -> Result<()> {
     let mut state = AppState::new(cfg.default_size_usdc, user_trade_sync.clone());
     let mut discovery_spawned = false;
     let _ = user_bundle_tx.send(build_user_ws_bundle(&state));
-    let _ = book_token_tx.send(collect_book_watch_token_ids(&state));
+    send_book_watch_if_changed(&state, &book_token_tx);
 
     // ── main loop ────────────────────────────────────────────────────
     /// Drain coalesced feed events in one frame so a burst of book updates

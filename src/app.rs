@@ -21,7 +21,7 @@ use crate::gamma::ActiveMarket;
 use crate::gamma_series::SeriesRow;
 use crate::market_profile::MarketProfile;
 use crate::trailing_stop::{Activation, Side as TrailSide, TickOutcome, TrailSpec, TrailingStop};
-use crate::trading::{clob_asset_ids_match, ClobOpenOrder, ClobTrade, OrderType, Side};
+use crate::trading::{canonical_clob_token_id, clob_asset_ids_match, ClobOpenOrder, ClobTrade, OrderType, Side};
 use tracing::debug;
 
 /// Minimum outcome shares for a limit (GTD) order — enforced in the UI before submit.
@@ -32,11 +32,19 @@ pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
 /// `main.rs`).
 pub const TRAILING_SELL_MAX_PARALLEL: usize = 8;
 
-/// Map key in [`AppState::trailing`] for this CLOB asset (decimal vs `0x` hex must match).
+/// Map key in [`AppState::trailing`] for this CLOB asset.
+/// Hot path: O(1) on canonical ids (see `canonical_clob_token_id`); then legacy U256/hex form.
 fn trailing_map_key_for_asset(
     trailing: &HashMap<String, TrailingSession>,
     asset_id: &str,
 ) -> Option<String> {
+    if trailing.contains_key(asset_id) {
+        return Some(asset_id.to_string());
+    }
+    let c = canonical_clob_token_id(asset_id);
+    if c != asset_id && trailing.contains_key(&c) {
+        return Some(c);
+    }
     trailing
         .keys()
         .find(|k| clob_asset_ids_match(k, asset_id))
@@ -48,6 +56,13 @@ fn pending_trail_map_key_for_asset(
     pending: &HashMap<String, PendingTrailArm>,
     asset_id: &str,
 ) -> Option<String> {
+    if pending.contains_key(asset_id) {
+        return Some(asset_id.to_string());
+    }
+    let c = canonical_clob_token_id(asset_id);
+    if c != asset_id && pending.contains_key(&c) {
+        return Some(c);
+    }
     pending
         .keys()
         .find(|k| clob_asset_ids_match(k, asset_id))
@@ -454,11 +469,11 @@ impl AppState {
     fn trailing_sell_queued_or_in_flight(&self, token_id: &str) -> bool {
         self.pending_trailing_sells
             .iter()
-            .any(|e| clob_asset_ids_match(&e.token_id, token_id))
+            .any(|e| e.token_id == token_id || clob_asset_ids_match(&e.token_id, token_id))
             || self
                 .trailing_sell_in_flight
                 .iter()
-                .any(|k| clob_asset_ids_match(k, token_id))
+                .any(|k| *k == token_id || clob_asset_ids_match(k, token_id))
     }
 
     // ── Queries ─────────────────────────────────────────────────────
@@ -515,14 +530,24 @@ impl AppState {
     /// Mid for a CLOB `token_id`: active UI books first, else [`Self::watched_books`].
     pub fn mid_for_token(&self, token_id: &str) -> Option<f64> {
         if let Some(m) = &self.market {
-            if clob_asset_ids_match(token_id, &m.up_token_id) {
+            if token_id == m.up_token_id.as_str() {
                 return self.book_up.as_ref().and_then(book_mid);
             }
-            if clob_asset_ids_match(token_id, &m.down_token_id) {
+            if token_id == m.down_token_id.as_str() {
                 return self.book_down.as_ref().and_then(book_mid);
             }
         }
-        self.watched_books.get(token_id).and_then(book_mid)
+        self.watched_books
+            .get(token_id)
+            .or_else(|| {
+                let c = canonical_clob_token_id(token_id);
+                if c != token_id {
+                    self.watched_books.get(c.as_str())
+                } else {
+                    None
+                }
+            })
+            .and_then(book_mid)
     }
 
     /// Best bid for `token_id` (UI or watched book).
@@ -533,22 +558,31 @@ impl AppState {
 
     fn book_snapshot_for_token(&self, token_id: &str) -> Option<&BookSnapshot> {
         if let Some(m) = &self.market {
-            if clob_asset_ids_match(token_id, &m.up_token_id) {
+            if token_id == m.up_token_id.as_str() {
                 return self.book_up.as_ref();
             }
-            if clob_asset_ids_match(token_id, &m.down_token_id) {
+            if token_id == m.down_token_id.as_str() {
                 return self.book_down.as_ref();
             }
         }
-        self.watched_books.get(token_id)
+        self.watched_books
+            .get(token_id)
+            .or_else(|| {
+                let c = canonical_clob_token_id(token_id);
+                if c != token_id {
+                    self.watched_books.get(c.as_str())
+                } else {
+                    None
+                }
+            })
     }
 
     /// If `token_id` belongs to the active UI market, return its UP/DOWN side.
     pub fn outcome_for_active_token(&self, token_id: &str) -> Option<Outcome> {
         let m = self.market.as_ref()?;
-        if clob_asset_ids_match(token_id, &m.up_token_id) {
+        if token_id == m.up_token_id.as_str() {
             Some(Outcome::Up)
-        } else if clob_asset_ids_match(token_id, &m.down_token_id) {
+        } else if token_id == m.down_token_id.as_str() {
             Some(Outcome::Down)
         } else {
             None
@@ -561,17 +595,13 @@ impl AppState {
             return self.trailing.len() + self.pending_trail_arms.len();
         };
         let mut n = 0;
-        for (tid, _) in &self.trailing {
-            if !clob_asset_ids_match(tid, &m.up_token_id)
-                && !clob_asset_ids_match(tid, &m.down_token_id)
-            {
+        for tid in self.trailing.keys() {
+            if tid != &m.up_token_id && tid != &m.down_token_id {
                 n += 1;
             }
         }
-        for (tid, _) in &self.pending_trail_arms {
-            if !clob_asset_ids_match(tid, &m.up_token_id)
-                && !clob_asset_ids_match(tid, &m.down_token_id)
-            {
+        for tid in self.pending_trail_arms.keys() {
+            if tid != &m.up_token_id && tid != &m.down_token_id {
                 n += 1;
             }
         }
@@ -617,18 +647,16 @@ impl AppState {
 
     /// Drop a trailing plan when the user (or the exchange) reduces position via a SELL fill.
     fn clear_trailing_on_sell_token(&mut self, token_id: &str) {
-        self
-            .trailing
-            .retain(|k, _| !clob_asset_ids_match(k, token_id));
-        self
-            .pending_trail_arms
-            .retain(|k, _| !clob_asset_ids_match(k, token_id));
-        self
-            .watched_books
-            .retain(|k, _| !clob_asset_ids_match(k, token_id));
+        self.trailing
+            .retain(|k, _| *k != token_id && !clob_asset_ids_match(k, token_id));
+        self.pending_trail_arms
+            .retain(|k, _| *k != token_id && !clob_asset_ids_match(k, token_id));
+        self.watched_books
+            .retain(|k, _| *k != token_id && !clob_asset_ids_match(k, token_id));
         self.pending_trailing_sells
-            .retain(|e| !clob_asset_ids_match(&e.token_id, token_id));
-        self.trailing_sell_in_flight.retain(|k| !clob_asset_ids_match(k, token_id));
+            .retain(|e| e.token_id != token_id && !clob_asset_ids_match(&e.token_id, token_id));
+        self.trailing_sell_in_flight
+            .retain(|k| *k != token_id && !clob_asset_ids_match(k, token_id));
     }
 
     fn install_trailing_session(
@@ -641,6 +669,7 @@ impl AppState {
         trail_bps:       u32,
         tracked_shares:  f64,
     ) {
+        let token_id = canonical_clob_token_id(&token_id);
         if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
             return;
         }
@@ -745,7 +774,9 @@ impl AppState {
             let Some(sess) = self.trailing.get(&map_key) else {
                 return;
             };
-            if !clob_asset_ids_match(asset_id, &sess.token_id) {
+            if asset_id != sess.token_id.as_str()
+                && !clob_asset_ids_match(asset_id, &sess.token_id)
+            {
                 return;
             }
             sess.stop.on_price(mid)
@@ -845,28 +876,29 @@ impl AppState {
                     }
                 }
             }
-            AppEvent::Book(b) => {
-                let aid = b.asset_id.clone();
-                let aid_s = aid.as_str();
+            AppEvent::Book(mut b) => {
+                b.asset_id = canonical_clob_token_id(&b.asset_id);
+                let id_for_trail = b.asset_id.clone();
                 if let Some(m) = &self.market {
-                    if clob_asset_ids_match(aid_s, &m.up_token_id) {
+                    if b.asset_id == m.up_token_id {
                         self.book_up = Some(b.clone());
-                    } else if clob_asset_ids_match(aid_s, &m.down_token_id) {
+                    } else if b.asset_id == m.down_token_id {
                         self.book_down = Some(b.clone());
                     }
                 }
                 let watch = collect_book_watch_token_ids(self);
-                if watch.iter().any(|t| clob_asset_ids_match(t, aid_s)) {
-                    self.watched_books.insert(aid.clone(), b);
+                if watch.contains(&id_for_trail) {
+                    self.watched_books
+                        .insert(b.asset_id.clone(), b);
+                } else {
+                    drop(b);
                 }
                 let keep: HashSet<String> = watch.into_iter().collect();
-                self.watched_books.retain(|k, _| {
-                    keep.iter().any(|w| clob_asset_ids_match(w, k))
-                });
+                self.watched_books.retain(|k, _| keep.contains(k));
 
-                self.try_promote_pending_trail_any(aid_s);
-                if let Some(mid) = self.mid_for_token(aid_s) {
-                    self.apply_trailing_book_tick(aid_s, mid);
+                self.try_promote_pending_trail_any(id_for_trail.as_str());
+                if let Some(mid) = self.mid_for_token(id_for_trail.as_str()) {
+                    self.apply_trailing_book_tick(id_for_trail.as_str(), mid);
                 }
             }
             AppEvent::MarketRoll(m) => {
@@ -959,6 +991,7 @@ impl AppState {
                 price,
                 ts,
             } => {
+                let token_id = canonical_clob_token_id(&token_id);
                 if let Some(ui_oc) = self.outcome_for_active_token(&token_id) {
                     let realized = self.position_mut(ui_oc).apply_fill(side, qty, price);
                     self.realized_pnl += realized;
@@ -1012,6 +1045,7 @@ impl AppState {
                 clob_order_id,
                 token_id,
             } => {
+                let token_id = canonical_clob_token_id(&token_id);
                 let mut do_pnl = true;
                 if let Some(ref oid) = clob_order_id {
                     if !self.user_trade_sync.before_order_ack_apply(oid, qty, price).await {
@@ -1067,6 +1101,7 @@ impl AppState {
                 activation_bps,
                 market,
             } => {
+                let token_id = canonical_clob_token_id(&token_id);
                 if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
                     // Misconfiguration — main should not send; ignore.
                 } else {
@@ -1192,11 +1227,11 @@ impl AppState {
                 success,
                 error,
             } => {
-                self
-                    .trailing_sell_in_flight
-                    .retain(|k| !clob_asset_ids_match(k, &token_id));
+                let token_id = canonical_clob_token_id(&token_id);
+                self.trailing_sell_in_flight
+                    .retain(|k| *k != token_id && !clob_asset_ids_match(k, &token_id));
                 self.pending_trailing_sells
-                    .retain(|p| !clob_asset_ids_match(&p.token_id, &token_id));
+                    .retain(|p| p.token_id != token_id && !clob_asset_ids_match(&p.token_id, &token_id));
                 let tid = token_id.clone();
                 if !success {
                     let had_sess = trailing_map_key_for_asset(&self.trailing, tid.as_str())

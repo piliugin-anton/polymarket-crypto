@@ -394,21 +394,35 @@ pub(crate) fn parse_clob_side_str(s: &str) -> Option<Side> {
     }
 }
 
+/// Parse a Polymarket outcome / asset id as U256: decimal, or `0x` + hex bytes.
+#[inline]
+pub fn parse_clob_token_id(s: &str) -> Option<U256> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        let bytes = ::hex::decode(h).ok()?;
+        return Some(U256::from_be_slice(&bytes));
+    }
+    U256::from_str_radix(t, 10).ok()
+}
+
+/// **Decimal** string unique per token. Use for map keys and `==` on hot paths after normalizing
+/// at boundaries; [`clob_asset_ids_match`] on every compare is much slower.
+#[inline]
+pub fn canonical_clob_token_id(s: &str) -> String {
+    if let Some(u) = parse_clob_token_id(s) {
+        u.to_string()
+    } else {
+        s.trim().to_string()
+    }
+}
+
 /// Compare Polymarket ERC-1155 outcome token ids: decimal and `0x` hex denote the same id.
 /// Gamma / CLOB / `GET /data/trades` do not always use the same string form; strict `==` misses rows.
 pub fn clob_asset_ids_match(a: &str, b: &str) -> bool {
-    fn parse_token_u256(s: &str) -> Option<U256> {
-        let t = s.trim();
-        if t.is_empty() {
-            return None;
-        }
-        if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-            let bytes = ::hex::decode(h).ok()?;
-            return Some(U256::from_be_slice(&bytes));
-        }
-        U256::from_str_radix(t, 10).ok()
-    }
-    match (parse_token_u256(a), parse_token_u256(b)) {
+    match (parse_clob_token_id(a), parse_clob_token_id(b)) {
         (Some(x), Some(y)) => x == y,
         _ => a.trim() == b.trim(),
     }
