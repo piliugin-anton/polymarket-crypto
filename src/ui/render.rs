@@ -20,6 +20,8 @@ use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome, Se
 use crate::bridge_deposit::SOLANA_MAINNET_USDC_MINT;
 use crate::market_profile::Timeframe;
 
+const SPACES: &str = "                                "; // 32 spaces — wider than any balance panel
+
 pub fn draw(f: &mut Frame, s: &AppState) {
     let now = Instant::now();
     if s.ui_phase != UiPhase::Trading {
@@ -204,7 +206,7 @@ fn balance_row_right_aligned<'a>(
     }
     Line::from(vec![
         Span::styled(label, Style::default().fg(Color::DarkGray)),
-        Span::raw(" ".repeat(gap)),
+        Span::raw(&SPACES[..gap.min(SPACES.len())]),
         Span::styled(value, vs),
     ])
 }
@@ -934,43 +936,107 @@ fn fmt_money_decimals(v: f64, decimal_places: u32) -> String {
 }
 
 fn fmt_money_decimals_inner(v: f64, decimal_places: u32, floor_frac: bool) -> String {
-    // e.g. 67_432.51 or 2.3456 (decimal_places = 4)
     let whole = v as i64;
-    let mult = 10_f64.powi(decimal_places as i32);
+    let mult  = 10_f64.powi(decimal_places as i32);
     let max_frac = mult as u64;
     let raw_frac = (v - whole as f64).abs() * mult;
-    let mut frac = if floor_frac {
-        raw_frac.floor() as u64
-    } else {
-        raw_frac.round() as u64
-    };
+    let mut frac = if floor_frac { raw_frac.floor() as u64 } else { raw_frac.round() as u64 };
     let mut w = whole;
     if frac >= max_frac {
         w += if v >= 0.0 { 1 } else { -1 };
         frac = 0;
     }
-    let mut ws = w.to_string().into_bytes();
-    let mut with_commas = Vec::with_capacity(ws.len() + ws.len() / 3);
-    let skip_sign = if ws.first() == Some(&b'-') { with_commas.push(b'-'); 1 } else { 0 };
-    let digits = &ws[skip_sign..];
-    for (i, &c) in digits.iter().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 { with_commas.push(b','); }
-        with_commas.push(c);
+
+    // Build integer digits in reverse into a stack buffer (u64 max = 20 digits).
+    let neg = w < 0;
+    let abs_w = w.unsigned_abs();
+    let mut ibuf = [0u8; 20];
+    let mut ilen = 0usize;
+    let mut tmp = abs_w;
+    if tmp == 0 {
+        ibuf[0] = b'0';
+        ilen = 1;
+    } else {
+        while tmp > 0 {
+            ibuf[ilen] = b'0' + (tmp % 10) as u8;
+            tmp /= 10;
+            ilen += 1;
+        }
     }
-    let _ = &mut ws;
-    format!(
-        "{}.{:0width$}",
-        String::from_utf8_lossy(&with_commas),
-        frac,
-        width = decimal_places as usize
-    )
+
+    // Single allocation sized to fit the result.
+    // Worst case: sign(1) + digits(20) + commas(6) + dot(1) + frac(4) = 32 bytes.
+    let mut out = String::with_capacity(32);
+    if neg { out.push('-'); }
+    for i in (0..ilen).rev() {
+        let pos = ilen - 1 - i; // position from left, 0-indexed
+        if pos > 0 && (ilen - pos) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ibuf[i] as char);
+    }
+    out.push('.');
+    // Write zero-padded fractional digits from a stack buffer.
+    let dp = decimal_places as usize;
+    let mut fbuf = [b'0'; 6]; // decimal_places is at most 4 in this app
+    let mut ftmp = frac;
+    for j in (0..dp).rev() {
+        fbuf[j] = b'0' + (ftmp % 10) as u8;
+        ftmp /= 10;
+    }
+    // SAFETY: all bytes in fbuf[..dp] are ASCII digits b'0'..=b'9'.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&fbuf[..dp]) });
+    out
 }
 fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_string() }
-    else { s.chars().take(n.saturating_sub(1)).collect::<String>() + "…" }
+    // Fast path: byte length ≥ char count, so if bytes fit, chars definitely fit.
+    if s.len() <= n {
+        return s.to_string();
+    }
+    // Slow path: find the byte offset of the (n-1)th char, append ellipsis.
+    match s.char_indices().nth(n.saturating_sub(1)) {
+        Some((i, _)) => {
+            let mut out = String::with_capacity(i + 3); // 3 bytes for "…"
+            out.push_str(&s[..i]);
+            out.push('…');
+            out
+        }
+        None => s.to_string(),
+    }
 }
 fn pnl_style(v: f64) -> Style {
     if v > 1e-9       { Style::default().fg(Color::Green) }
     else if v < -1e-9 { Style::default().fg(Color::Red) }
     else              { Style::default().fg(Color::Gray) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_money_basic() {
+        assert_eq!(fmt_money_decimals_inner(1234.56,  2, false), "1,234.56");
+        assert_eq!(fmt_money_decimals_inner(0.0,      2, false), "0.00");
+        assert_eq!(fmt_money_decimals_inner(-99.5,    2, false), "-99.50");
+        assert_eq!(fmt_money_decimals_inner(1_000_000.0, 2, false), "1,000,000.00");
+        assert_eq!(fmt_money_decimals_inner(0.999,    2, false), "1.00"); // rounding carry
+        assert_eq!(fmt_money_decimals_inner(67_432.51, 2, true),  "67,432.50"); // floor_frac truncates towards zero
+        assert_eq!(fmt_money_decimals_inner(1.23456,  4, false), "1.2346");
+    }
+
+    #[test]
+    fn truncate_ascii_fast_path() {
+        // No truncation — must not scan chars
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("",      5),  "");
+    }
+
+    #[test]
+    fn truncate_long_string() {
+        let s = "a".repeat(100);
+        let r = truncate(&s, 5);
+        assert!(r.ends_with('…'));
+        assert_eq!(r.chars().count(), 5); // 4 'a' + ellipsis
+    }
 }
