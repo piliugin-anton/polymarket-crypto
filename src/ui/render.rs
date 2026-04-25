@@ -16,7 +16,7 @@ use ratatui::{
 
 use std::time::Instant;
 
-use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome, UiPhase};
+use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome, SentimentDir, UiPhase};
 use crate::bridge_deposit::SOLANA_MAINNET_USDC_MINT;
 use crate::market_profile::Timeframe;
 
@@ -211,7 +211,7 @@ fn balance_row_right_aligned<'a>(
 
 fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
     let dec = s.spot_usd_decimal_places();
-    let pair = s.spot_pair_label();
+    let pair = s.cached_pair_label.as_str();
     let price_cell = match s.spot_price {
         Some(p) => format!("${}", fmt_money_decimals(p, dec as u32)),
         None    => "—".to_string(),
@@ -229,45 +229,26 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
         _ => "—".into(),
     };
 
-    // Sentiment: prefer CLOB mid (live book) over top-holder sums — `/holders` can stay skewed
-    // to one side (whale positions) and misread as "mood" vs current order book.
-    const SENT_EPS: f64 = 1e-6;
-    let m_up = s.mark(Outcome::Up);
-    let m_down = s.mark(Outcome::Down);
-    let sentiment_spans: Vec<Span> = match (m_up, m_down) {
-        (Some(m_u), Some(m_d)) if m_u > m_d + SENT_EPS => vec![
+    let sentiment_spans: Vec<Span> = match s.cached_sentiment {
+        SentimentDir::Up => vec![
             Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
             Span::styled("▲", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         ],
-        (Some(m_u), Some(m_d)) if m_d > m_u + SENT_EPS => vec![
+        SentimentDir::Down => vec![
             Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
             Span::styled("▼", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         ],
-        (Some(_), Some(_)) => vec![
+        SentimentDir::Neutral => vec![
             Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("·", Style::default().fg(Color::DarkGray)),
+            Span::styled("·",  Style::default().fg(Color::DarkGray)),
         ],
-        _ => match (s.top_holders_up_sum, s.top_holders_down_sum) {
-            (Some(u), Some(d)) if u > d + SENT_EPS => vec![
-                Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
-                Span::styled("▲", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            ],
-            (Some(u), Some(d)) if d > u + SENT_EPS => vec![
-                Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
-                Span::styled("▼", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            ],
-            (Some(_), Some(_)) => vec![
-                Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
-                Span::styled("·", Style::default().fg(Color::DarkGray)),
-            ],
-            _ => vec![
-                Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
-                Span::styled("—", Style::default().fg(Color::DarkGray)),
-            ],
-        },
+        SentimentDir::Unknown => vec![
+            Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("—",  Style::default().fg(Color::DarkGray)),
+        ],
     };
 
-    let cd = s.countdown_secs()
+    let cd = s.cached_countdown_secs
         .map(|c| format!("{:02}:{:02}", c / 60, c % 60))
         .unwrap_or_else(|| "—".into());
 
@@ -293,7 +274,7 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
         Span::raw("   "),
         Span::styled(
             format!("Closes in {cd}"),
-            Style::default().fg(match s.countdown_secs() {
+            Style::default().fg(match s.cached_countdown_secs {
                 Some(c) if c < 30  => Color::Red,
                 Some(c) if c < 120 => Color::Yellow,
                 _                  => Color::Green,

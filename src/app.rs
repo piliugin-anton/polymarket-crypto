@@ -308,6 +308,15 @@ pub enum UiPhase {
     Trading,
 }
 
+/// Pre-computed sentiment direction for the header — updated in `apply()`, read by `draw()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SentimentDir {
+    Up,
+    Down,
+    Neutral,
+    Unknown,
+}
+
 /// Mid price from a CLOB book snapshot (best bid / best ask average).
 #[inline]
 pub fn book_mid(b: &BookSnapshot) -> Option<f64> {
@@ -426,6 +435,13 @@ pub struct AppState {
     pub top_holders_up_sum:   Option<f64>,
     pub top_holders_down_sum: Option<f64>,
 
+    /// Pre-computed from CLOB mid + top-holder sums; updated on Book and TopHoldersSentiment events.
+    pub cached_sentiment: SentimentDir,
+    /// Updated once per second in the Tick handler; avoids `Utc::now()` in the draw path.
+    pub cached_countdown_secs: Option<i64>,
+    /// `”{asset}/USD”` label, set once on StartTrading.
+    pub cached_pair_label: String,
+
     /// Deduplication between `OrderAck` and user-channel `trade` (see `feeds::user_trade_sync`).
     pub user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>,
 
@@ -478,6 +494,9 @@ impl AppState {
             deposit_modal: None,
             top_holders_up_sum: None,
             top_holders_down_sum: None,
+            cached_sentiment: SentimentDir::Unknown,
+            cached_countdown_secs: None,
+            cached_pair_label: "\u{2014}/USD".to_string(), // "—/USD"
             user_trade_sync,
             trailing: HashMap::new(),
             pending_trail_arms: HashMap::new(),
@@ -881,6 +900,23 @@ impl AppState {
     /// Reserved for PnL on non-UI legs; inventory is tracked via [`Self::bump_trailing_tracked_shares`].
     fn apply_background_trailing_fill(&mut self, _token_id: &str, _side: Side, _qty: f64) {}
 
+    fn recompute_sentiment(&mut self) {
+        const SENT_EPS: f64 = 1e-6;
+        let m_up   = self.mark(Outcome::Up);
+        let m_down = self.mark(Outcome::Down);
+        self.cached_sentiment = match (m_up, m_down) {
+            (Some(u), Some(d)) if u > d + SENT_EPS => SentimentDir::Up,
+            (Some(u), Some(d)) if d > u + SENT_EPS => SentimentDir::Down,
+            (Some(_), Some(_))                      => SentimentDir::Neutral,
+            _ => match (self.top_holders_up_sum, self.top_holders_down_sum) {
+                (Some(u), Some(d)) if u > d + SENT_EPS => SentimentDir::Up,
+                (Some(u), Some(d)) if d > u + SENT_EPS => SentimentDir::Down,
+                (Some(_), Some(_))                      => SentimentDir::Neutral,
+                _                                       => SentimentDir::Unknown,
+            },
+        };
+    }
+
     // ── Mutations ───────────────────────────────────────────────────
     pub async fn apply(&mut self, ev: AppEvent) {
         let mut book_watch_cached = false;
@@ -893,6 +929,9 @@ impl AppState {
                 {
                     self.order_error_toast = None;
                 }
+                self.cached_countdown_secs = self.market
+                    .as_ref()
+                    .map(|m| (m.closes_at - Utc::now()).num_seconds().max(0));
             }
             AppEvent::Price(p) => {
                 self.spot_price    = Some(p.price);
@@ -932,6 +971,7 @@ impl AppState {
                 if let Some(mid) = self.mid_for_token(id_for_trail.as_str()) {
                     self.apply_trailing_book_tick(id_for_trail.as_str(), mid);
                 }
+                self.recompute_sentiment();
             }
             AppEvent::MarketRoll(m) => {
                 // Close any positions from the previous market — they'll resolve
@@ -953,6 +993,8 @@ impl AppState {
                 self.top_holders_up_sum = None;
                 self.top_holders_down_sum = None;
                 self.watched_books.clear();
+                self.cached_sentiment = SentimentDir::Unknown;
+                self.cached_countdown_secs = None;
             }
             AppEvent::PriceToBeatRefresh { slug, price_to_beat } => {
                 if let Some(m) = &mut self.market {
@@ -1012,6 +1054,7 @@ impl AppState {
             AppEvent::TopHoldersSentiment { up_sum, down_sum } => {
                 self.top_holders_up_sum = Some(up_sum);
                 self.top_holders_down_sum = Some(down_sum);
+                self.recompute_sentiment();
             }
             AppEvent::UserChannelFill {
                 clob_trade_id,
@@ -1253,6 +1296,9 @@ impl AppState {
                 self.market_profile = Some(p.clone());
                 self.ui_phase = UiPhase::Trading;
                 self.status_line = "Waiting for market data…".into();
+                self.cached_pair_label = format!("{}/USD", p.asset.label);
+                self.cached_sentiment = SentimentDir::Unknown;
+                self.cached_countdown_secs = None;
             }
             AppEvent::TrailingExitDispatchDone {
                 token_id,
