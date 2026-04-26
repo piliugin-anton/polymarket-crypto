@@ -7,10 +7,10 @@
 //! the JSON string bytes and calls `fast_float::parse` (≈ 3 × faster than `str::parse`).
 //! No intermediate `String` is ever allocated for numeric fields.
 //!
-//! **Borrowed asset IDs** — `#[serde(borrow)]` lets serde_json hand out `&'de str` slices
-//! that point into the original frame buffer for the `asset_id` field.  The token IDs sent
-//! by the CLOB WS are plain ASCII decimal strings (no JSON escape sequences), so this is
-//! always zero-copy.
+//! **SIMD JSON parsing** — `sonic_rs::from_str` (AVX2/SSE4.2) replaces `serde_json` on the
+//! hot receive loop.  sonic-rs tokenises JSON 2–4 × faster than serde_json on x86_64 by
+//! using SIMD to scan for structural characters.  All existing serde attributes and custom
+//! visitors are fully compatible; no derive changes needed.
 //!
 //! **`BookSide` = sorted `Vec<(i64, f64)>`** — replaces `BTreeMap<i64, f64>`.  Same O(log n)
 //! updates via `binary_search`; sequential memory layout means snapshot reads scan a single
@@ -305,8 +305,19 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
 
     info!(url = %CLOB_WS_URL, n = token_ids.len(), "CLOB WS connected");
 
-    let sub = serde_json::json!({ "type": "market", "assets_ids": token_ids });
-    ws.send(Message::Text(sub.to_string().into())).await?;
+    // Build subscription JSON manually — token IDs are all-decimal, no escaping needed.
+    let mut sub = String::with_capacity(
+        32 + token_ids.iter().map(|id| id.len() + 3).sum::<usize>(),
+    );
+    sub.push_str(r#"{"type":"market","assets_ids":["#);
+    for (j, id) in token_ids.iter().enumerate() {
+        if j > 0 { sub.push(','); }
+        sub.push('"');
+        sub.push_str(id);
+        sub.push('"');
+    }
+    sub.push_str("]}");
+    ws.send(Message::Text(sub.into())).await?;
     for (i, id) in token_ids.iter().enumerate() {
         let prefix: String = id.chars().take(12).collect();
         info!(i, token_id_prefix = %prefix, "CLOB WS subscribe token");
@@ -376,7 +387,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
 
                 // Dispatch on first non-whitespace byte (cheap heuristic).
                 if t.trim_start().starts_with('[') {
-                    match serde_json::from_str::<Vec<RawEvent>>(t) {
+                    match sonic_rs::from_str::<Vec<RawEvent>>(t) {
                         Ok(events) => {
                             for ev in events {
                                 if let Some(i) = apply_event(&mut db, ev) {
@@ -387,7 +398,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                         Err(_) => { warn_unparsed_clob(t); continue; }
                     }
                 } else if t.contains("price_changes") && t.trim_start().starts_with('{') {
-                    match serde_json::from_str::<MarketPriceChangesMsg>(t) {
+                    match sonic_rs::from_str::<MarketPriceChangesMsg>(t) {
                         Ok(msg) => {
                             for ch in msg.price_changes {
                                 let cid = ensure_canonical(&ch.asset_id);
@@ -401,7 +412,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                         Err(_) => { warn_unparsed_clob(t); continue; }
                     }
                 } else {
-                    match serde_json::from_str::<RawEvent>(t) {
+                    match sonic_rs::from_str::<RawEvent>(t) {
                         Ok(ev) => {
                             if let Some(i) = apply_event(&mut db, ev) {
                                 touched.set(i);
