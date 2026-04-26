@@ -797,8 +797,38 @@ async fn run_take_profit_consolidate_after_buy(
 
     let resp_result = trading.place_order(args, OrderType::Gtd).await;
 
-    // Release the lock before post-placement I/O so the next consolidation
-    // sees a fully committed resting SELL when it reads the WS ledger.
+    // Compute ok_ui and, if the order went live, optimistically insert it into the
+    // WS ledger *before* releasing the lock.  A concurrent consolidation that acquires
+    // the lock next will then see this resting SELL in snapshot_clob_orders() without
+    // having to wait for the async WS order event.
+    let ok_ui = if let Ok(ref resp) = resp_result {
+        let live = resp.success
+            || resp.status.as_ref().is_some_and(|s| {
+                s.eq_ignore_ascii_case("matched")
+                    || s.eq_ignore_ascii_case("delayed")
+                    || s.eq_ignore_ascii_case("live")
+                    || s.eq_ignore_ascii_case("open")
+            });
+        if live {
+            if let Some(oid) = resp.order_id.as_deref().filter(|s| !s.is_empty()) {
+                user_open_ledger
+                    .insert_resting_order(ClobOpenOrder {
+                        id:            oid.to_string(),
+                        asset_id:      tid.clone(),
+                        side:          "SELL".to_string(),
+                        price:         format!("{tp_px}"),
+                        original_size: format!("{want_raw}"),
+                        size_matched:  "0".to_string(),
+                    })
+                    .await;
+            }
+        }
+        live
+    } else {
+        false
+    };
+
+    // Lock held through POST + optimistic insert — release before post-placement I/O.
     drop(tp_op);
 
     match resp_result {
@@ -816,13 +846,6 @@ async fn run_take_profit_consolidate_after_buy(
                 error_msg = ?resp.error,
                 "CLOB take-profit GTD (limit sell) order response",
             );
-            let ok_ui = resp.success
-                || resp.status.as_ref().is_some_and(|s| {
-                    s.eq_ignore_ascii_case("matched")
-                        || s.eq_ignore_ascii_case("delayed")
-                        || s.eq_ignore_ascii_case("live")
-                        || s.eq_ignore_ascii_case("open")
-                });
             if ok_ui {
                 let ack = resp.fill_for_position_ack(Side::Sell, want_raw, tp_px, OrderType::Gtd);
                 if let Some((ack_qty, ack_price)) = ack {
@@ -2190,9 +2213,50 @@ fn spawn_order(
                                 ))
                                 .await;
                         }
+                        // Refine fill size from WS trade event (mirrors trailing arm path).
+                        // Registration races the incoming event; falls back to REST estimate on timeout.
+                        let buy_ack_qty = if let Some(oid) = resp.order_id.as_deref() {
+                            match tokio::time::timeout(
+                                USER_WS_TP_FILL_WAIT,
+                                cli.wait_user_channel_buy_fill(oid),
+                            )
+                            .await
+                            {
+                                Ok(Ok(ws_fill))
+                                    if ws_fill.size_shares.is_finite()
+                                        && ws_fill.size_shares > 1e-9 =>
+                                {
+                                    debug!(
+                                        shares = ws_fill.size_shares,
+                                        order_id = %oid,
+                                        "take-profit: buy fill size from user WS trade"
+                                    );
+                                    ws_fill.size_shares
+                                }
+                                Ok(Err(e)) => {
+                                    debug!(
+                                        error = %e,
+                                        order_id = %oid,
+                                        "take-profit: user WS fill not delivered (using REST estimate)"
+                                    );
+                                    buy_ack_qty
+                                }
+                                Err(_) => {
+                                    debug!(
+                                        order_id = %oid,
+                                        "take-profit: user WS fill wait timed out (using REST estimate)"
+                                    );
+                                    buy_ack_qty
+                                }
+                                _ => buy_ack_qty,
+                            }
+                        } else {
+                            buy_ack_qty
+                        };
                         info!(
                             take_profit_bps,
                             outcome = ?outcome,
+                            buy_ack_qty,
                             "take-profit: scheduling consolidate (open SELL on same outcome + merged position)",
                         );
                         let _ = tx

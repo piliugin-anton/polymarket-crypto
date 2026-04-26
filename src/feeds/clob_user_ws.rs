@@ -134,6 +134,17 @@ impl UserOpenOrdersLedger {
         ))
     }
 
+    /// Optimistically record a just-placed resting order before the WS `order` event arrives.
+    /// The real WS event will overwrite this entry with identical data; cancels remove it normally.
+    pub async fn insert_resting_order(&self, order: ClobOpenOrder) {
+        let k = norm_order_id_key(&order.id);
+        if k.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().await;
+        g.by_id.insert(k, order);
+    }
+
     /// Apply CLOB `order` events; returns new UI rows if anything changed.
     async fn apply_order_values(&self, values: &[Value]) -> Option<Vec<OpenOrderRow>> {
         let mut changed = false;
