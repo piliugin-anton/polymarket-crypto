@@ -197,32 +197,62 @@ async fn apply_app_event(
             false
         }
         e => {
-            if let AppEvent::StartTrading(p) = &e {
-                let _ = rtds_sym_tx.send(p.asset.rtds_symbol.to_string());
-                let _ = market_profile_tx.send(p.clone());
-                if !*discovery_spawned {
-                    if let Some(rx) = market_profile_rx_slot.take() {
-                        *discovery_spawned = true;
-                        let txi = tx.clone();
-                        let mtx = market_tx.clone();
-                        tokio::spawn(async move {
-                            feeds::market_discovery_gamma::spawn(txi, mtx, rx);
-                        });
-                    } else {
-                        warn!("market discovery: profile receiver missing — cannot spawn Gamma poll");
+            match e {
+                AppEvent::RunTakeProfitAfterMarketBuy {
+                    market,
+                    outcome,
+                    take_profit_bps,
+                } => {
+                    let pos = match outcome {
+                        Outcome::Up => state.position_up.clone(),
+                        Outcome::Down => state.position_down.clone(),
+                    };
+                    let trading2 = Arc::clone(trading);
+                    let ledger2 = user_open_ledger.clone();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        run_take_profit_consolidate_after_buy(
+                            trading2,
+                            ledger2,
+                            tx2,
+                            market,
+                            outcome,
+                            take_profit_bps,
+                            pos.shares,
+                            pos.avg_entry,
+                        )
+                        .await;
+                    });
+                }
+                ev => {
+                    if let AppEvent::StartTrading(p) = &ev {
+                        let _ = rtds_sym_tx.send(p.asset.rtds_symbol.to_string());
+                        let _ = market_profile_tx.send(p.clone());
+                        if !*discovery_spawned {
+                            if let Some(rx) = market_profile_rx_slot.take() {
+                                *discovery_spawned = true;
+                                let txi = tx.clone();
+                                let mtx = market_tx.clone();
+                                tokio::spawn(async move {
+                                    feeds::market_discovery_gamma::spawn(txi, mtx, rx);
+                                });
+                            } else {
+                                warn!("market discovery: profile receiver missing — cannot spawn Gamma poll");
+                            }
+                        }
                     }
+                    state.apply(ev).await;
+                    try_dispatch_trailing_sell(
+                        state,
+                        trading,
+                        tx,
+                        user_open_ledger,
+                        cfg,
+                    );
+                    send_user_bundle_if_changed(state, user_bundle_tx);
+                    send_book_watch_if_changed(state, book_token_tx);
                 }
             }
-            state.apply(e).await;
-            try_dispatch_trailing_sell(
-                state,
-                trading,
-                tx,
-                user_open_ledger,
-                cfg,
-            );
-            send_user_bundle_if_changed(state, user_bundle_tx);
-            send_book_watch_if_changed(state, book_token_tx);
             false
         }
     }
@@ -445,6 +475,199 @@ async fn run_trailing_exit_fak_sell(
             }
         }
     }
+}
+
+/// After a market BUY (FAK) with fixed take-profit: optionally cancel resting SELL on the same
+/// outcome, then place one GTD take-profit sized to the merged position (VWAP from UI state).
+async fn run_take_profit_consolidate_after_buy(
+    trading:          Arc<TradingClient>,
+    user_open_ledger: Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
+    tx:               mpsc::Sender<AppEvent>,
+    market:           gamma::ActiveMarket,
+    outcome:          Outcome,
+    take_profit_bps:  u32,
+    position_shares:  f64,
+    position_avg_entry: f64,
+) {
+    let tid = match outcome {
+        Outcome::Up => market.up_token_id.clone(),
+        Outcome::Down => market.down_token_id.clone(),
+    };
+    let cond = market.condition_id.clone();
+
+    let orders = match trading.fetch_open_orders_for_market(&cond).await {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, "take-profit consolidate: fetch open orders failed");
+            let _ = tx
+                .send(AppEvent::OrderErrModal(format!("take-profit: open orders: {e:#}")))
+                .await;
+            return;
+        }
+    };
+
+    let sell_same_outcome: Vec<_> = orders
+        .iter()
+        .filter(|o| {
+            trading::parse_clob_side_str(&o.side) == Some(Side::Sell)
+                && clob_asset_ids_match(&o.asset_id, tid.as_str())
+        })
+        .collect();
+
+    let had_resting_sells = !sell_same_outcome.is_empty();
+    let n_resting_sells = sell_same_outcome.len();
+
+    if !had_resting_sells && position_shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+        info!(
+            outcome = ?outcome,
+            position_shares,
+            min = MIN_LIMIT_ORDER_SHARES,
+            "take-profit: skipped — position below min and no resting SELL on this outcome",
+        );
+        let _ = tx
+            .send(AppEvent::StatusInfo(format!(
+                "take-profit skipped: {} position {:.2} sh < min {:.0} sh",
+                outcome.as_str(),
+                position_shares,
+                MIN_LIMIT_ORDER_SHARES
+            )))
+            .await;
+        return;
+    }
+
+    for o in sell_same_outcome {
+        if let Err(e) = trading.cancel_order(&o.id).await {
+            warn!(order_id = %o.id, error = %e, "take-profit consolidate: cancel resting SELL failed");
+            let _ = tx
+                .send(AppEvent::OrderErrModal(format!("take-profit: cancel {e:#}")))
+                .await;
+            return;
+        }
+        debug!(order_id = %o.id, "take-profit consolidate: canceled resting SELL");
+    }
+
+    if had_resting_sells {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        if let Err(e) = trading.refresh_conditional_balance_allowance_cache(&tid).await {
+            debug!(
+                error = %e,
+                token_id = %tid,
+                "take-profit consolidate: post-cancel balance refresh failed"
+            );
+        }
+    }
+
+    let mut bal = match trading.fetch_conditional_balance_shares(&tid).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "take-profit consolidate: balance read failed");
+            let _ = tx
+                .send(AppEvent::OrderErrModal(format!("take-profit: balance: {e:#}")))
+                .await;
+            return;
+        }
+    };
+
+    if bal + 1e-9 < MIN_LIMIT_ORDER_SHARES && had_resting_sells {
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let _ = trading.refresh_conditional_balance_allowance_cache(&tid).await;
+        if let Ok(b2) = trading.fetch_conditional_balance_shares(&tid).await {
+            bal = b2;
+        }
+    }
+
+    let want_raw = if position_shares.is_finite() && bal.is_finite() {
+        position_shares.min(bal).max(0.0)
+    } else {
+        0.0
+    };
+
+    if want_raw + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+        info!(
+            want_raw,
+            bal,
+            position_shares,
+            outcome = ?outcome,
+            "take-profit: skipped — spendable size below min after consolidate",
+        );
+        let _ = tx
+            .send(AppEvent::StatusInfo(format!(
+                "take-profit skipped: spendable {want_raw:.2} sh < min {:.0} sh",
+                MIN_LIMIT_ORDER_SHARES
+            )))
+            .await;
+        spawn_open_orders_refresh(
+            trading.clone(),
+            tx.clone(),
+            market.clone(),
+            user_open_ledger.clone(),
+        );
+        return;
+    }
+
+    if !position_avg_entry.is_finite() || position_avg_entry <= 0.0 {
+        warn!(
+            outcome = ?outcome,
+            position_avg_entry,
+            "take-profit consolidate: invalid avg entry"
+        );
+        let _ = tx
+            .send(AppEvent::StatusInfo("take-profit skipped: invalid avg entry".into()))
+            .await;
+        return;
+    }
+
+    let tp_px = clamp_prob(take_profit_limit_price_crypto_after_fees(
+        position_avg_entry,
+        take_profit_bps,
+    ));
+    if tp_px >= 0.99 {
+        info!(
+            limit_price = tp_px,
+            outcome = ?outcome,
+            "take-profit: skipped — limit price >= 0.99",
+        );
+        return;
+    }
+
+    let exp_secs = match gamma::clob_gtd_expiration_secs_one_s_before_window_end(market.closes_at) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "take-profit consolidate: GTD expiration failed");
+            let _ = tx
+                .send(AppEvent::OrderErrModal(format!("take-profit limit: {e}")))
+                .await;
+            return;
+        }
+    };
+
+    info!(
+        outcome = ?outcome,
+        want_shares = want_raw,
+        position_shares,
+        cond_bal = bal,
+        entry = position_avg_entry,
+        tp_limit_px = tp_px,
+        canceled_resting_sells = n_resting_sells,
+        "take-profit: placing consolidated GTD limit SELL",
+    );
+
+    spawn_order(
+        trading,
+        user_open_ledger,
+        tx,
+        market,
+        outcome,
+        Side::Sell,
+        want_raw,
+        tp_px,
+        OrderType::Gtd,
+        None,
+        exp_secs,
+        0,
+        0,
+        true,
+    );
 }
 
 use tracing::{debug, error, info, warn};
@@ -1707,7 +1930,7 @@ fn spawn_order(
                             outcome = ?outcome,
                             "take-profit: market BUY succeeded; evaluating GTD limit sell",
                         );
-                        let Some((sell_shares, entry_px, amounts_from_api)) =
+                        let Some((_, _, amounts_from_api)) =
                             resp.take_profit_fill_for_market_buy(shares, price)
                         else {
                             info!(
@@ -1734,101 +1957,18 @@ fn spawn_order(
                                 ))
                                 .await;
                         }
-                        // Limit SELL: same downstream as manual limit — `place_order` snaps to
-                        // `orderPriceMinTickSize` and builds amounts (maker/taker micros on tick).
-                        let tp_px = clamp_prob(
-                            take_profit_limit_price_crypto_after_fees(
-                                entry_px,
-                                take_profit_bps,
-                            ),
+                        info!(
+                            take_profit_bps,
+                            outcome = ?outcome,
+                            "take-profit: scheduling consolidate (open SELL on same outcome + merged position)",
                         );
-                        if sell_shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
-                            info!(
-                                sell_shares,
-                                min_shares = MIN_LIMIT_ORDER_SHARES,
-                                "take-profit: skipped — fill below min limit order size",
-                            );
-                            let _ = tx
-                                .send(AppEvent::StatusInfo(format!(
-                                    "take-profit skipped: fill {sell_shares:.2} sh < min {:.0} sh",
-                                    MIN_LIMIT_ORDER_SHARES
-                                )))
-                                .await;
-                        } else {
-                            let exp_secs = match gamma::clob_gtd_expiration_secs_one_s_before_window_end(
-                                market_for_refresh.closes_at,
-                            ) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    warn!(error = %e, "take-profit: skipped — GTD expiration computation failed");
-                                    let _ = tx
-                                        .send(AppEvent::OrderErrModal(format!("take-profit limit: {e}")))
-                                        .await;
-                                    return;
-                                }
-                            };
-                            let mut tp_sell_shares = sell_shares;
-                            if let Some(oid) = resp.order_id.as_deref() {
-                                match tokio::time::timeout(
-                                    USER_WS_TP_FILL_WAIT,
-                                    cli.wait_user_channel_buy_fill(oid),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(ws_fill)) => {
-                                        if ws_fill.size_shares.is_finite()
-                                            && ws_fill.size_shares > 1e-9
-                                        {
-                                            tp_sell_shares = ws_fill.size_shares;
-                                            debug!(
-                                                shares = ws_fill.size_shares,
-                                                status = %ws_fill.status,
-                                                asset_id = %ws_fill.asset_id,
-                                                order_id = %oid,
-                                                "take-profit: size from CLOB user WS trade"
-                                            );
-                                        }
-                                    }
-                                    Ok(Err(e)) => {
-                                        debug!(
-                                            error = %e,
-                                            order_id = %oid,
-                                            "take-profit: user WS did not deliver fill (using REST estimate)"
-                                        );
-                                    }
-                                    Err(_) => {
-                                        debug!(
-                                            order_id = %oid,
-                                            "take-profit: user WS fill wait timed out (using REST estimate)"
-                                        );
-                                    }
-                                }
-                            }
-                            info!(
-                                tp_sell_shares,
-                                entry_px,
-                                tp_limit_px = tp_px,
-                                gtd_expiration_unix_secs = exp_secs,
-                                outcome = ?outcome,
-                                "take-profit: scheduling GTD limit SELL (POST /order; retries if balance lags)",
-                            );
-                            spawn_order(
-                                trading.clone(),
-                                user_open_ledger.clone(),
-                                tx.clone(),
-                                market_for_refresh.clone(),
+                        let _ = tx
+                            .send(AppEvent::RunTakeProfitAfterMarketBuy {
+                                market: market_for_refresh.clone(),
                                 outcome,
-                                Side::Sell,
-                                tp_sell_shares,
-                                tp_px,
-                                OrderType::Gtd,
-                                None,
-                                exp_secs,
-                                0,
-                                0,
-                                true,
-                            );
-                        }
+                                take_profit_bps,
+                            })
+                            .await;
                     }
 
                     if trail_bps > 0

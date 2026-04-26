@@ -145,6 +145,13 @@ pub enum AppEvent {
     SeriesListReady(std::result::Result<Vec<SeriesRow>, String>),
     /// Wizard complete — start RTDS + Gamma discovery (main spawns tasks; `apply` updates state).
     StartTrading(std::sync::Arc<MarketProfile>),
+    /// After a market **Buy** (FAK) with `MARKET_BUY_TAKE_PROFIT_BPS > 0` and `MARKET_BUY_TRAIL_BPS == 0`:
+    /// consolidate take-profit vs open SELL legs and current position (handled in `main::apply_app_event`).
+    RunTakeProfitAfterMarketBuy {
+        market:            crate::gamma::ActiveMarket,
+        outcome:         Outcome,
+        take_profit_bps: u32,
+    },
     /// After a market **Buy** (FAK) when `MARKET_BUY_TRAIL_BPS` is set: register until CLOB **mid**
     /// is at or above **gross** take-profit move from position entry (`MARKET_BUY_TAKE_PROFIT_BPS`).
     RequestTrailingArm {
@@ -1334,6 +1341,9 @@ impl AppState {
                 self.cached_pair_label = format!("{}/USD", p.asset.label);
                 self.cached_sentiment = SentimentDir::Unknown;
                 self.cached_countdown_secs = None;
+            }
+            AppEvent::RunTakeProfitAfterMarketBuy { .. } => {
+                // Dispatched from `main::apply_app_event` (needs `TradingClient`); no UI state change here.
             }
             AppEvent::TrailingExitDispatchDone {
                 token_id,

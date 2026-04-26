@@ -1893,6 +1893,60 @@ impl TradingClient {
         }
         Ok(())
     }
+
+    /// Cancel one resting order by CLOB `orderID` (see Polymarket `DELETE /order`).
+    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        let oid = order_id.trim();
+        if oid.is_empty() {
+            return Err(anyhow!("cancel_order: empty order id"));
+        }
+        let creds = self.ensure_creds().await?;
+        let ts = chrono::Utc::now().timestamp();
+        let path = "/order";
+        let body = serde_json::json!({ "orderID": oid }).to_string();
+        let l2_sig = l2_hmac(&creds.secret, ts, "DELETE", path, &body)?;
+        let resp = self.http
+            .delete(format!("{CLOB_HOST}{path}"))
+            .header("POLY_ADDRESS",     format!("{:#x}", self.signer.address()))
+            .header("POLY_API_KEY",     &creds.api_key)
+            .header("POLY_PASSPHRASE",  &creds.passphrase)
+            .header("POLY_TIMESTAMP",   ts.to_string())
+            .header("POLY_SIGNATURE",   l2_sig)
+            .header("Content-Type",     "application/json")
+            .body(body.clone())
+            .send()
+            .await?;
+        let status = resp.status();
+        let txt = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let detail = extract_clob_error_text(&txt)
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(anyhow!("cancel_order: {detail}"));
+        }
+        #[derive(Debug, Deserialize)]
+        struct CancelOrdersResponse {
+            canceled: Vec<String>,
+            #[serde(default)]
+            not_canceled: std::collections::HashMap<String, String>,
+        }
+        let parsed: CancelOrdersResponse = serde_json::from_str(&txt)
+            .with_context(|| format!("decode cancel_order response: {}", snip(&txt)))?;
+        if let Some((_, err)) = parsed
+            .not_canceled
+            .iter()
+            .find(|(k, _)| norm_order_id_key(k) == norm_order_id_key(oid))
+        {
+            return Err(anyhow!("cancel_order: not canceled {oid}: {err}"));
+        }
+        if !parsed.canceled.iter().any(|c| norm_order_id_key(c) == norm_order_id_key(oid)) {
+            debug!(
+                order_id = %oid,
+                response = %snip(&txt),
+                "cancel_order: HTTP 200 but order id not listed in canceled (treating as ok)"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Limit price as **integer** micros (`human * 1e6`), always an exact multiple of the tick in micros.
