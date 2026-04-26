@@ -1665,9 +1665,16 @@ pub fn hydrate_positions_from_trades(
         } else {
             Outcome::Down
         };
-        let Some(side) = parse_clob_side(&t.side) else {
+        // "side" in Polymarket REST is the TAKER's side; flip for maker fills.
+        let Some(taker_side) = parse_clob_side(&t.side) else {
             debug!(id = %t.id, side = %t.side, "skip trade with unknown side");
             continue;
+        };
+        let role = t.trader_side.as_deref().map(|s| s.trim().to_ascii_uppercase());
+        let side = if matches!(role.as_deref(), Some("MAKER")) {
+            match taker_side { Side::Buy => Side::Sell, Side::Sell => Side::Buy }
+        } else {
+            taker_side
         };
         let Ok(qty) = t.size.parse::<f64>() else {
             debug!(id = %t.id, "skip trade with bad size");

@@ -348,7 +348,6 @@ pub struct ClobTrade {
     pub maker_orders: Vec<ClobMakerOrder>,
     /// `"TAKER"` | `"MAKER"` — disambiguates which leg to use with `order_id`.
     #[serde(default, rename = "trader_side", alias = "traderSide")]
-    #[allow(dead_code)]
     pub trader_side: Option<String>,
 }
 
@@ -510,7 +509,9 @@ pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannel
     if asset_id.is_empty() {
         return None;
     }
-    let side = parse_clob_side_str(v.get("side").and_then(|s| s.as_str())?)?;
+    // "side" in Polymarket trade events is the TAKER's side (the aggressor). When the
+    // authenticated user is the maker, their actual side is the opposite.
+    let taker_side = parse_clob_side_str(v.get("side").and_then(|s| s.as_str())?)?;
     let price: f64 = v.get("price").and_then(|s| s.as_str())?.parse().ok()?;
     if !price.is_finite() || price <= 0.0 {
         return None;
@@ -526,7 +527,13 @@ pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannel
         .and_then(|s| s.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let (order_leg_id, qty) = if matches!(trader_side.as_deref(), Some("MAKER") | Some("M")) {
+    let is_maker = matches!(trader_side.as_deref(), Some("MAKER") | Some("M"));
+    let side = if is_maker {
+        match taker_side { Side::Buy => Side::Sell, Side::Sell => Side::Buy }
+    } else {
+        taker_side
+    };
+    let (order_leg_id, qty) = if is_maker {
         let arr = v.get("maker_orders").or_else(|| v.get("makerOrders"))?.as_array()?;
         let m0 = arr.first()?;
         let oid = m0
