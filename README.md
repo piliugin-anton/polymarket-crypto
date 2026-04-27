@@ -4,7 +4,7 @@ A terminal trading interface for Polymarket's rolling **Up or Down** crypto pred
 
 ---
 
-> **Educational project — use at your own risk.**
+> ⚠️ **Educational project — use at your own risk.**
 > This software is developed for learning purposes. It interacts with real money on a live prediction market. There is no warranty of any kind. You are solely responsible for any funds lost due to bugs, misconfiguration, or unexpected market behavior. Start with very small amounts and verify every action before trusting it with real funds.
 
 ---
