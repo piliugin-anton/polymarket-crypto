@@ -869,6 +869,8 @@ const FEE_RATE_CACHE_TTL: Duration = Duration::from_secs(600);
 
 struct TradingState {
     creds: Option<ApiCreds>,
+    /// Decoded bytes of `creds.secret` — cached once so `post_order_http` skips base64 decode.
+    hmac_key: Option<Vec<u8>>,
     /// Cached `GET /version` → `version` field (1 or 2).
     cached_clob_order_version: Option<u32>,
     /// `(base_fee_bps, fetched_at)` per outcome token id.
@@ -898,6 +900,7 @@ impl TradingClient {
             config,
             state: RwLock::new(TradingState {
                 creds: None,
+                hmac_key: None,
                 cached_clob_order_version: None,
                 fee_rate_cache: HashMap::new(),
             }),
@@ -1003,6 +1006,7 @@ impl TradingClient {
                 "derived existing CLOB API creds",
             );
             let mut state = self.state.write().await;
+            state.hmac_key = decode_hmac_key(&creds.secret).ok();
             state.creds = Some(creds.clone());
             return Ok(creds);
         }
@@ -1025,6 +1029,7 @@ impl TradingClient {
                 "created new CLOB API creds",
             );
             let mut state = self.state.write().await;
+            state.hmac_key = decode_hmac_key(&creds.secret).ok();
             state.creds = Some(creds.clone());
             return Ok(creds);
         }
@@ -1830,7 +1835,11 @@ impl TradingClient {
     ) -> Result<PostOrderResponse> {
         let ts = chrono::Utc::now().timestamp();
         let path = "/order";
-        let l2_sig = l2_hmac(&creds.secret, ts, "POST", path, &body)?;
+        // Use pre-decoded key bytes when available to skip base64 decode on the hot path.
+        let l2_sig = match self.state.try_read().ok().and_then(|g| g.hmac_key.clone()) {
+            Some(key) => l2_hmac_bytes(&key, ts, "POST", path, &body)?,
+            None      => l2_hmac(&creds.secret, ts, "POST", path, &body)?,
+        };
 
         let resp = self.http
             .post(format!("{CLOB_HOST}{path}"))
@@ -2290,22 +2299,30 @@ fn amounts_for(
     }
 }
 
-/// L2 HMAC-SHA256 signature. Matches Polymarket's reference:
-/// `base64url( HMAC_SHA256(base64_decode(secret), ts+method+path+body) )`.
-fn l2_hmac(secret_b64: &str, ts: i64, method: &str, path: &str, body: &str) -> Result<String> {
+fn decode_hmac_key(secret_b64: &str) -> Result<Vec<u8>> {
     // Polymarket's secrets are base64 url-safe, sometimes without padding.
-    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(secret_b64)
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(secret_b64))
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(secret_b64))
-        .context("decoding L2 secret")?;
-    let mut mac = <Hmac<Sha256>>::new_from_slice(&key).map_err(|e| anyhow!("hmac key: {e}"))?;
+        .context("decoding L2 secret")
+}
+
+fn l2_hmac_bytes(key: &[u8], ts: i64, method: &str, path: &str, body: &str) -> Result<String> {
+    let mut mac = <Hmac<Sha256>>::new_from_slice(key).map_err(|e| anyhow!("hmac key: {e}"))?;
     mac.update(ts.to_string().as_bytes());
     mac.update(method.as_bytes());
     mac.update(path.as_bytes());
     mac.update(body.as_bytes());
     let sig = mac.finalize().into_bytes();
     Ok(base64::engine::general_purpose::URL_SAFE.encode(sig))
+}
+
+/// L2 HMAC-SHA256 signature. Matches Polymarket's reference:
+/// `base64url( HMAC_SHA256(base64_decode(secret), ts+method+path+body) )`.
+fn l2_hmac(secret_b64: &str, ts: i64, method: &str, path: &str, body: &str) -> Result<String> {
+    let key = decode_hmac_key(secret_b64)?;
+    l2_hmac_bytes(&key, ts, method, path, body)
 }
 
 /// Intermediate values produced during L1 auth signing — useful for diagnostics.

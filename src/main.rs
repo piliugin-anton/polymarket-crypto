@@ -361,15 +361,6 @@ fn try_dispatch_trailing_sell(
         let trading2 = trading.clone();
         let ledger2 = user_open_ledger.clone();
         let tx2 = tx.clone();
-        info!(
-            outcome = ?exit.outcome,
-            sell_shares = shares,
-            price,
-            attempts = TRAILING_EXIT_FAK_ATTEMPTS,
-            in_flight = state.trailing_sell_in_flight.len(),
-            "trailing: FAK SELL (await place_order, up to {n} attempts)",
-            n = TRAILING_EXIT_FAK_ATTEMPTS
-        );
         tokio::spawn(async move {
             run_trailing_exit_fak_sell(trading2, ledger2, tx2, exit, shares, price, otype).await;
         });
@@ -389,6 +380,14 @@ async fn run_trailing_exit_fak_sell(
     let market_for_refresh = exit.market.clone();
     let token_id = exit.token_id.clone();
     let outcome = exit.outcome;
+    info!(
+        outcome = ?outcome,
+        sell_shares = shares,
+        price,
+        attempts = TRAILING_EXIT_FAK_ATTEMPTS,
+        "trailing: FAK SELL (await place_order, up to {n} attempts)",
+        n = TRAILING_EXIT_FAK_ATTEMPTS,
+    );
     for attempt in 1u32..=TRAILING_EXIT_FAK_ATTEMPTS {
         let args = OrderArgs {
             token_id:        token_id.clone(),
