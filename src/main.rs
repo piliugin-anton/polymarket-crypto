@@ -73,9 +73,18 @@ use std::{
 /// after the terminal loses track of modifier/lock state (see `events::normalize_terminal_key_event`).
 static KEYBOARD_PROTOCOL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Serializes post-buy TP consolidate and user-WS-driven merge of multiple resting SELL on one outcome.
-static TP_RESTING_SELL_OP_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+/// Per-outcome locks for TP consolidate / merge — UP and DOWN ops no longer block each other.
+static TP_RESTING_SELL_OP_LOCK_UP: LazyLock<Arc<tokio::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+static TP_RESTING_SELL_OP_LOCK_DOWN: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
+fn tp_lock_for(outcome: Outcome) -> Arc<tokio::sync::Mutex<()>> {
+    match outcome {
+        Outcome::Up   => Arc::clone(&TP_RESTING_SELL_OP_LOCK_UP),
+        Outcome::Down => Arc::clone(&TP_RESTING_SELL_OP_LOCK_DOWN),
+    }
+}
 
 fn keyboard_protocol_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -90,7 +99,7 @@ const FEED_REDRAW_MIN: Duration = Duration::from_millis(50);
 
 /// After a market BUY, wait briefly for a **`trade`** on the CLOB user WebSocket so take-profit
 /// size matches the pushed fill (often arrives before REST trade history).
-const USER_WS_TP_FILL_WAIT: Duration = Duration::from_millis(80);
+const USER_WS_TP_FILL_WAIT: Duration = Duration::from_millis(40);
 
 /// Retries (no added sleep here; each attempt awaits the full `place_order` future).
 const TRAILING_EXIT_FAK_ATTEMPTS: u32 = 3;
@@ -593,7 +602,8 @@ async fn run_merge_resting_tp_sells_from_ws(
     take_profit_bps:    u32,
     position_avg_entry: f64,
 ) {
-    let _op = TP_RESTING_SELL_OP_LOCK.lock().await;
+    let _lock = tp_lock_for(outcome);
+    let _op = _lock.lock().await;
     if take_profit_bps == 0 {
         return;
     }
@@ -624,17 +634,28 @@ async fn run_merge_resting_tp_sells_from_ws(
         );
         return;
     }
-    for o in &sells {
-        if let Err(e) = trading.cancel_order(&o.id).await {
-            warn!(order_id = %o.id, error = %e, "merge TP SELL: cancel failed");
-            let _ = tx
-                .send(AppEvent::OrderErrModal(format!("merge take-profit: cancel {e:#}")))
-                .await;
-            return;
+    // Cancel all resting SELLs concurrently instead of serially.
+    let cancel_futs: Vec<_> = sells
+        .iter()
+        .map(|o| {
+            let t = Arc::clone(&trading);
+            let id = o.id.clone();
+            async move { t.cancel_order(&id).await.map_err(|e| (id, e)) }
+        })
+        .collect();
+    for res in futures_util::future::join_all(cancel_futs).await {
+        match res {
+            Ok(()) => debug!("merge TP SELL: canceled resting SELL"),
+            Err((order_id, e)) => {
+                warn!(order_id = %order_id, error = %e, "merge TP SELL: cancel failed");
+                let _ = tx
+                    .send(AppEvent::OrderErrModal(format!("merge take-profit: cancel {e:#}")))
+                    .await;
+                return;
+            }
         }
-        debug!(order_id = %o.id, "merge TP SELL: canceled resting SELL");
     }
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
 
     if !position_avg_entry.is_finite() || position_avg_entry <= 0.0 {
         return;
@@ -707,7 +728,8 @@ async fn run_take_profit_consolidate_after_buy(
     position_shares:  f64,
     position_avg_entry: f64,
 ) {
-    let tp_op = TP_RESTING_SELL_OP_LOCK.lock().await;
+    let _tp_lock = tp_lock_for(outcome);
+    let tp_op = _tp_lock.lock().await;
     let tid = match outcome {
         Outcome::Up => market.up_token_id.clone(),
         Outcome::Down => market.down_token_id.clone(),
@@ -749,20 +771,31 @@ async fn run_take_profit_consolidate_after_buy(
         return;
     }
 
-    for o in sell_same_outcome {
-        if let Err(e) = trading.cancel_order(&o.id).await {
-            warn!(order_id = %o.id, error = %e, "take-profit consolidate: cancel resting SELL failed");
-            let _ = tx
-                .send(AppEvent::OrderErrModal(format!("take-profit: cancel {e:#}")))
-                .await;
-            return;
+    // Cancel all resting SELLs concurrently instead of serially.
+    let cancel_futs: Vec<_> = sell_same_outcome
+        .iter()
+        .map(|o| {
+            let t = Arc::clone(&trading);
+            let id = o.id.clone();
+            async move { t.cancel_order(&id).await.map_err(|e| (id, e)) }
+        })
+        .collect();
+    for res in futures_util::future::join_all(cancel_futs).await {
+        match res {
+            Ok(()) => debug!("take-profit consolidate: canceled resting SELL"),
+            Err((order_id, e)) => {
+                warn!(order_id = %order_id, error = %e, "take-profit consolidate: cancel resting SELL failed");
+                let _ = tx
+                    .send(AppEvent::OrderErrModal(format!("take-profit: cancel {e:#}")))
+                    .await;
+                return;
+            }
         }
-        debug!(order_id = %o.id, "take-profit consolidate: canceled resting SELL");
     }
 
     if had_resting_sells {
         // Let user-channel `order` events update the ledger after cancels before POST TP.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
     }
 
     let want_raw = consolidate_tp_want_shares(
@@ -1025,7 +1058,7 @@ async fn main() -> Result<()> {
     }
 
     // Shared event channel — generous buffer so bursts from the book WS don't drop
-    let (tx, mut rx) = mpsc::channel::<AppEvent>(512);
+    let (tx, mut rx) = mpsc::channel::<AppEvent>(2048);
 
     let (rtds_sym_tx, rtds_sym_rx) = watch::channel(String::new());
 
@@ -1268,37 +1301,32 @@ async fn main() -> Result<()> {
                 if let Err(e) = cli.prewarm_order_context(&pre_ids).await {
                     debug!(error = %e, "CLOB order context prewarm failed (continuing to position sync)");
                 }
-                let up = cli
-                    .fetch_conditional_balance_shares(&up_id)
-                    .await
-                    .unwrap_or_else(|e| {
-                        debug!(error = %e, token = %up_id, "fetch UP balance failed");
-                        0.0
-                    });
-                let down = cli
-                    .fetch_conditional_balance_shares(&down_id)
-                    .await
-                    .unwrap_or_else(|e| {
-                        debug!(error = %e, token = %down_id, "fetch DOWN balance failed");
-                        0.0
-                    });
-                let oo_raw = match cli.fetch_open_orders_for_market(&condition_id).await {
-                    Ok(rows) => rows,
-                    Err(e) => {
-                        debug!(error = %e, market = %condition_id, "fetch /data/orders failed");
-                        vec![]
-                    }
-                };
+                // Fetch balances, open orders, and trades concurrently — all are independent
+                // after prewarm, which must complete first (it warms the balance-allowance cache).
+                let (up_res, down_res, oo_res, trades_res) = tokio::join!(
+                    cli.fetch_conditional_balance_shares(&up_id),
+                    cli.fetch_conditional_balance_shares(&down_id),
+                    cli.fetch_open_orders_for_market(&condition_id),
+                    cli.fetch_trades_for_market(&condition_id),
+                );
+                let up = up_res.unwrap_or_else(|e| {
+                    debug!(error = %e, token = %up_id, "fetch UP balance failed");
+                    0.0
+                });
+                let down = down_res.unwrap_or_else(|e| {
+                    debug!(error = %e, token = %down_id, "fetch DOWN balance failed");
+                    0.0
+                });
+                let oo_raw = oo_res.unwrap_or_else(|e| {
+                    debug!(error = %e, market = %condition_id, "fetch /data/orders failed");
+                    vec![]
+                });
                 let (escrow_up, escrow_down) =
                     escrow_sell_shares_from_clob_orders(&oo_raw, &up_id, &down_id);
-
-                let trades = match cli.fetch_trades_for_market(&condition_id).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        debug!(error = %e, market = %condition_id, "fetch /data/trades failed; avg entry unknown");
-                        vec![]
-                    }
-                };
+                let trades = trades_res.unwrap_or_else(|e| {
+                    debug!(error = %e, market = %condition_id, "fetch /data/trades failed; avg entry unknown");
+                    vec![]
+                });
                 let (position_up, position_down, fills_bootstrap) = hydrate_positions_from_trades(
                     &trades,
                     &up_id,

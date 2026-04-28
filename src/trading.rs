@@ -875,7 +875,7 @@ fn balance_allowance_error_text(msg: &str) -> bool {
 
 /// Back-off (ms) before re-reading conditional balance + POST **SELL** on retries. Used after a
 /// failed/zero-balance read or a balance/allowance rejection — not on the first FAK attempt (fast path).
-const SELL_ORDER_PREP_SETTLE_MS: [u64; 5] = [450, 900, 1_800, 3_000, 5_000];
+const SELL_ORDER_PREP_SETTLE_MS: [u64; 5] = [200, 500, 1_200, 2_500, 4_500];
 
 /// How long `GET /fee-rate` responses are reused per `token_id` (avoids an extra RTT on hot paths).
 const FEE_RATE_CACHE_TTL: Duration = Duration::from_secs(600);
