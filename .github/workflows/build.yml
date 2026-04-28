@@ -29,7 +29,13 @@ jobs:
             artifact: polymarket-crypto.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
