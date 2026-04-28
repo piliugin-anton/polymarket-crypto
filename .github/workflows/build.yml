@@ -1,0 +1,81 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: polymarket-crypto
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: polymarket-crypto
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: polymarket-crypto.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Rename artifacts
+        run: |
+          mv x86_64-unknown-linux-gnu/polymarket-crypto   polymarket-crypto-linux-x86_64
+          mv aarch64-apple-darwin/polymarket-crypto        polymarket-crypto-macos-aarch64
+          mv x86_64-pc-windows-msvc/polymarket-crypto.exe polymarket-crypto-windows-x86_64.exe
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            polymarket-crypto-linux-x86_64
+            polymarket-crypto-macos-aarch64
+            polymarket-crypto-windows-x86_64.exe
+          generate_release_notes: true
