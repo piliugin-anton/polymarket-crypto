@@ -1630,8 +1630,9 @@ pub fn hydrate_positions_from_trades(
     let mut indexed: Vec<(DateTime<Utc>, &str, &ClobTrade)> = trades
         .iter()
         .filter(|t| {
-            clob_asset_ids_match(&t.asset_id, up_token_id)
-                || clob_asset_ids_match(&t.asset_id, down_token_id)
+            t.is_valid_fill()
+                && (clob_asset_ids_match(&t.asset_id, up_token_id)
+                    || clob_asset_ids_match(&t.asset_id, down_token_id))
         })
         .map(|t| (parse_trade_timestamp(&t.match_time), t.id.as_str(), t))
         .collect();

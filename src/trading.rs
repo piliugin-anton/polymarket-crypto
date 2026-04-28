@@ -339,6 +339,10 @@ pub struct ClobTrade {
     pub price: String,
     #[serde(alias = "matchTime")]
     pub match_time: String,
+    /// On-chain settlement status: `MATCHED` | `MINED` | `CONFIRMED` | `RETRYING` | `FAILED`.
+    /// Absent on older payloads — treated as a valid fill.
+    #[serde(default)]
+    pub status: Option<String>,
     /// When the authenticated user was **taker**, this matches `orderID` from `postOrder`.
     #[serde(default, rename = "taker_order_id", alias = "takerOrderId")]
     #[allow(dead_code)]
@@ -349,6 +353,16 @@ pub struct ClobTrade {
     /// `"TAKER"` | `"MAKER"` — disambiguates which leg to use with `order_id`.
     #[serde(default, rename = "trader_side", alias = "traderSide")]
     pub trader_side: Option<String>,
+}
+
+impl ClobTrade {
+    /// Returns `false` for trades that permanently failed on-chain and should not be counted as fills.
+    pub fn is_valid_fill(&self) -> bool {
+        !matches!(
+            self.status.as_deref().map(|s| s.to_ascii_uppercase()).as_deref(),
+            Some("FAILED")
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
