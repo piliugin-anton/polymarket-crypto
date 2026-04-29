@@ -357,12 +357,12 @@ pub struct ClobTrade {
 }
 
 impl ClobTrade {
-    /// Returns `true` only for fully settled trades (`CONFIRMED`).
+    /// Returns `true` for settled trades (`CONFIRMED` or `MINED`).
     /// Absent status (older payloads) is treated as valid to preserve historical data.
     pub fn is_valid_fill(&self) -> bool {
         matches!(
             self.status.as_deref().map(|s| s.to_ascii_uppercase()).as_deref(),
-            None | Some("CONFIRMED")
+            None | Some("CONFIRMED") | Some("MINED")
         )
     }
 }
@@ -505,7 +505,7 @@ pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannel
         return None;
     }
     let status = v.get("status").and_then(|s| s.as_str());
-    if !status.is_some_and(|s| s.eq_ignore_ascii_case("CONFIRMED")) {
+    if !status.is_some_and(|s| s.eq_ignore_ascii_case("CONFIRMED") || s.eq_ignore_ascii_case("MINED")) {
         return None;
     }
     let clob_trade_id = v
@@ -662,7 +662,7 @@ impl FillWaitRegistry {
 
     async fn dispatch_trade_value(&self, v: &serde_json::Value) {
         let status = v.get("status").and_then(|s| s.as_str());
-        if !status.is_some_and(|s| s.eq_ignore_ascii_case("CONFIRMED")) {
+        if !status.is_some_and(|s| s.eq_ignore_ascii_case("CONFIRMED") || s.eq_ignore_ascii_case("MINED")) {
             return;
         }
 
