@@ -1,5 +1,14 @@
 //! CTF redemption via Polymarket Relayer (gasless Safe `execTransaction`).
 //!
+//! After [CLOB V2 / pUSD](https://docs.polymarket.com/v2-migration), resolved shares live under
+//! [`ctf-exchange-v2`](https://github.com/Polymarket/ctf-exchange-v2) **collateral adapters**:
+//! [`CtfCollateralAdapter`](https://docs.polymarket.com/resources/contracts) and
+//! [`NegRiskCtfCollateralAdapter`](https://docs.polymarket.com/resources/contracts) expose the same
+//! `redeemPositions(address,bytes32,bytes32,uint256[])` entrypoint (first args unused). They pull CTF
+//! ERC1155, call CTF internally with **USDC.e** as `collateralToken`, then wrap proceeds to **pUSD**
+//! (PMCT) for `msg.sender`. Calling **CTF** or the **legacy NegRisk adapter** directly from the Safe
+//! does not match those position IDs / unwrap paths and typically fails on-chain.
+//!
 //! Flow matches [`@polymarket/builder-relayer-client`](https://github.com/Polymarket/builder-relayer-client)
 //! (`buildSafeTransactionRequest`): EIP-712 `SafeTx` hash → sign → `POST /submit`.
 //! Docs: <https://docs.polymarket.com/developers/builders/relayer-client>,
@@ -20,31 +29,27 @@ use crate::config::{Config, SignatureType};
 use crate::data_api::DataPosition;
 
 const RELAYER_HOST: &str = "https://relayer-v2.polymarket.com";
-const USDC_POLYGON: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
-const USD_POLYGON: Address = address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
-const CTF: Address = address!("0x4D97DCd97eC945f40cf65f87097ACe5EA0476045");
-const NEG_RISK_ADAPTER: Address = address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296");
-
+/// CtfCollateralAdapter — standard markets redeem entrypoint. [Contracts / Collateral](https://docs.polymarket.com/resources/contracts)
+const CTF_COLLATERAL_ADAPTER: Address = address!("0xADa100874d00e3331D00F2007a9c336a65009718");
+/// NegRiskCtfCollateralAdapter — neg-risk redeem entrypoint. [Contracts / Collateral](https://docs.polymarket.com/resources/contracts)
+const NEG_RISK_CTF_COLLATERAL_ADAPTER: Address =
+    address!("0xAdA200001000ef00D07553cEE7006808F895c6F1");
+/// Gnosis Safe Factory. [Contracts / Wallet factory](https://docs.polymarket.com/resources/contracts#wallet-factory-contracts)
 const SAFE_FACTORY: Address = address!("0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b");
 const SAFE_INIT_CODE_HASH: B256 =
     b256!("0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf");
-/// Polygon — same `SafeMultisend` as `@polymarket/builder-relayer-client` (`getContractConfig(137)`).
+/// Gnosis `MultiSend` — not listed on Contracts; matches `@polymarket/builder-relayer-client` `getContractConfig(137)`.
 const SAFE_MULTISEND: Address = address!("0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761");
 
 sol! {
-    contract Ctf {
+    /// Same selector/ABI as CTF `redeemPositions`; adapter ignores `collateralToken`, `parentCollectionId`, and `indexSets`.
+    contract CtfCollateralAdapter {
         function redeemPositions(
             address collateralToken,
             bytes32 parentCollectionId,
             bytes32 conditionId,
             uint256[] indexSets
         ) external;
-    }
-}
-
-sol! {
-    contract NegRisk {
-        function redeemPositions(bytes32 conditionId, uint256[] amounts) external;
     }
 }
 
@@ -74,7 +79,7 @@ struct SubmitResponse {
     state: String,
 }
 
-/// Polymarket CREATE2 Safe for browser-wallet users (same salt as `rs-clob-client`).
+/// Polymarket CREATE2 Safe for browser-wallet users (`derive_safe_wallet` in `polymarket_client_sdk_v2`).
 fn derive_polymarket_safe(eoa: Address) -> Address {
     let mut padded = [0_u8; 32];
     padded[12..].copy_from_slice(eoa.as_slice());
@@ -82,20 +87,12 @@ fn derive_polymarket_safe(eoa: Address) -> Address {
     SAFE_FACTORY.create2(salt, SAFE_INIT_CODE_HASH)
 }
 
-fn encode_standard_redeem(condition_id: B256) -> Vec<u8> {
-    Ctf::redeemPositionsCall {
-        collateralToken: USD_POLYGON, //USDC_POLYGON
+fn encode_v2_adapter_redeem(condition_id: B256) -> Vec<u8> {
+    CtfCollateralAdapter::redeemPositionsCall {
+        collateralToken: Address::ZERO,
         parentCollectionId: B256::ZERO,
         conditionId: condition_id,
-        indexSets: vec![U256::from(1u64), U256::from(2u64)],
-    }
-    .abi_encode()
-}
-
-fn encode_neg_risk_redeem(condition_id: B256, amounts: Vec<U256>) -> Vec<u8> {
-    NegRisk::redeemPositionsCall {
-        conditionId: condition_id,
-        amounts,
+        indexSets: vec![],
     }
     .abi_encode()
 }
@@ -283,58 +280,6 @@ async fn relayer_submit(
     }
 }
 
-/// `balanceOf(address,uint256)` on CTF ERC1155.
-async fn erc1155_balance(
-    http: &Client,
-    rpc_url: &str,
-    holder: Address,
-    token_id: U256,
-) -> Result<U256> {
-    let mut data = vec![0x00, 0xfd, 0xd5, 0x8e];
-    data.extend_from_slice(&[0u8; 12]);
-    data.extend_from_slice(holder.as_slice());
-    let tid = token_id.to_be_bytes::<32>();
-    data.extend_from_slice(&tid);
-    let call_data = format!(
-        "0x{}",
-        data.iter().map(|b| format!("{b:02x}")).collect::<String>()
-    );
-    let body = json!({
-        "jsonrpc": "2.0",
-        "method": "eth_call",
-        "params": [
-            {"to": format!("{CTF:#x}"), "data": call_data},
-            "latest"
-        ],
-        "id": 1
-    });
-    let resp = http
-        .post(rpc_url)
-        .json(&body)
-        .send()
-        .await
-        .context("RPC eth_call")?;
-    let v: serde_json::Value = resp.json().await.context("RPC JSON")?;
-    if let Some(err) = v.get("error") {
-        bail!("RPC error: {err}");
-    }
-    let s = v
-        .get("result")
-        .and_then(|x| x.as_str())
-        .context("RPC missing result")?;
-    let hex = s.trim_start_matches("0x");
-    let bytes = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-        .collect::<Result<Vec<_>, _>>()
-        .context("decode RPC hex")?;
-    let mut arr = [0u8; 32];
-    if bytes.len() <= 32 {
-        arr[32 - bytes.len()..].copy_from_slice(&bytes);
-    }
-    Ok(U256::from_be_bytes(arr))
-}
-
 pub(crate) fn parse_condition_id(s: &str) -> Result<B256> {
     let t = s.trim();
     let h = t.strip_prefix("0x").unwrap_or(t);
@@ -355,7 +300,7 @@ pub(crate) fn parse_token_id_u256(s: &str) -> Result<U256> {
 }
 
 /// Redeem all redeemable positions returned by Data API in **one** relayer submission when possible:
-/// multiple `redeemPositions` calls are packed with Gnosis `MultiSend` + Safe `DelegateCall`, matching
+/// multiple adapter `redeemPositions` calls are packed with Gnosis `MultiSend` + Safe `DelegateCall`, matching
 /// [`aggregateTransaction`](https://github.com/Polymarket/builder-relayer-client/blob/main/src/builder/safe.ts).
 pub async fn redeem_resolved_positions(
     cfg: &Config,
@@ -405,7 +350,7 @@ pub async fn redeem_resolved_positions(
     let mut seen = std::collections::HashSet::new();
     let mut ops: Vec<(String, Address, Vec<u8>)> = Vec::new();
 
-    'each: for p in redeemable {
+    for p in redeemable {
         if !seen.insert(p.condition_id.as_str()) {
             continue;
         }
@@ -417,65 +362,12 @@ pub async fn redeem_resolved_positions(
                 continue;
             }
         };
-        let (to, calldata) = if p.negative_risk {
-            let group: Vec<&DataPosition> = positions
-                .iter()
-                .filter(|q| q.condition_id == p.condition_id && q.redeemable)
-                .collect();
-            let max_idx = group
-                .iter()
-                .map(|q| q.outcome_index as usize)
-                .max()
-                .unwrap_or(0);
-            let mut amounts = vec![U256::ZERO; max_idx + 1];
-            for q in &group {
-                let i = q.outcome_index as usize;
-                if i >= amounts.len() {
-                    warn!(
-                        cond = %p.condition_id,
-                        outcome = q.outcome_index,
-                        "CTF redeem: skip neg-risk (outcomeIndex out of bounds)"
-                    );
-                    continue 'each;
-                }
-                let tid = match parse_token_id_u256(&q.asset) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(
-                            cond = %p.condition_id,
-                            error = %e,
-                            "CTF redeem: skip neg-risk (bad asset id)"
-                        );
-                        continue 'each;
-                    }
-                };
-                let bal = match erc1155_balance(http, &cfg.polygon_rpc_url, cfg.funder, tid).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!(
-                            cond = %p.condition_id,
-                            outcome = q.outcome_index,
-                            error = %e,
-                            "CTF redeem: skip neg-risk (balance read)"
-                        );
-                        continue 'each;
-                    }
-                };
-                amounts[i] = bal;
-            }
-            if amounts.iter().all(|x| x.is_zero()) {
-                warn!(
-                    cond = %p.condition_id,
-                    "CTF redeem: skip neg-risk (zero on-chain balances)"
-                );
-                continue;
-            }
-            let data = encode_neg_risk_redeem(condition, amounts);
-            (NEG_RISK_ADAPTER, data)
+        let adapter = if p.negative_risk {
+            NEG_RISK_CTF_COLLATERAL_ADAPTER
         } else {
-            (CTF, encode_standard_redeem(condition))
+            CTF_COLLATERAL_ADAPTER
         };
-        ops.push((short, to, calldata));
+        ops.push((short, adapter, encode_v2_adapter_redeem(condition)));
     }
 
     if ops.is_empty() {

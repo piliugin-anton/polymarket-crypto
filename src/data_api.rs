@@ -39,6 +39,7 @@ pub struct DataPosition {
     #[serde(default, rename = "avgPrice")]
     pub avg_price: f64,
     #[serde(rename = "outcomeIndex", default)]
+    #[allow(dead_code)] // deserialized from API; redeem uses adapters that read balances on-chain
     pub outcome_index: u32,
     #[serde(rename = "negativeRisk", default)]
     pub negative_risk: bool,
