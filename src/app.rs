@@ -1090,6 +1090,22 @@ impl AppState {
                 price,
                 ts,
             } => {
+                // Event-loop de-dupe guards — run here (sequentially with OrderAck) to close two
+                // races that the WS-task pre-check in `before_ws_user_fill_apply` cannot prevent:
+                //
+                // 1. WS reconnect delivers same trade before `after_ws_user_fill_committed` adds
+                //    the ID to `seen_trades`, so both `UserChannelFill` events pass the pre-check.
+                // 2. `OrderAck` for the same fill is queued ahead of `UserChannelFill` and is
+                //    processed first; `ack_wait` now holds the entry but the WS pre-check already
+                //    returned `true` before that happened.
+                if self.user_trade_sync.fill_already_committed(&clob_trade_id).await
+                    || self
+                        .user_trade_sync
+                        .ack_claimed_for_ws_fill(&order_leg_id, qty, price, &clob_trade_id)
+                        .await
+                {
+                    return;
+                }
                 let token_id = canonical_clob_token_id(&token_id).into_owned();
                 if let Some(ui_oc) = self.outcome_for_active_token(&token_id) {
                     let realized = self.position_mut(ui_oc).apply_fill(side, qty, price);

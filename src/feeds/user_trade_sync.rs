@@ -5,6 +5,12 @@
 //! 2) `ack_wait` / `ws_wait` short-lived queues match `(clob order id, qty, price)` when the two
 //!    channels race (POST /order does not return `Trade.id`).
 //!
+//! **Event-loop guard** (fixes two races not covered by the WS-task pre-check):
+//! - `fill_already_committed`: re-checks `seen_trades` inside the event loop so a WS reconnect
+//!   that replays the same trade ID before `after_ws_user_fill_committed` completes is blocked.
+//! - `ack_claimed_for_ws_fill`: checks `ack_wait` so an `OrderAck` that sneaked ahead of a queued
+//!   `UserChannelFill` (TOCTOU between the WS-task pre-check and the event-loop commit) is detected.
+//!
 //! Shared across the TUI event loop, the user-channel WebSocket task, and the market supervisor.
 //! [`tokio::sync::Mutex`] is used so waiting tasks yield instead of blocking a runtime worker
 //! (unlike `std::sync::Mutex`). Atomics are not a fit here: we need a set plus bounded wait lists.
@@ -158,6 +164,48 @@ impl UserTradeSync {
             WaitSlot { oid: o, qty, price, created: Instant::now() },
         );
     }
+
+    /// Event-loop guard: `true` if this trade was already committed (WS reconnect replay race).
+    ///
+    /// Called at the top of the `UserChannelFill` handler — runs inside the single-threaded event
+    /// loop, sequentially with `OrderAck`, so it sees `seen_trades` as it truly stands right now.
+    pub async fn fill_already_committed(&self, clob_trade_id: &str) -> bool {
+        if clob_trade_id.is_empty() {
+            return false;
+        }
+        self.inner.lock().await.seen_trades.contains(clob_trade_id)
+    }
+
+    /// Event-loop guard: `true` if an `OrderAck` raced ahead of this queued `UserChannelFill`.
+    ///
+    /// Removes the matching `ack_wait` entry (consumed) and records the trade ID in `seen_trades`
+    /// so a future WS reconnect replay of the same trade is also blocked.
+    pub async fn ack_claimed_for_ws_fill(
+        &self,
+        taker_or_leg_id: &str,
+        qty: f64,
+        price: f64,
+        clob_trade_id: &str,
+    ) -> bool {
+        let o = norm_order_id_key(taker_or_leg_id);
+        if o.is_empty() {
+            return false;
+        }
+        let mut g = self.inner.lock().await;
+        prune_stale(&mut g.ack_wait);
+        if let Some(i) = g
+            .ack_wait
+            .iter()
+            .position(|w| w.oid == o && close_enough(w.qty, qty) && close_enough(w.price, price))
+        {
+            g.ack_wait.remove(i);
+            if !clob_trade_id.is_empty() {
+                g.seen_trades.insert(clob_trade_id.to_string());
+            }
+            return true;
+        }
+        false
+    }
 }
 
 fn close_enough(a: f64, b: f64) -> bool {
@@ -197,5 +245,35 @@ mod tests {
         assert!(s.before_ws_user_fill_apply("T-2", "0xdef2", 5.0, 0.40).await);
         s.after_ws_user_fill_committed("T-2", "0xdef2", 5.0, 0.40).await;
         assert!(!s.before_order_ack_apply("0xdef2", 5.0, 0.40).await);
+    }
+
+    // Race: WS pre-check passes, OrderAck sneaks ahead in the event queue before the
+    // UserChannelFill is processed. The event-loop guard must catch it.
+    #[tokio::test]
+    async fn event_loop_guard_ack_raced_ahead_of_ws_fill() {
+        let s = UserTradeSync::new();
+        // WS pre-check passes (no ack yet)
+        assert!(s.before_ws_user_fill_apply("T-3", "0xorder3", 8.0, 0.60).await);
+        // OrderAck is processed first in the event loop before UserChannelFill is handled
+        assert!(s.before_order_ack_apply("0xorder3", 8.0, 0.60).await);
+        s.after_order_ack_applied("0xorder3", 8.0, 0.60).await;
+        // Now UserChannelFill reaches the event-loop handler — ack_claimed_for_ws_fill catches it
+        assert!(s.ack_claimed_for_ws_fill("0xorder3", 8.0, 0.60, "T-3").await);
+        // trade ID recorded in seen_trades, so a WS reconnect replay is also blocked
+        assert!(s.fill_already_committed("T-3").await);
+    }
+
+    // Race: WS reconnect replays the same trade before after_ws_user_fill_committed runs.
+    #[tokio::test]
+    async fn event_loop_guard_ws_reconnect_replay() {
+        let s = UserTradeSync::new();
+        // First delivery passes pre-check
+        assert!(s.before_ws_user_fill_apply("T-4", "0xorder4", 3.0, 0.45).await);
+        // Reconnect delivers same trade before commit — passes pre-check again
+        assert!(s.before_ws_user_fill_apply("T-4", "0xorder4", 3.0, 0.45).await);
+        // Event loop processes first UserChannelFill, commits it
+        s.after_ws_user_fill_committed("T-4", "0xorder4", 3.0, 0.45).await;
+        // Event loop processes second UserChannelFill — fill_already_committed blocks it
+        assert!(s.fill_already_committed("T-4").await);
     }
 }
