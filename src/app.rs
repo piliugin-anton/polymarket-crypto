@@ -1010,6 +1010,7 @@ impl AppState {
                 self.position_down = Default::default();
                 self.fak_net_up = 0.0;
                 self.fak_net_down = 0.0;
+                self.fills.clear();
                 self.open_orders.clear();
                 self.top_holders_up_sum = None;
                 self.top_holders_down_sum = None;
@@ -1033,11 +1034,21 @@ impl AppState {
                 fills_bootstrap,
                 refresh_status_line,
             } => {
-                self.position_up = position_up;
-                self.position_down = position_down;
-                self.fills.clear();
                 // fills_bootstrap is always empty — fills come from the user WS only.
                 let _ = fills_bootstrap;
+                // Only apply REST position if it carries at least as many shares as the
+                // current in-memory state. The REST fetch is spawned at market roll and may
+                // complete while WS fills have already updated the position (REST indexing
+                // lags ~1-5 s). If REST has equal-or-more shares it is authoritative (full
+                // trade-history VWAP); if it has fewer, WS already applied a fill that REST
+                // hasn't indexed yet — keep the WS-updated position to avoid clobbering it.
+                if position_up.shares >= self.position_up.shares {
+                    self.position_up = position_up;
+                }
+                if position_down.shares >= self.position_down.shares {
+                    self.position_down = position_down;
+                }
+                // fills are managed by WS events; cleared on MarketRoll, not here.
                 let nu = 0.0_f64;
                 let nd = 0.0_f64;
                 self.fak_net_up = self.position_up.shares.max(nu);
