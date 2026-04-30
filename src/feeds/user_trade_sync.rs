@@ -76,6 +76,17 @@ impl UserTradeSync {
         g.ws_wait.clear();
     }
 
+    /// Trade IDs from [`crate::app::hydrate_positions_from_trades`] (`GET /data/trades`) after a roll
+    /// or cold start. Same IDs as user-channel `trade.id` — blocks duplicate P&L when WS catches up.
+    pub async fn seed_seen_trades_from_rest(&self, ids: impl Iterator<Item = String>) {
+        let mut g = self.inner.lock().await;
+        for id in ids {
+            if !id.is_empty() {
+                g.seen_trades.insert(id);
+            }
+        }
+    }
+
     /// `true` = apply the OrderAck P&L block. `false` = user WSS `trade` already matched the fill.
     pub async fn before_order_ack_apply(&self, clob_order_id: &str, qty: f64, price: f64) -> bool {
         let o = norm_order_id_key(clob_order_id);

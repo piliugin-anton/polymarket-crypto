@@ -1,7 +1,7 @@
 //! Polymarket CLOB **user** WebSocket (`/ws/user`) — authenticated `trade` / `order` events.
 //!
 //! Subscription uses `auth` + `markets` (condition IDs). See
-//! <https://docs.polymarket.com/developers/CLOB/websocket/user-channel> .
+//! <https://docs.polymarket.com/market-data/websocket/user-channel> .
 //!
 //! After the initial authenticated subscribe, **market changes** use dynamic
 //! `{"markets":[…], "operation":"subscribe"|"unsubscribe"}` so the socket stays open.
@@ -127,6 +127,13 @@ impl UserOpenOrdersLedger {
     pub async fn snapshot_clob_orders(&self) -> Vec<ClobOpenOrder> {
         let g = self.inner.lock().await;
         g.by_id.values().cloned().collect()
+    }
+
+    /// Normalized CLOB order ids currently in the ledger (keys of [`LedgerInner::by_id`]).
+    /// Used to match user-channel `trade` payloads to **our** `maker_orders` leg, not another maker.
+    pub async fn normalized_order_keys(&self) -> HashSet<String> {
+        let g = self.inner.lock().await;
+        g.by_id.keys().cloned().collect()
     }
 
     /// Same source as [`Self::snapshot_clob_orders`], formatted for the Open Orders panel.
@@ -531,11 +538,19 @@ async fn run_session(
                     logged_first = true;
                 }
                 let values = parse_user_channel_values(&txt);
+                // Apply `order` events first so the ledger contains our resting ids before we match
+                // `trade` → `maker_orders` to the correct leg ([user channel](https://docs.polymarket.com/market-data/websocket/user-channel)).
+                let orders_update = open_ledger.apply_order_values(&values).await;
+                let known_order_keys = open_ledger.normalized_order_keys().await;
                 registry.dispatch_trades_in_values(&values).await;
                 let bundle = market_watch.borrow().clone();
                 if bundle_has_markets(&bundle) {
                     for v in &values {
-                        if let Some(f) = try_parse_user_channel_trade(v) {
+                        if let Some(f) = try_parse_user_channel_trade(
+                            v,
+                            &known_order_keys,
+                            Some(creds.api_key.as_str()),
+                        ) {
                             let Some(outcome) = resolve_trade_outcome(&bundle, &f.asset_id) else {
                                 continue;
                             };
@@ -566,7 +581,7 @@ async fn run_session(
                         }
                     }
                 }
-                if let Some(orders) = open_ledger.apply_order_values(&values).await {
+                if let Some(orders) = orders_update {
                     let _ = app_tx.send(AppEvent::OpenOrdersLoaded { orders }).await;
                     // Fixed take-profit: if the ledger now shows multiple resting SELL on one outcome,
                     // ask main to merge them into a single GTD (sum of remaining sizes).

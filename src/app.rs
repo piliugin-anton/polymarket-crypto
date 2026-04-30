@@ -279,6 +279,8 @@ pub struct Fill {
     pub qty:      f64,
     pub price:    f64,
     pub realized: f64, // only non-zero when the fill closes part of a position
+    /// CLOB `Trade.id` when known — REST bootstrap / user WS (dedupe); absent for `OrderAck`-only rows.
+    pub clob_trade_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -670,6 +672,36 @@ impl AppState {
         match outcome { Outcome::Up => &mut self.position_up, Outcome::Down => &mut self.position_down }
     }
 
+    /// If session [`Self::fills`] imply **more** gross long shares than [`Position::shares`], bump
+    /// inventory to match (and repair `avg_entry` when missing). Does **not** shrink the position
+    /// (SELL path stays authoritative).
+    fn reconcile_position_shares_with_fill_deque(&mut self, oc: Outcome) {
+        let net = net_shares_from_fills(&self.fills, oc);
+        if !net.is_finite() || net < 1e-12 {
+            return;
+        }
+        let cur_shares = self.position(oc).shares;
+        let tol = f64::max(1e-6, 1e-4 * net.abs().max(1.0));
+        if net <= cur_shares + tol {
+            return;
+        }
+        let vwap = vwap_buy_price_from_fills_for_outcome(&self.fills, oc);
+        {
+            let p = self.position_mut(oc);
+            p.shares = net.max(0.0);
+            if !p.avg_entry.is_finite() || p.avg_entry <= 1e-12 {
+                if vwap.is_finite() && vwap > 1e-12 {
+                    p.avg_entry = vwap;
+                }
+            }
+        }
+        let after = self.position(oc).shares;
+        let fk = self.fak_net_mut(oc);
+        if after > *fk {
+            *fk = after;
+        }
+    }
+
     fn fak_net_mut(&mut self, outcome: Outcome) -> &mut f64 {
         match outcome {
             Outcome::Up => &mut self.fak_net_up,
@@ -1034,8 +1066,28 @@ impl AppState {
                 fills_bootstrap,
                 refresh_status_line,
             } => {
-                // fills_bootstrap is always empty — fills come from the user WS only.
-                let _ = fills_bootstrap;
+                if !fills_bootstrap.is_empty() {
+                    let ids = fills_bootstrap
+                        .iter()
+                        .filter_map(|f| f.clob_trade_id.clone())
+                        .filter(|s| !s.is_empty());
+                    self.user_trade_sync.seed_seen_trades_from_rest(ids).await;
+                    let mut have_id: HashSet<String> = self
+                        .fills
+                        .iter()
+                        .filter_map(|f| f.clob_trade_id.clone())
+                        .collect();
+                    for f in fills_bootstrap {
+                        if let Some(ref id) = f.clob_trade_id {
+                            if have_id.contains(id) {
+                                continue;
+                            }
+                            have_id.insert(id.clone());
+                        }
+                        self.fills.push_back(f);
+                    }
+                    trim_fills_to_cap(&mut self.fills, 64);
+                }
                 // Only apply REST position if it carries at least as many shares as the
                 // current in-memory state. The REST fetch is spawned at market roll and may
                 // complete while WS fills have already updated the position (REST indexing
@@ -1048,11 +1100,13 @@ impl AppState {
                 if position_down.shares >= self.position_down.shares {
                     self.position_down = position_down;
                 }
-                // fills are managed by WS events; cleared on MarketRoll, not here.
+                // Session fills: REST bootstrap above + user WS / OrderAck; cleared on MarketRoll.
                 let nu = 0.0_f64;
                 let nd = 0.0_f64;
                 self.fak_net_up = self.position_up.shares.max(nu);
                 self.fak_net_down = self.position_down.shares.max(nd);
+                self.reconcile_position_shares_with_fill_deque(Outcome::Up);
+                self.reconcile_position_shares_with_fill_deque(Outcome::Down);
                 if refresh_status_line {
                     self.status_line = format!(
                         "Positions from CLOB — UP {:.2} @ {:.2} / DOWN {:.2} @ {:.2}",
@@ -1117,15 +1171,26 @@ impl AppState {
                             *v = (*v - qty).max(0.0);
                         }
                     }
-                    self.fills.push_back(Fill {
-                        ts,
-                        side,
-                        outcome: ui_oc,
-                        qty,
-                        price,
-                        realized,
-                    });
-                    trim_fills_to_cap(&mut self.fills, 64);
+                    // Always record a Fills row for user-channel trades on the active market: the CLOB
+                    // tape can show SELL on one outcome while the user's intent was a limit BUY on the
+                    // other leg; suppressing "zero-inventory SELL" rows hid legitimate fills (see debug).
+                    if qty > 1e-12 {
+                        self.fills.push_back(Fill {
+                            ts,
+                            side,
+                            outcome: ui_oc,
+                            qty,
+                            price,
+                            realized,
+                            clob_trade_id: if clob_trade_id.is_empty() {
+                                None
+                            } else {
+                                Some(clob_trade_id.clone())
+                            },
+                        });
+                        trim_fills_to_cap(&mut self.fills, 64);
+                    }
+                    self.reconcile_position_shares_with_fill_deque(ui_oc);
                     self.user_trade_sync
                         .after_ws_user_fill_committed(&clob_trade_id, &order_leg_id, qty, price)
                         .await;
@@ -1163,7 +1228,9 @@ impl AppState {
                     }
                 }
                 if do_pnl {
+                    let mut filled_oc: Option<Outcome> = None;
                     if let Some(ui_oc) = self.outcome_for_active_token(&token_id) {
+                        filled_oc = Some(ui_oc);
                         let realized = self.position_mut(ui_oc).apply_fill(side, qty, price);
                         self.realized_pnl += realized;
                         match side {
@@ -1173,20 +1240,26 @@ impl AppState {
                                 *v = (*v - qty).max(0.0);
                             }
                         }
-                        self.fills.push_back(Fill {
-                            ts:            Utc::now(),
-                            side,
-                            outcome: ui_oc,
-                            qty,
-                            price,
-                            realized,
-                        });
+                        if qty > 1e-12 {
+                            self.fills.push_back(Fill {
+                                ts:            Utc::now(),
+                                side,
+                                outcome: ui_oc,
+                                qty,
+                                price,
+                                realized,
+                                clob_trade_id: None,
+                            });
+                        }
                     } else {
                         self.apply_background_trailing_fill(&token_id, side, qty);
                     }
                     trim_fills_to_cap(&mut self.fills, 64);
-                    if let Some(oid) = clob_order_id {
-                        self.user_trade_sync.after_order_ack_applied(&oid, qty, price).await;
+                    if let Some(ref oid) = clob_order_id {
+                        self.user_trade_sync.after_order_ack_applied(oid, qty, price).await;
+                    }
+                    if let Some(oc) = filled_oc {
+                        self.reconcile_position_shares_with_fill_deque(oc);
                     }
                     self.bump_trailing_tracked_shares(&token_id, side, qty);
                     if side == Side::Sell {
@@ -1437,6 +1510,42 @@ fn trim_fills_to_cap(fills: &mut VecDeque<Fill>, cap: usize) {
     }
 }
 
+/// User's BUY/SELL on [`ClobTrade::asset_id`] from L2 `GET /data/trades`.
+///
+/// Top-level `side` is the **taker's** side ([`methods-l2`](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
+/// When `trader_side` is MAKER, prefer [`ClobMakerOrder::side`] on the leg whose `asset_id` matches
+/// this trade row (same as WebSocket `maker_orders[].side`).
+fn user_fill_side_from_clob_trade(t: &ClobTrade) -> Option<Side> {
+    let taker_side = parse_clob_side(&t.side)?;
+    let role = t.trader_side.as_deref().map(|s| s.trim().to_ascii_uppercase());
+    let is_maker = matches!(role.as_deref(), Some("MAKER") | Some("M"));
+    if !is_maker {
+        return Some(taker_side);
+    }
+    for mo in &t.maker_orders {
+        let aid = mo.asset_id.as_deref().filter(|s| !s.is_empty());
+        let asset_match = aid.is_some_and(|a| clob_asset_ids_match(a, &t.asset_id));
+        if asset_match {
+            if let Some(ref s) = mo.side {
+                if let Some(ps) = parse_clob_side(s) {
+                    return Some(ps);
+                }
+            }
+        }
+    }
+    if t.maker_orders.len() == 1 {
+        if let Some(ref s) = t.maker_orders[0].side {
+            if let Some(ps) = parse_clob_side(s) {
+                return Some(ps);
+            }
+        }
+    }
+    Some(match taker_side {
+        Side::Buy => Side::Sell,
+        Side::Sell => Side::Buy,
+    })
+}
+
 fn parse_trade_timestamp(s: &str) -> DateTime<Utc> {
     let s = s.trim();
     if s.is_empty() {
@@ -1651,16 +1760,9 @@ pub fn hydrate_positions_from_trades(
         } else {
             Outcome::Down
         };
-        // "side" in Polymarket REST is the TAKER's side; flip for maker fills.
-        let Some(taker_side) = parse_clob_side(&t.side) else {
+        let Some(side) = user_fill_side_from_clob_trade(t) else {
             debug!(id = %t.id, side = %t.side, "skip trade with unknown side");
             continue;
-        };
-        let role = t.trader_side.as_deref().map(|s| s.trim().to_ascii_uppercase());
-        let side = if matches!(role.as_deref(), Some("MAKER")) {
-            match taker_side { Side::Buy => Side::Sell, Side::Sell => Side::Buy }
-        } else {
-            taker_side
         };
         let Ok(qty) = t.size.parse::<f64>() else {
             debug!(id = %t.id, "skip trade with bad size");
@@ -1685,6 +1787,11 @@ pub fn hydrate_positions_from_trades(
             qty,
             price,
             realized,
+            clob_trade_id: if t.id.is_empty() {
+                None
+            } else {
+                Some(t.id.clone())
+            },
         });
     }
 
@@ -1713,6 +1820,26 @@ pub fn net_shares_from_fills(fills: &VecDeque<Fill>, outcome: Outcome) -> f64 {
         }
     }
     net
+}
+
+/// VWAP price over **BUY** fills for `outcome` in the session deque (for avg_entry repair).
+fn vwap_buy_price_from_fills_for_outcome(fills: &VecDeque<Fill>, outcome: Outcome) -> f64 {
+    let mut q = 0.0_f64;
+    let mut pc = 0.0_f64;
+    for f in fills.iter() {
+        if f.outcome != outcome || f.side != Side::Buy {
+            continue;
+        }
+        if f.qty.is_finite() && f.qty > 0.0 && f.price.is_finite() && f.price > 0.0 {
+            q += f.qty;
+            pc += f.qty * f.price;
+        }
+    }
+    if q > 1e-12 {
+        pc / q
+    } else {
+        0.0
+    }
 }
 
 /// Derive the OrderArgs + order_type we'd submit for a given user intent,
@@ -1786,7 +1913,7 @@ mod tests {
     use crate::feeds::user_trade_sync::UserTradeSync;
     use crate::fees::polymarket_crypto_taker_fee_usdc;
     use crate::gamma::ActiveMarket;
-    use crate::trading::{ClobOpenOrder, ClobTrade};
+    use crate::trading::{ClobMakerOrder, ClobOpenOrder, ClobTrade};
 
     fn test_state() -> AppState {
         AppState::new(5.0, Arc::new(UserTradeSync::new()))
@@ -1830,6 +1957,33 @@ mod tests {
             // `hydrate_positions_from_trades` only replays fills with a known role (matches CLOB user rows).
             trader_side: Some("TAKER".into()),
         }
+    }
+
+    /// REST replay: `maker_orders[].side` is the maker's side on that token (L2 `getTrades`).
+    #[test]
+    fn hydrate_maker_prefers_maker_order_side() {
+        let up = "111";
+        let t = ClobTrade {
+            id: "1".into(),
+            asset_id: up.to_string(),
+            side: "SELL".into(),
+            size: "10".into(),
+            price: "0.5".into(),
+            match_time: "0".into(),
+            status: None,
+            taker_order_id: Some("0xt".into()),
+            maker_orders: vec![ClobMakerOrder {
+                order_id: "o1".into(),
+                matched_amount: "10".into(),
+                asset_id: Some(up.to_string()),
+                side: Some("BUY".into()),
+            }],
+            trader_side: Some("MAKER".into()),
+        };
+        let (pu, _, fills) =
+            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
+        assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
+        assert!(fills.iter().all(|f| f.side == Side::Buy), "fills={:?}", fills);
     }
 
     #[test]
@@ -1927,6 +2081,7 @@ mod tests {
             qty: 10.09,
             price: 0.5,
             realized: 0.0,
+            clob_trade_id: None,
         });
         let (shares, _, _) =
             resolve_market_order(&state, Outcome::Up, Side::Sell, 1.0, 0, 0).unwrap();
@@ -2227,6 +2382,8 @@ mod tests {
     }
 
     /// REST replay shows a flat book — drop armed / pending trails so we never FAK-sell air.
+    /// In-memory position must not exceed REST for this load (see `PositionsLoaded` merge rule);
+    /// when both are flat, `sync_trailing_inventory_with_positions` clears trails for this market.
     #[tokio::test]
     async fn positions_loaded_clears_trailing_when_flat() {
         let mut s = test_state();
@@ -2237,10 +2394,7 @@ mod tests {
             bids:     vec![BookLevel { price: 0.52, size: 100.0 }],
             asks:     vec![BookLevel { price: 0.54, size: 100.0 }],
         }));
-        s.position_up = Position {
-            shares:    8.0,
-            avg_entry: 0.50,
-        };
+        s.position_up = Position::default();
         s.apply(AppEvent::RequestTrailingArm {
             outcome:          Outcome::Up,
             entry_price:      0.50,

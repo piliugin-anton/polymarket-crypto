@@ -20,7 +20,7 @@ use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -326,6 +326,12 @@ pub struct ClobMakerOrder {
     #[serde(default, rename = "matched_amount", alias = "matchedAmount")]
     #[allow(dead_code)]
     pub matched_amount: String,
+    /// Outcome token this maker leg applies to (L2 `MakerOrder`).
+    #[serde(default, rename = "asset_id", alias = "assetId")]
+    pub asset_id: Option<String>,
+    /// **Maker's** order side on that token ([L2 docs](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
+    #[serde(default)]
+    pub side: Option<String>,
 }
 
 /// Polymarket `clob-client-v2` `GET /data/trades` — one row per user fill (L2 auth).
@@ -357,12 +363,12 @@ pub struct ClobTrade {
 }
 
 impl ClobTrade {
-    /// Returns `true` for settled trades (`CONFIRMED` or `MINED`).
+    /// Returns `true` for trades useful in replay (`MATCHED` through `CONFIRMED`).
     /// Absent status (older payloads) is treated as valid to preserve historical data.
     pub fn is_valid_fill(&self) -> bool {
         matches!(
             self.status.as_deref().map(|s| s.to_ascii_uppercase()).as_deref(),
-            None | Some("CONFIRMED") | Some("MINED")
+            None | Some("MATCHED") | Some("CONFIRMED") | Some("MINED")
         )
     }
 }
@@ -453,6 +459,10 @@ pub fn norm_order_id_key(s: &str) -> String {
     s.trim().trim_start_matches("0x").to_ascii_lowercase()
 }
 
+fn norm_user_channel_owner(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
+
 /// Compare Polymarket order ids from `orderID` / `taker_order_id` / `maker_orders.order_id`.
 #[cfg(test)]
 fn order_ids_match(a: &str, b: &str) -> bool {
@@ -494,9 +504,26 @@ pub struct UserChannelTradeFill {
     pub match_ts:      DateTime<Utc>,
 }
 
-/// Parse a user-channel `event_type: trade` object for [`UserChannelTradeFill`].
-/// Returns `None` for non-CONFIRMED trades, trades without `trader_side` (not owned by us), missing ids, or non-trades.
-pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannelTradeFill> {
+/// Parse a user-channel `trade` object for [`UserChannelTradeFill`].
+///
+/// `known_user_order_keys` must contain [`norm_order_id_key`] values for resting orders from the
+/// open-order ledger (user `order` events + REST). For **maker** fills, the matching row in
+/// `maker_orders` / `makerOrders` is chosen by that id so we do not attribute another maker's leg
+/// ([Polymarket user channel `trade`](https://docs.polymarket.com/market-data/websocket/user-channel)).
+/// When there is exactly one maker leg, we still use it if no key matched (FAK / race before ledger).
+///
+/// `ws_owner_api_key`: L2 **`apiKey`** (same string Polymarket puts in each `maker_orders[].owner`
+/// for your leg). When the open-order ledger no longer contains your `order_id` (fill already
+/// removed the row) but several maker legs remain, we pick the unique row whose `owner` matches.
+///
+/// Accepts trade statuses **`MATCHED`**, **`MINED`**, and **`CONFIRMED`** (same `id` dedupes later
+/// status transitions in the user WS path). Returns `None` for `FAILED` / unknown status, missing
+/// `trader_side`, or **maker** with multiple legs and no disambiguation.
+pub fn try_parse_user_channel_trade(
+    v: &serde_json::Value,
+    known_user_order_keys: &HashSet<String>,
+    ws_owner_api_key: Option<&str>,
+) -> Option<UserChannelTradeFill> {
     let et = v
         .get("event_type")
         .and_then(|x| x.as_str())
@@ -505,7 +532,12 @@ pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannel
         return None;
     }
     let status = v.get("status").and_then(|s| s.as_str());
-    if !status.is_some_and(|s| s.eq_ignore_ascii_case("CONFIRMED") || s.eq_ignore_ascii_case("MINED")) {
+    let status_ok = status.is_some_and(|s| {
+        s.eq_ignore_ascii_case("MATCHED")
+            || s.eq_ignore_ascii_case("MINED")
+            || s.eq_ignore_ascii_case("CONFIRMED")
+    });
+    if !status_ok {
         return None;
     }
     let clob_trade_id = v
@@ -515,20 +547,22 @@ pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannel
         .map(str::trim)
         .filter(|s| !s.is_empty())?
         .to_string();
-    let asset_id = v
+    let top_asset_id = v
         .get("asset_id")
         .or_else(|| v.get("assetId"))?
         .as_str()?
         .trim()
         .to_string();
-    if asset_id.is_empty() {
+    if top_asset_id.is_empty() {
         return None;
     }
-    // "side" in Polymarket trade events is the TAKER's side (the aggressor). When the
-    // authenticated user is the maker, their actual side is the opposite.
+    // Top-level `side` is the **taker's** side on this trade (Polymarket user-channel + L2 `Trade`).
+    // For **maker** fills, prefer `maker_orders[].side` on the user's leg — it is the maker order's
+    // side ([L2 Trade.MakerOrder](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)); only
+    // fall back to inverting the taker side when `side` is missing on the leg (older payloads).
     let taker_side = parse_clob_side_str(v.get("side").and_then(|s| s.as_str())?)?;
-    let price: f64 = v.get("price").and_then(|s| s.as_str())?.parse().ok()?;
-    if !price.is_finite() || price <= 0.0 {
+    let top_price: f64 = v.get("price").and_then(|s| s.as_str())?.parse().ok()?;
+    if !top_price.is_finite() || top_price <= 0.0 {
         return None;
     }
     let trader_side = v
@@ -546,40 +580,87 @@ pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannel
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let is_maker = matches!(trader_side.as_deref(), Some("MAKER") | Some("M"));
-    let side = if is_maker {
-        match taker_side { Side::Buy => Side::Sell, Side::Sell => Side::Buy }
-    } else {
-        taker_side
-    };
-    let (order_leg_id, qty) = if is_maker {
-        let arr = v.get("maker_orders").or_else(|| v.get("makerOrders"))?.as_array()?;
-        let m0 = arr.first()?;
-        let oid = m0
-            .get("order_id")
-            .or_else(|| m0.get("orderId"))?
-            .as_str()?
-            .trim();
-        if oid.is_empty() {
+    let (order_leg_id, qty, asset_id, price, leg_maker_side) = if is_maker {
+        let arr = v
+            .get("maker_orders")
+            .or_else(|| v.get("makerOrders"))?
+            .as_array()?;
+        if arr.is_empty() {
             return None;
         }
-        let am = m0
-            .get("matched_amount")
-            .or_else(|| m0.get("matchedAmount"))?
-            .as_str()?;
-        let q: f64 = am.parse().ok()?;
-        if !q.is_finite() || q <= 0.0 {
-            return None;
+        let mut picked: Option<(String, f64, String, f64, Option<String>)> = None;
+        for m in arr {
+            let Some((oid_raw, q, leg_asset, leg_price, leg_side)) = parse_user_channel_maker_leg(m) else {
+                continue;
+            };
+            let nk = norm_order_id_key(&oid_raw);
+            if known_user_order_keys.contains(&nk) {
+                let aid = leg_asset.unwrap_or_else(|| top_asset_id.clone());
+                let px = leg_price.unwrap_or(top_price);
+                picked = Some((oid_raw, q, aid, px, leg_side));
+                break;
+            }
         }
-        (oid.to_string(), q)
+        if picked.is_none() {
+            if let Some(want_raw) = ws_owner_api_key.map(str::trim).filter(|s| !s.is_empty()) {
+                let want = norm_user_channel_owner(want_raw);
+                let owner_rows: Vec<&serde_json::Value> = arr
+                    .iter()
+                    .filter(|m| {
+                        user_ws_json_str2(m, "owner", "orderOwner")
+                            .is_some_and(|o| norm_user_channel_owner(o) == want)
+                    })
+                    .collect();
+                if owner_rows.len() == 1 {
+                    let m0 = owner_rows[0];
+                    if let Some((oid_raw, q, leg_asset, leg_price, leg_side)) = parse_user_channel_maker_leg(m0) {
+                        let aid = leg_asset.unwrap_or_else(|| top_asset_id.clone());
+                        let px = leg_price.unwrap_or(top_price);
+                        picked = Some((oid_raw, q, aid, px, leg_side));
+                    }
+                }
+            }
+        }
+        if picked.is_none() {
+            match arr.len() {
+                1 => {
+                    let m0 = arr.first()?;
+                    let (oid_raw, q, leg_asset, leg_price, leg_side) = parse_user_channel_maker_leg(m0)?;
+                    let aid = leg_asset.unwrap_or_else(|| top_asset_id.clone());
+                    let px = leg_price.unwrap_or(top_price);
+                    picked = Some((oid_raw, q, aid, px, leg_side));
+                }
+                _ => {
+                    debug!(
+                        trade_id = %clob_trade_id,
+                        maker_legs = arr.len(),
+                        "user-channel trade: multiple maker_orders with no ledger order id match — skip"
+                    );
+                    return None;
+                }
+            }
+        }
+        picked?
     } else {
-        // TAKER: use top-level size + taker order id.
+        // TAKER: use top-level size + taker order id (entire aggressor fill is ours on this channel).
         let tid = taker?.to_string();
         let szs = v.get("size").and_then(|s| s.as_str())?;
         let q: f64 = szs.parse().ok()?;
         if !q.is_finite() || q <= 0.0 {
             return None;
         }
-        (tid, q)
+        (tid, q, top_asset_id.clone(), top_price, None)
+    };
+    let side = if is_maker {
+        leg_maker_side
+            .as_deref()
+            .and_then(parse_clob_side_str)
+            .unwrap_or_else(|| match taker_side {
+                Side::Buy => Side::Sell,
+                Side::Sell => Side::Buy,
+            })
+    } else {
+        taker_side
     };
     if order_leg_id.is_empty() {
         return None;
@@ -594,6 +675,39 @@ pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannel
         price,
         match_ts: ts,
     })
+}
+
+fn user_ws_json_str2<'a>(obj: &'a serde_json::Value, a: &str, b: &str) -> Option<&'a str> {
+    obj.get(a)
+        .and_then(|x| x.as_str())
+        .or_else(|| obj.get(b).and_then(|x| x.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// One element of `maker_orders` / `makerOrders` in a user-channel [`try_parse_user_channel_trade`] payload.
+fn parse_user_channel_maker_leg(
+    m: &serde_json::Value,
+) -> Option<(String, f64, Option<String>, Option<f64>, Option<String>)> {
+    let oid = user_ws_json_str2(m, "order_id", "orderId")?.to_string();
+    let amt = user_ws_json_str2(m, "matched_amount", "matchedAmount")?;
+    let q: f64 = amt.parse().ok()?;
+    if !q.is_finite() || q <= 0.0 {
+        return None;
+    }
+    let leg_asset = user_ws_json_str2(m, "asset_id", "assetId").map(|s| s.to_string());
+    let leg_price = m
+        .get("price")
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0);
+    let leg_side = m
+        .get("side")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Some((oid, q, leg_asset, leg_price, leg_side))
 }
 
 fn parse_user_trade_timestamp(v: &serde_json::Value) -> DateTime<Utc> {
@@ -710,6 +824,129 @@ impl FillWaitRegistry {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod user_channel_trade_parse_tests {
+    use super::{norm_order_id_key, try_parse_user_channel_trade, Side};
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    fn trade_two_makers() -> serde_json::Value {
+        json!({
+            "event_type": "trade",
+            "id": "trade-1",
+            "status": "CONFIRMED",
+            "asset_id": "TOKEN_TOP",
+            "side": "BUY",
+            "price": "0.5",
+            "trader_side": "MAKER",
+            "taker_order_id": "0xtaker",
+            "size": "100",
+            "maker_orders": [
+                {"order_id": "0xother", "matched_amount": "50", "price": "0.51"},
+                {"order_id": "0xmine", "matched_amount": "2.5", "asset_id": "TOKEN_LEG", "price": "0.52", "side": "SELL"}
+            ]
+        })
+    }
+
+    #[test]
+    fn maker_picks_maker_orders_row_matching_open_ledger() {
+        let v = trade_two_makers();
+        let mut ks = HashSet::new();
+        ks.insert(norm_order_id_key("0xmine"));
+        let f = try_parse_user_channel_trade(&v, &ks, None).unwrap();
+        assert_eq!(f.order_leg_id, "0xmine");
+        assert!((f.qty - 2.5).abs() < 1e-9);
+        assert_eq!(f.asset_id, "TOKEN_LEG");
+        assert!((f.price - 0.52).abs() < 1e-9);
+        assert_eq!(f.side, Side::Sell);
+    }
+
+    #[test]
+    fn maker_two_legs_without_ledger_match_is_ambiguous() {
+        let v = trade_two_makers();
+        let ks = HashSet::new();
+        assert!(try_parse_user_channel_trade(&v, &ks, None).is_none());
+    }
+
+    #[test]
+    fn maker_single_leg_falls_back_without_ledger() {
+        let v = json!({
+            "event_type": "trade",
+            "id": "t2",
+            "status": "CONFIRMED",
+            "asset_id": "TOK1",
+            "side": "SELL",
+            "price": "0.4",
+            "trader_side": "MAKER",
+            "maker_orders": [
+                {"order_id": "0xsolo", "matched_amount": "3", "price": "0.41", "side": "BUY"}
+            ]
+        });
+        let ks = HashSet::new();
+        let f = try_parse_user_channel_trade(&v, &ks, None).unwrap();
+        assert_eq!(f.order_leg_id, "0xsolo");
+        assert!((f.qty - 3.0).abs() < 1e-9);
+        assert_eq!(f.side, Side::Buy);
+    }
+
+    #[test]
+    fn matched_status_parses_when_ledger_matches() {
+        let mut v = trade_two_makers();
+        v.as_object_mut().unwrap().insert("status".into(), json!("MATCHED"));
+        let mut ks = HashSet::new();
+        ks.insert(norm_order_id_key("0xmine"));
+        let f = try_parse_user_channel_trade(&v, &ks, None).unwrap();
+        assert_eq!(f.order_leg_id, "0xmine");
+    }
+
+    #[test]
+    fn maker_multi_leg_disambiguates_by_ws_api_key_owner() {
+        let my_key = "9180014b-33c8-9240-a14b-bdca11c0a465";
+        let v = json!({
+            "event_type": "trade",
+            "id": "t-owner",
+            "status": "CONFIRMED",
+            "asset_id": "TOKEN_TOP",
+            "side": "BUY",
+            "price": "0.5",
+            "trader_side": "MAKER",
+            "taker_order_id": "0xtaker",
+            "size": "100",
+            "maker_orders": [
+                {"order_id": "0xa", "matched_amount": "1", "owner": "someone-else-uuid", "price": "0.51", "asset_id": "LEG_A"},
+                {"order_id": "0xb", "matched_amount": "7", "owner": my_key, "price": "0.52", "asset_id": "LEG_B", "side": "BUY"}
+            ]
+        });
+        let ks = HashSet::new();
+        let f = try_parse_user_channel_trade(&v, &ks, Some(my_key)).unwrap();
+        assert_eq!(f.order_leg_id, "0xb");
+        assert!((f.qty - 7.0).abs() < 1e-9);
+        assert_eq!(f.asset_id, "LEG_B");
+        assert_eq!(f.side, Side::Buy);
+    }
+
+    /// [`maker_orders[].side`] is the maker's order side on that outcome token (L2 docs).
+    #[test]
+    fn maker_leg_side_used_when_present() {
+        let v = json!({
+            "event_type": "trade",
+            "id": "t-buy-leg",
+            "status": "CONFIRMED",
+            "asset_id": "DOWN_TOKEN",
+            "side": "SELL",
+            "price": "0.4",
+            "trader_side": "MAKER",
+            "taker_order_id": "0xtaker",
+            "maker_orders": [
+                {"order_id": "0xb", "matched_amount": "5", "price": "0.41", "side": "BUY"}
+            ]
+        });
+        let ks = HashSet::new();
+        let f = try_parse_user_channel_trade(&v, &ks, None).unwrap();
+        assert_eq!(f.side, Side::Buy);
     }
 }
 
@@ -2705,6 +2942,7 @@ mod buy_fill_order_id_tests {
             maker_orders: vec![ClobMakerOrder {
                 order_id: oid.to_string(),
                 matched_amount: "3.5".into(),
+                ..Default::default()
             }],
             trader_side: Some("MAKER".into()),
         }];

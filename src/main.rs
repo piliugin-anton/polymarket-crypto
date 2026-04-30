@@ -1319,7 +1319,7 @@ async fn main() -> Result<()> {
                     debug!(error = %e, market = %condition_id, "fetch /data/trades failed; avg entry unknown");
                     vec![]
                 });
-                let (position_up, position_down, _fills_from_rest) = hydrate_positions_from_trades(
+                let (position_up, position_down, fills_bootstrap) = hydrate_positions_from_trades(
                     &trades,
                     &up_id,
                     &down_id,
@@ -1330,14 +1330,13 @@ async fn main() -> Result<()> {
                     data_api_up,
                     data_api_down,
                 );
-                // Fills come exclusively from the user WebSocket (CONFIRMED trade events).
-                // The REST result is used only for VWAP/position computation above; seeding
-                // fills_bootstrap from it causes duplicates when the WS delivers the same trades.
+                // Bootstrap fills + trade IDs from `GET /data/trades` so UI shows history after
+                // restart; [`UserTradeSync::seed_seen_trades_from_rest`] dedupes user-channel replay.
                 let _ = txp
                     .send(AppEvent::PositionsLoaded {
                         position_up,
                         position_down,
-                        fills_bootstrap: vec![],
+                        fills_bootstrap,
                         refresh_status_line: true,
                     })
                     .await;
