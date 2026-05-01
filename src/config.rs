@@ -70,6 +70,8 @@ pub struct Config {
     /// limit buys arm the same trail when the fill arrives on the user channel as a **maker** leg
     /// (`MARKET_BUY_TRAIL_BPS` + values from the last market roll).
     pub market_buy_trail_bps: u32,
+    /// Enables the Markov/context detection indicator and its in-memory collectors.
+    pub detection_enabled: bool,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,
     /// Address paired with the relayer API key (same screen in Polymarket settings).
@@ -131,6 +133,11 @@ impl Config {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
 
+        let detection_enabled = std::env::var("DETECTION_ENABLED")
+            .ok()
+            .and_then(|s| parse_env_bool(&s))
+            .unwrap_or(true);
+
         let relayer_api_key = std::env::var("POLYMARKET_RELAYER_API_KEY")
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -167,9 +174,32 @@ impl Config {
             market_sell_slippage_bps,
             market_buy_take_profit_bps,
             market_buy_trail_bps,
+            detection_enabled,
             relayer_api_key,
             relayer_api_key_address,
             polygon_rpc_url,
         })
+    }
+}
+
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_env_bool;
+
+    #[test]
+    fn parse_env_bool_accepts_common_values() {
+        assert_eq!(parse_env_bool("true"), Some(true));
+        assert_eq!(parse_env_bool("1"), Some(true));
+        assert_eq!(parse_env_bool("off"), Some(false));
+        assert_eq!(parse_env_bool("FALSE"), Some(false));
+        assert_eq!(parse_env_bool("maybe"), None);
     }
 }

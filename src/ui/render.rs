@@ -21,6 +21,8 @@ use crate::bridge_deposit::SOLANA_MAINNET_USDC_MINT;
 use crate::market_profile::Timeframe;
 
 const SPACES: &str = "                                "; // 32 spaces — wider than any balance panel
+const HELP_KEYS_LINES: u16 = 1;
+const HELP_DETECTION_LINES: u16 = 1;
 
 pub fn draw(f: &mut Frame, s: &AppState) {
     let now = Instant::now();
@@ -40,7 +42,7 @@ pub fn draw(f: &mut Frame, s: &AppState) {
         Constraint::Min(8),    // main — book + positions (less vertical space than before)
         Constraint::Length(8), // open orders
         Constraint::Length(8), // fills
-        Constraint::Length(3), // help
+        Constraint::Length(help_block_height(s)), // help
     ]).split(area);
 
     draw_header_row(f, chunks[0], s);
@@ -60,6 +62,16 @@ pub fn draw(f: &mut Frame, s: &AppState) {
             draw_order_error_toast(f, area, t.message.as_str());
         }
     }
+}
+
+fn help_block_height(s: &AppState) -> u16 {
+    let content = HELP_KEYS_LINES
+        + if s.detection_enabled {
+            HELP_DETECTION_LINES
+        } else {
+            0
+        };
+    content + 2 // rounded border consumes top/bottom rows
 }
 
 // ── Header (BTC left, Balance right) ────────────────────────────────
@@ -520,13 +532,19 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         key("q", "quit"),
     ]);
 
-    let status = Line::from(vec![
-        Span::styled("› ", Style::default().fg(Color::DarkGray)),
-        Span::raw(truncate(&s.status_line, 100)),
-    ]);
+    let mut lines = vec![keys];
+    if s.detection_enabled {
+        lines.push(Line::from(vec![
+            Span::styled("↳ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate(&s.detection_status_line(), 120),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]));
+    }
 
     let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
-    let p = Paragraph::new(vec![keys, status]).block(block);
+    let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
 }
 
@@ -1037,5 +1055,21 @@ mod tests {
         let r = truncate(&s, 5);
         assert!(r.ends_with('…'));
         assert_eq!(r.chars().count(), 5); // 4 'a' + ellipsis
+    }
+
+    #[test]
+    fn help_block_height_tracks_detection_flag() {
+        let enabled = AppState::new_with_detection(
+            5.0,
+            std::sync::Arc::new(crate::feeds::user_trade_sync::UserTradeSync::new()),
+            true,
+        );
+        let disabled = AppState::new_with_detection(
+            5.0,
+            std::sync::Arc::new(crate::feeds::user_trade_sync::UserTradeSync::new()),
+            false,
+        );
+        assert_eq!(help_block_height(&enabled), HELP_KEYS_LINES + HELP_DETECTION_LINES + 2);
+        assert_eq!(help_block_height(&disabled), HELP_KEYS_LINES + 2);
     }
 }

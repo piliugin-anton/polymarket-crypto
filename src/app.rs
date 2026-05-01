@@ -15,6 +15,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::detection::{
+    BidSignal, DetectionCandidate, DetectionConfig, DetectionContext, DetectionJob,
+    DetectionJobResult, DetectionOutcome, MarkovPrior, ResolutionPrior,
+};
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
 use crate::fees::polymarket_crypto_taker_fee_usdc;
 use crate::gamma::ActiveMarket;
@@ -34,6 +38,11 @@ pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
 /// like `tokio::sync::Semaphore(N)` to limit API / exchange load; see `try_dispatch_trailing_sell` in
 /// `main.rs`).
 pub const TRAILING_SELL_MAX_PARALLEL: usize = 8;
+
+const DETECTION_HISTORY_MAX: usize = 256;
+const DETECTION_MIN_HISTORY: usize = 8;
+const DETECTION_WINDOW_BOOK_POINTS_MAX: usize = 512;
+const DETECTION_COMPLETED_WINDOWS_MAX: usize = 256;
 
 /// Map key in [`AppState::trailing`] for this CLOB asset.
 /// Two hash lookups: direct, then canonical form. Keys are always canonical, so this covers all cases.
@@ -120,6 +129,8 @@ pub enum AppEvent {
     BalancePanelLoaded { cash_usdc: f64, claimable_usdc: f64 },
     /// `GET /holders` — per-`proxyWallet` sums: if a wallet holds both outcomes, only the larger leg counts; then summed per side (Sentiment).
     TopHoldersSentiment { up_sum: f64, down_sum: f64 },
+    /// Background detection worker finished a Monte Carlo run.
+    DetectionSignalReady(DetectionJobResult),
     Key(crossterm::event::KeyEvent),
     /// `clob_order_id` is Polymarket `orderID` from the POST /order body — for fill de-dupe vs user WS.
     /// `token_id` is the CLOB outcome token this fill applies to (must match the order's asset).
@@ -231,6 +242,47 @@ pub struct PendingTrailArm {
     pub token_id:        String,
     pub trail_bps:       u32,
     pub activation_bps:  u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DetectionSignalView {
+    pub outcome: Outcome,
+    pub signal:  BidSignal,
+}
+
+#[allow(dead_code)] // Runtime dataset for later backtests/export; not all fields are rendered live.
+#[derive(Debug, Clone)]
+pub struct DetectionBookPoint {
+    pub rel_secs:      i64,
+    pub secs_to_close: i64,
+    pub bid:           Option<f64>,
+    pub ask:           Option<f64>,
+    pub mid:           Option<f64>,
+}
+
+#[allow(dead_code)] // Runtime dataset for later backtests/export; not all fields are rendered live.
+#[derive(Debug, Clone)]
+pub struct DetectionSpotPoint {
+    pub rel_secs:      i64,
+    pub secs_to_close: i64,
+    pub price:         f64,
+    pub distance_bps:  Option<f64>,
+}
+
+#[allow(dead_code)] // Runtime dataset for later backtests/export; not all fields are rendered live.
+#[derive(Debug, Clone)]
+pub struct DetectionWindowSample {
+    pub asset_label:    String,
+    pub timeframe_label: String,
+    pub market_slug:    String,
+    pub opens_at:       DateTime<Utc>,
+    pub closes_at:      DateTime<Utc>,
+    pub price_to_beat:  Option<f64>,
+    pub close_spot:     Option<f64>,
+    pub resolved:       Option<Outcome>,
+    pub spot_series:    Vec<DetectionSpotPoint>,
+    pub up_series:      Vec<DetectionBookPoint>,
+    pub down_series:    Vec<DetectionBookPoint>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -453,6 +505,18 @@ pub struct AppState {
 
     /// Pre-computed from CLOB mid + top-holder sums; updated on Book and TopHoldersSentiment events.
     pub cached_sentiment: SentimentDir,
+    pub detection_enabled: bool,
+    /// Markov/Monte Carlo edge signal computed from recent CLOB mids.
+    pub detection_signal: Option<DetectionSignalView>,
+    detection_seq: u64,
+    pending_detection_job: Option<DetectionJob>,
+    detection_up_prior: MarkovPrior,
+    detection_down_prior: MarkovPrior,
+    detection_resolution_prior: ResolutionPrior,
+    detection_up_history: VecDeque<f64>,
+    detection_down_history: VecDeque<f64>,
+    detection_current_window: Option<DetectionWindowSample>,
+    pub detection_completed_windows: VecDeque<DetectionWindowSample>,
     /// Updated once per second in the Tick handler; avoids `Utc::now()` in the draw path.
     pub cached_countdown_secs: Option<i64>,
     /// `”{asset}/USD”` label, set once on StartTrading.
@@ -482,7 +546,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(test)]
     pub fn new(default_size_usdc: f64, user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>) -> Self {
+        Self::new_with_detection(default_size_usdc, user_trade_sync, true)
+    }
+
+    pub fn new_with_detection(
+        default_size_usdc: f64,
+        user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>,
+        detection_enabled: bool,
+    ) -> Self {
         Self {
             ui_phase:            UiPhase::WizardLoading,
             wizard_rows:         Vec::new(),
@@ -514,6 +587,17 @@ impl AppState {
             top_holders_up_sum: None,
             top_holders_down_sum: None,
             cached_sentiment: SentimentDir::Unknown,
+            detection_enabled,
+            detection_signal: None,
+            detection_seq: 0,
+            pending_detection_job: None,
+            detection_up_prior: MarkovPrior::default(),
+            detection_down_prior: MarkovPrior::default(),
+            detection_resolution_prior: ResolutionPrior::default(),
+            detection_up_history: VecDeque::with_capacity(DETECTION_HISTORY_MAX),
+            detection_down_history: VecDeque::with_capacity(DETECTION_HISTORY_MAX),
+            detection_current_window: None,
+            detection_completed_windows: VecDeque::with_capacity(DETECTION_COMPLETED_WINDOWS_MAX),
             cached_countdown_secs: None,
             cached_pair_label: "\u{2014}/USD".to_string(), // "—/USD"
             user_trade_sync,
@@ -1096,6 +1180,265 @@ impl AppState {
         };
     }
 
+    fn record_detection_mid(&mut self, outcome: Outcome) {
+        if !self.detection_enabled {
+            return;
+        }
+        let Some(mid) = self.mark(outcome) else {
+            return;
+        };
+        if !(0.0..=1.0).contains(&mid) || !mid.is_finite() {
+            return;
+        }
+        let (history, prior) = match outcome {
+            Outcome::Up => (&mut self.detection_up_history, &mut self.detection_up_prior),
+            Outcome::Down => (&mut self.detection_down_history, &mut self.detection_down_prior),
+        };
+        if history.back().is_some_and(|last| (last - mid).abs() < 1e-6) {
+            return;
+        }
+        if let Some(prev) = history.back().copied() {
+            prior.record_transition(prev, mid);
+        }
+        if history.len() == DETECTION_HISTORY_MAX {
+            history.pop_front();
+        }
+        history.push_back(mid);
+    }
+
+    fn start_detection_window_sample(&mut self) {
+        if !self.detection_enabled {
+            self.detection_current_window = None;
+            return;
+        }
+        let Some(market) = self.market.as_ref() else {
+            self.detection_current_window = None;
+            return;
+        };
+        let (asset_label, timeframe_label) = self
+            .market_profile
+            .as_ref()
+            .map(|p| (p.asset.label.to_string(), p.timeframe.label().to_string()))
+            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+        self.detection_current_window = Some(DetectionWindowSample {
+            asset_label,
+            timeframe_label,
+            market_slug: market.slug.clone(),
+            opens_at: market.opens_at,
+            closes_at: market.closes_at,
+            price_to_beat: self.price_to_beat(),
+            close_spot: self.spot_price,
+            resolved: None,
+            spot_series: Vec::new(),
+            up_series: Vec::new(),
+            down_series: Vec::new(),
+        });
+    }
+
+    fn update_detection_window_spot(&mut self) {
+        if !self.detection_enabled {
+            return;
+        }
+        let price_to_beat = self.price_to_beat();
+        if let Some(sample) = self.detection_current_window.as_mut() {
+            if sample.price_to_beat.is_none() {
+                sample.price_to_beat = price_to_beat;
+            }
+            sample.close_spot = self.spot_price;
+            let Some(price) = self.spot_price else {
+                return;
+            };
+            let now = Utc::now();
+            let distance_bps = sample
+                .price_to_beat
+                .filter(|target| target.is_finite() && *target > 0.0)
+                .map(|target| (price - target) / target * 10_000.0);
+            sample.spot_series.push(DetectionSpotPoint {
+                rel_secs: (now - sample.opens_at).num_seconds(),
+                secs_to_close: (sample.closes_at - now).num_seconds(),
+                price,
+                distance_bps,
+            });
+        }
+    }
+
+    fn record_detection_book_point(&mut self, outcome: Outcome, book: &BookSnapshot) {
+        if !self.detection_enabled {
+            return;
+        }
+        let Some(sample) = self.detection_current_window.as_mut() else {
+            return;
+        };
+        let now = Utc::now();
+        let point = DetectionBookPoint {
+            rel_secs: (now - sample.opens_at).num_seconds(),
+            secs_to_close: (sample.closes_at - now).num_seconds(),
+            bid: book.bids.first().map(|l| l.price),
+            ask: book.asks.first().map(|l| l.price),
+            mid: book_mid(book),
+        };
+        let series = match outcome {
+            Outcome::Up => &mut sample.up_series,
+            Outcome::Down => &mut sample.down_series,
+        };
+        if series.len() == DETECTION_WINDOW_BOOK_POINTS_MAX {
+            series.remove(0);
+        }
+        series.push(point);
+    }
+
+    fn finalize_detection_window_sample(&mut self) {
+        if !self.detection_enabled {
+            self.detection_current_window = None;
+            return;
+        }
+        let Some(mut sample) = self.detection_current_window.take() else {
+            return;
+        };
+        if Utc::now() < sample.closes_at {
+            return;
+        }
+        if sample.price_to_beat.is_none() {
+            sample.price_to_beat = self.price_to_beat();
+        }
+        if sample.close_spot.is_none() {
+            sample.close_spot = self.spot_price;
+        }
+        sample.resolved = match (sample.close_spot, sample.price_to_beat) {
+            (Some(close), Some(target)) => Some(if close >= target { Outcome::Up } else { Outcome::Down }),
+            _ => None,
+        };
+        self.learn_from_detection_window_sample(&sample);
+        if self.detection_completed_windows.len() == DETECTION_COMPLETED_WINDOWS_MAX {
+            self.detection_completed_windows.pop_front();
+        }
+        self.detection_completed_windows.push_back(sample);
+    }
+
+    fn learn_from_detection_window_sample(&mut self, sample: &DetectionWindowSample) {
+        let Some(resolved) = sample.resolved else {
+            return;
+        };
+        let resolved = match resolved {
+            Outcome::Up => DetectionOutcome::Up,
+            Outcome::Down => DetectionOutcome::Down,
+        };
+        let window_secs = (sample.closes_at - sample.opens_at).num_seconds().max(1);
+        for point in &sample.spot_series {
+            let Some(distance_bps) = point.distance_bps else {
+                continue;
+            };
+            self.detection_resolution_prior.record_observation(
+                distance_bps,
+                point.rel_secs,
+                window_secs,
+                resolved,
+            );
+        }
+    }
+
+    fn detection_candidate_snapshot(
+        &self,
+        outcome: Outcome,
+        history: &VecDeque<f64>,
+    ) -> Option<DetectionCandidate> {
+        if history.len() < DETECTION_MIN_HISTORY {
+            return None;
+        }
+        let market_probability = self.best_bid(outcome).or_else(|| self.mark(outcome))?;
+        let prices: Vec<f64> = history.iter().copied().collect();
+        let outcome = match outcome {
+            Outcome::Up => DetectionOutcome::Up,
+            Outcome::Down => DetectionOutcome::Down,
+        };
+        Some(DetectionCandidate {
+            outcome,
+            prices,
+            market_probability,
+            context: self.detection_context(outcome),
+            prior: match outcome {
+                DetectionOutcome::Up => self.detection_up_prior.clone(),
+                DetectionOutcome::Down => self.detection_down_prior.clone(),
+            },
+            resolution_prior: self.detection_resolution_prior.clone(),
+        })
+    }
+
+    fn detection_context(&self, outcome: DetectionOutcome) -> Option<DetectionContext> {
+        let market = self.market.as_ref()?;
+        let spot_price = self.spot_price?;
+        let price_to_beat = self.price_to_beat()?;
+        let window_secs = (market.closes_at - market.opens_at).num_seconds().max(1);
+        let elapsed_secs = (Utc::now() - market.opens_at)
+            .num_seconds()
+            .clamp(0, window_secs);
+        Some(DetectionContext {
+            outcome,
+            spot_price,
+            price_to_beat,
+            elapsed_secs,
+            window_secs,
+        })
+    }
+
+    fn queue_detection_job(&mut self) {
+        if !self.detection_enabled {
+            self.pending_detection_job = None;
+            return;
+        }
+        let candidates: Vec<_> = [
+            self.detection_candidate_snapshot(Outcome::Up, &self.detection_up_history),
+            self.detection_candidate_snapshot(Outcome::Down, &self.detection_down_history),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        self.detection_seq = self.detection_seq.saturating_add(1);
+        self.pending_detection_job = Some(DetectionJob {
+            seq: self.detection_seq,
+            market_slug: self.market.as_ref().map(|m| m.slug.clone()),
+            candidates,
+            cfg: DetectionConfig::default(),
+        });
+    }
+
+    pub fn take_detection_job(&mut self) -> Option<DetectionJob> {
+        self.pending_detection_job.take()
+    }
+
+    fn apply_detection_result(&mut self, result: DetectionJobResult) {
+        if !self.detection_enabled {
+            return;
+        }
+        if result.seq != self.detection_seq {
+            return;
+        }
+        let current_slug = self.market.as_ref().map(|m| m.slug.as_str());
+        if result.market_slug.as_deref() != current_slug {
+            return;
+        }
+        self.detection_signal = result.best.map(|(outcome, signal)| DetectionSignalView {
+            outcome: match outcome {
+                DetectionOutcome::Up => Outcome::Up,
+                DetectionOutcome::Down => Outcome::Down,
+            },
+            signal,
+        });
+    }
+
+    pub fn detection_status_line(&self) -> String {
+        if !self.detection_enabled {
+            return String::new();
+        }
+        match self.detection_signal {
+            Some(view) => format!("Detection: {} {}", view.outcome.as_str(), view.signal.short_label()),
+            None => "Detection: warming up Markov history".to_string(),
+        }
+    }
+
     // ── Mutations ───────────────────────────────────────────────────
     pub async fn apply(&mut self, ev: AppEvent) {
         match ev {
@@ -1123,23 +1466,28 @@ impl AppState {
                         }
                     }
                 }
+                self.update_detection_window_spot();
+                self.queue_detection_job();
             }
             AppEvent::Book(mut b) => {
                 b.asset_id = canonical_clob_token_id(&b.asset_id).into_owned();
                 let id_for_trail = b.asset_id.clone();
                 let snap = Arc::new(b);
+                let mut detection_outcome = None;
                 if let Some(m) = &self.market {
                     if snap.asset_id == m.up_token_id {
                         self.book_up = Some(Arc::clone(&snap));
+                        detection_outcome = Some(Outcome::Up);
                     } else if snap.asset_id == m.down_token_id {
                         self.book_down = Some(Arc::clone(&snap));
+                        detection_outcome = Some(Outcome::Down);
                     }
                 }
                 // Use the cached sorted watch list — binary search, no HashSet allocation.
                 // cached_book_watch_tokens is rebuilt at the end of apply() to capture any
                 // state changes made by try_promote_pending_trail_any / apply_trailing_book_tick.
                 if self.cached_book_watch_tokens.binary_search(&id_for_trail).is_ok() {
-                    self.watched_books.insert(id_for_trail.clone(), snap);
+                    self.watched_books.insert(id_for_trail.clone(), Arc::clone(&snap));
                     let tokens = &self.cached_book_watch_tokens;
                     self.watched_books.retain(|k, _| tokens.binary_search(k).is_ok());
                 }
@@ -1149,12 +1497,19 @@ impl AppState {
                     self.apply_trailing_book_tick(id_for_trail.as_str(), bid);
                 }
                 self.recompute_sentiment();
+                if let Some(outcome) = detection_outcome {
+                    self.record_detection_book_point(outcome, snap.as_ref());
+                    self.record_detection_mid(outcome);
+                    self.queue_detection_job();
+                }
             }
+            AppEvent::DetectionSignalReady(result) => self.apply_detection_result(result),
             AppEvent::MarketRoll {
                 market,
                 buy_trail_bps,
                 buy_trail_activation_bps,
             } => {
+                self.finalize_detection_window_sample();
                 // Close any positions from the previous market — they'll resolve
                 // via Polymarket and show up as realized once winnings redeem.
                 // We keep realized_pnl but zero out live positions for the new market.
@@ -1178,7 +1533,13 @@ impl AppState {
                 self.top_holders_down_sum = None;
                 self.watched_books.clear();
                 self.cached_sentiment = SentimentDir::Unknown;
+                self.detection_signal = None;
+                self.detection_seq = self.detection_seq.saturating_add(1);
+                self.pending_detection_job = None;
+                self.detection_up_history.clear();
+                self.detection_down_history.clear();
                 self.cached_countdown_secs = None;
+                self.start_detection_window_sample();
             }
             AppEvent::PriceToBeatRefresh { slug, price_to_beat } => {
                 if let Some(m) = &mut self.market {
@@ -1186,6 +1547,7 @@ impl AppState {
                         if let Some(ptb) = price_to_beat {
                             m.price_to_beat = Some(ptb);
                             self.latched_price_to_beat = None;
+                            self.update_detection_window_spot();
                         }
                     }
                 }
@@ -1238,13 +1600,17 @@ impl AppState {
                 self.reconcile_position_shares_with_fill_deque(Outcome::Up);
                 self.reconcile_position_shares_with_fill_deque(Outcome::Down);
                 if refresh_status_line {
-                    self.status_line = format!(
-                        "Positions from CLOB — UP {:.2} @ {:.2} / DOWN {:.2} @ {:.2}",
-                        self.position_up.shares,
-                        self.position_up.avg_entry,
-                        self.position_down.shares,
-                        self.position_down.avg_entry,
-                    );
+                    if self.position_up.shares <= 1e-9 && self.position_down.shares <= 1e-9 {
+                        self.status_line = "No active CLOB positions on this market".into();
+                    } else {
+                        self.status_line = format!(
+                            "Positions from CLOB — UP {:.2} @ {:.2} / DOWN {:.2} @ {:.2}",
+                            self.position_up.shares,
+                            self.position_up.avg_entry,
+                            self.position_down.shares,
+                            self.position_down.avg_entry,
+                        );
+                    }
                 }
                 if let Some(m) = self.market.clone() {
                     self.sync_trailing_inventory_with_positions();
@@ -1505,6 +1871,7 @@ impl AppState {
                 self.spot_price = None;
                 self.spot_price_ts = None;
                 self.market = None;
+                self.detection_current_window = None;
                 self.book_up = None;
                 self.book_down = None;
                 self.latched_price_to_beat = None;
@@ -1521,6 +1888,14 @@ impl AppState {
                 self.status_line = "Waiting for market data…".into();
                 self.cached_pair_label = format!("{}/USD", p.asset.label);
                 self.cached_sentiment = SentimentDir::Unknown;
+                self.detection_signal = None;
+                self.detection_seq = self.detection_seq.saturating_add(1);
+                self.pending_detection_job = None;
+                self.detection_up_prior = MarkovPrior::default();
+                self.detection_down_prior = MarkovPrior::default();
+                self.detection_resolution_prior = ResolutionPrior::default();
+                self.detection_up_history.clear();
+                self.detection_down_history.clear();
                 self.cached_countdown_secs = None;
                 self.buy_trail_bps = 0;
                 self.buy_trail_activation_bps = 0;
@@ -2345,10 +2720,13 @@ mod tests {
     use super::*;
 
     use chrono::Utc;
+    use crate::detection::BidRecommendation;
+    use crate::feeds::chainlink::PriceTick;
     use crate::feeds::clob_ws::{BookLevel, BookSnapshot};
     use crate::feeds::user_trade_sync::UserTradeSync;
     use crate::fees::polymarket_crypto_taker_fee_usdc;
     use crate::gamma::ActiveMarket;
+    use crate::market_profile::{MarketProfile, CRYPTO_ASSETS, Timeframe};
     use crate::trading::{ClobMakerOrder, ClobOpenOrder, ClobTrade};
 
     fn test_state() -> AppState {
@@ -3157,6 +3535,167 @@ mod tests {
             best > 0.51,
             "trailing must follow book updates when asset_id string form differs; best={best}"
         );
+    }
+
+    #[tokio::test]
+    async fn positions_loaded_flat_status_does_not_show_zero_position_row() {
+        let mut s = test_state();
+        s.status_line = "New market: test".into();
+        s.apply(AppEvent::PositionsLoaded {
+            position_up:         Position::default(),
+            position_down:       Position::default(),
+            fills_bootstrap:      vec![],
+            refresh_status_line: true,
+        })
+        .await;
+
+        assert_eq!(s.status_line, "No active CLOB positions on this market");
+    }
+
+    #[tokio::test]
+    async fn stale_detection_worker_result_is_ignored() {
+        let mut s = test_state();
+        s.detection_seq = 2;
+        let signal = BidSignal {
+            recommendation: BidRecommendation::MakerUp,
+            fair_probability: 0.80,
+            markov_probability: 0.75,
+            context_probability: 0.85,
+            market_probability: 0.60,
+            delta: 0.20,
+            expected_value: 0.20,
+            kelly_fraction: 0.20,
+            no_delta: -0.20,
+            no_expected_value: -0.20,
+            no_kelly_fraction: 0.0,
+        };
+        s.apply(AppEvent::DetectionSignalReady(crate::detection::DetectionJobResult {
+            seq: 1,
+            market_slug: None,
+            best: Some((DetectionOutcome::Up, signal)),
+        }))
+        .await;
+
+        assert!(s.detection_signal.is_none());
+    }
+
+    #[tokio::test]
+    async fn detection_prior_survives_market_roll() {
+        let mut s = test_state();
+        let m1 = test_market("UP1", "DOWN1", "0xprior1");
+        let m2 = test_market("UP2", "DOWN2", "0xprior2");
+        s.market = Some(m1.clone());
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP1".into(),
+            bids:     vec![BookLevel { price: 0.40, size: 100.0 }],
+            asks:     vec![BookLevel { price: 0.42, size: 100.0 }],
+        }));
+        s.record_detection_mid(Outcome::Up);
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP1".into(),
+            bids:     vec![BookLevel { price: 0.55, size: 100.0 }],
+            asks:     vec![BookLevel { price: 0.57, size: 100.0 }],
+        }));
+        s.record_detection_mid(Outcome::Up);
+        assert_eq!(s.detection_up_prior.total_transitions(), 1);
+
+        s.apply(AppEvent::MarketRoll {
+            market: m2,
+            buy_trail_bps: 0,
+            buy_trail_activation_bps: 0,
+        })
+        .await;
+
+        assert_eq!(s.detection_up_prior.total_transitions(), 1);
+        assert!(s.detection_up_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detection_window_dataset_collects_completed_market() {
+        let mut s = test_state();
+        s.market_profile = Some(Arc::new(MarketProfile {
+            asset: CRYPTO_ASSETS[0].clone(),
+            timeframe: Timeframe::M5,
+        }));
+        let now = Utc::now();
+        let mut m1 = test_market("UP_DATA", "DOWN_DATA", "0xdata1");
+        m1.slug = "btc-updown-5m-old".into();
+        m1.price_to_beat = Some(100.0);
+        m1.opens_at = now - chrono::Duration::seconds(301);
+        m1.closes_at = now - chrono::Duration::seconds(1);
+        let mut m2 = test_market("UP_NEXT", "DOWN_NEXT", "0xdata2");
+        m2.slug = "btc-updown-5m-new".into();
+        m2.opens_at = now;
+        m2.closes_at = now + chrono::Duration::seconds(300);
+
+        s.apply(AppEvent::MarketRoll {
+            market: m1,
+            buy_trail_bps: 0,
+            buy_trail_activation_bps: 0,
+        })
+        .await;
+        s.apply(AppEvent::Price(PriceTick {
+            price: 101.0,
+            timestamp_ms: now.timestamp_millis() as u64,
+        }))
+        .await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_DATA".into(),
+            bids: vec![BookLevel { price: 0.56, size: 10.0 }],
+            asks: vec![BookLevel { price: 0.58, size: 12.0 }],
+        }))
+        .await;
+        s.apply(AppEvent::MarketRoll {
+            market: m2,
+            buy_trail_bps: 0,
+            buy_trail_activation_bps: 0,
+        })
+        .await;
+
+        let sample = s.detection_completed_windows.back().expect("completed window");
+        assert_eq!(sample.asset_label, "BTC");
+        assert_eq!(sample.timeframe_label, "5m");
+        assert_eq!(sample.market_slug, "btc-updown-5m-old");
+        assert_eq!(sample.price_to_beat, Some(100.0));
+        assert_eq!(sample.close_spot, Some(101.0));
+        assert_eq!(sample.resolved, Some(Outcome::Up));
+        assert_eq!(sample.spot_series.len(), 1);
+        assert_eq!(sample.spot_series[0].price, 101.0);
+        assert_eq!(s.detection_resolution_prior.total_observations(), 1);
+        assert_eq!(sample.up_series.len(), 1);
+        assert_eq!(sample.up_series[0].bid, Some(0.56));
+        assert_eq!(sample.up_series[0].ask, Some(0.58));
+        assert!((sample.up_series[0].mid.unwrap() - 0.57).abs() < 1e-12);
+        assert!(sample.up_series[0].rel_secs >= 0);
+        assert!(sample.up_series[0].secs_to_close <= 0);
+    }
+
+    #[tokio::test]
+    async fn detection_disabled_does_not_queue_jobs_or_collect_windows() {
+        let mut s = AppState::new_with_detection(5.0, Arc::new(UserTradeSync::new()), false);
+        let mut m = test_market("UP_OFF", "DOWN_OFF", "0xoff");
+        m.price_to_beat = Some(100.0);
+        s.apply(AppEvent::MarketRoll {
+            market: m,
+            buy_trail_bps: 0,
+            buy_trail_activation_bps: 0,
+        })
+        .await;
+        s.apply(AppEvent::Price(PriceTick {
+            price: 101.0,
+            timestamp_ms: Utc::now().timestamp_millis() as u64,
+        }))
+        .await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_OFF".into(),
+            bids: vec![BookLevel { price: 0.51, size: 10.0 }],
+            asks: vec![BookLevel { price: 0.53, size: 10.0 }],
+        }))
+        .await;
+
+        assert!(s.take_detection_job().is_none());
+        assert!(s.detection_current_window.is_none());
+        assert!(s.detection_status_line().is_empty());
     }
 
     /// REST replay shows a flat book — drop armed / pending trails so we never FAK-sell air.

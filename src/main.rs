@@ -18,6 +18,7 @@ mod app;
 mod balances;
 mod bridge_deposit;
 mod config;
+mod detection;
 mod fees;
 mod take_profit;
 mod data_api;
@@ -196,6 +197,7 @@ async fn apply_app_event(
     discovery_spawned: &mut bool,
     user_bundle_tx:  &watch::Sender<UserWsBundle>,
     book_token_tx:   &watch::Sender<Vec<String>>,
+    detection_job_tx: &watch::Sender<Option<detection::DetectionJob>>,
 ) -> bool {
     match ev {
         AppEvent::Key(k) => {
@@ -302,6 +304,7 @@ async fn apply_app_event(
                     // after Book events so we skip the call on every Price/Tick/etc. message.
                     let is_book_ev = matches!(ev, AppEvent::Book(_));
                     state.apply(ev).await;
+                    send_detection_job_if_queued(state, detection_job_tx);
                     if is_book_ev {
                         try_dispatch_trailing_sell(
                             state,
@@ -317,6 +320,41 @@ async fn apply_app_event(
             false
         }
     }
+}
+
+fn send_detection_job_if_queued(
+    state: &mut AppState,
+    detection_job_tx: &watch::Sender<Option<detection::DetectionJob>>,
+) {
+    if let Some(job) = state.take_detection_job() {
+        let _ = detection_job_tx.send(Some(job));
+    }
+}
+
+fn spawn_detection_worker(
+    tx: mpsc::Sender<AppEvent>,
+    mut rx: watch::Receiver<Option<detection::DetectionJob>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            if rx.changed().await.is_err() {
+                break;
+            }
+            let Some(job) = rx.borrow_and_update().clone() else {
+                continue;
+            };
+            let result = match tokio::task::spawn_blocking(move || detection::run_detection_job(job)).await {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!(error = %e, "detection worker task failed");
+                    continue;
+                }
+            };
+            if tx.send(AppEvent::DetectionSignalReady(result)).await.is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// After book ticks trip client-side trails, FAK SELLs run as soon as the CLOB can price them.
@@ -1051,6 +1089,11 @@ async fn main() -> Result<()> {
 
     // Shared event channel — generous buffer so bursts from the book WS don't drop
     let (tx, mut rx) = mpsc::channel::<AppEvent>(2048);
+    let (detection_job_tx, detection_job_rx) =
+        watch::channel::<Option<detection::DetectionJob>>(None);
+    if cfg.detection_enabled {
+        spawn_detection_worker(tx.clone(), detection_job_rx);
+    }
 
     let (rtds_sym_tx, rtds_sym_rx) = watch::channel(String::new());
 
@@ -1557,7 +1600,11 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
 
-    let mut state = AppState::new(cfg.default_size_usdc, user_trade_sync.clone());
+    let mut state = AppState::new_with_detection(
+        cfg.default_size_usdc,
+        user_trade_sync.clone(),
+        cfg.detection_enabled,
+    );
     let mut discovery_spawned = false;
     let _ = user_bundle_tx.send(build_user_ws_bundle(&state));
     send_book_watch_if_changed(&state, &book_token_tx);
@@ -1594,6 +1641,7 @@ async fn main() -> Result<()> {
                 &mut discovery_spawned,
                 &user_bundle_tx,
                 &book_token_tx,
+                &detection_job_tx,
             )
             .await
             {
@@ -1638,6 +1686,7 @@ async fn main() -> Result<()> {
                                 &mut discovery_spawned,
                                 &user_bundle_tx,
                                 &book_token_tx,
+                                &detection_job_tx,
                             )
                             .await
                             {
@@ -1671,6 +1720,7 @@ async fn main() -> Result<()> {
                     &mut discovery_spawned,
                     &user_bundle_tx,
                     &book_token_tx,
+                    &detection_job_tx,
                 )
                 .await
                 {
