@@ -15,9 +15,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::detection::{
-    BidDecision, BidSkipReason, DetectionOutcome, ResolutionPrior, WindowBidConfig, WindowBidInput,
-};
+use tokio::sync::mpsc;
+
+use crate::detection::{BidDecision, BidSkipReason};
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
 use crate::fees::polymarket_crypto_taker_fee_usdc;
 use crate::gamma::ActiveMarket;
@@ -31,6 +31,24 @@ use crate::trading::{
 use crate::trailing_stop::{Activation, Side as TrailSide, TickOutcome, TrailSpec, TrailingStop};
 use tracing::debug;
 
+pub use crate::detection_runtime::{
+    DetectionCmd, DetectionMarketSnap, DetectionRuntime, DetectionSignalView,
+};
+
+enum DetectionEngine {
+    Inline(DetectionRuntime),
+    Remote(mpsc::Sender<DetectionCmd>),
+}
+
+impl std::fmt::Debug for DetectionEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inline(_) => f.write_str("Inline"),
+            Self::Remote(_) => f.write_str("Remote"),
+        }
+    }
+}
+
 /// Minimum outcome shares for a limit (GTD) order — enforced in the UI before submit.
 pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
 
@@ -38,9 +56,6 @@ pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
 /// like `tokio::sync::Semaphore(N)` to limit API / exchange load; see `try_dispatch_trailing_sell` in
 /// `main.rs`).
 pub const TRAILING_SELL_MAX_PARALLEL: usize = 8;
-
-const DETECTION_WINDOW_BOOK_POINTS_MAX: usize = 512;
-const DETECTION_COMPLETED_WINDOWS_MAX: usize = 256;
 
 /// Map key in [`AppState::trailing`] for this CLOB asset.
 /// Two hash lookups: direct, then canonical form. Keys are always canonical, so this covers all cases.
@@ -203,6 +218,10 @@ pub enum AppEvent {
         success: bool,
         error: Option<String>,
     },
+    /// Async detection worker finished recompute — merge without blocking the feed path.
+    DetectionUpdate {
+        signal: Option<DetectionSignalView>,
+    },
 }
 
 // ── UI-level types ──────────────────────────────────────────────────
@@ -264,47 +283,6 @@ pub struct PendingTrailArm {
     pub token_id: String,
     pub trail_bps: u32,
     pub activation_bps: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DetectionSignalView {
-    pub outcome: Outcome,
-    pub decision: BidDecision,
-}
-
-#[allow(dead_code)] // Runtime dataset for later backtests/export; not all fields are rendered live.
-#[derive(Debug, Clone)]
-pub struct DetectionBookPoint {
-    pub rel_secs: i64,
-    pub secs_to_close: i64,
-    pub bid: Option<f64>,
-    pub ask: Option<f64>,
-    pub mid: Option<f64>,
-}
-
-#[allow(dead_code)] // Runtime dataset for later backtests/export; not all fields are rendered live.
-#[derive(Debug, Clone)]
-pub struct DetectionSpotPoint {
-    pub rel_secs: i64,
-    pub secs_to_close: i64,
-    pub price: f64,
-    pub distance_bps: Option<f64>,
-}
-
-#[allow(dead_code)] // Runtime dataset for later backtests/export; not all fields are rendered live.
-#[derive(Debug, Clone)]
-pub struct DetectionWindowSample {
-    pub asset_label: String,
-    pub timeframe_label: String,
-    pub market_slug: String,
-    pub opens_at: DateTime<Utc>,
-    pub closes_at: DateTime<Utc>,
-    pub price_to_beat: Option<f64>,
-    pub close_spot: Option<f64>,
-    pub resolved: Option<Outcome>,
-    pub spot_series: Vec<DetectionSpotPoint>,
-    pub up_series: Vec<DetectionBookPoint>,
-    pub down_series: Vec<DetectionBookPoint>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -538,11 +516,9 @@ pub struct AppState {
     /// Pre-computed from CLOB mid + top-holder sums; updated on Book and TopHoldersSentiment events.
     pub cached_sentiment: SentimentDir,
     pub detection_enabled: bool,
-    /// Book/context bid decision for the active rolling market.
+    /// Book/context bid decision for the active rolling market (inline or async worker).
     pub detection_signal: Option<DetectionSignalView>,
-    detection_resolution_prior: ResolutionPrior,
-    detection_current_window: Option<DetectionWindowSample>,
-    pub detection_completed_windows: VecDeque<DetectionWindowSample>,
+    detection_engine: Option<DetectionEngine>,
     /// Updated once per second in the Tick handler; avoids `Utc::now()` in the draw path.
     pub cached_countdown_secs: Option<i64>,
     /// `”{asset}/USD”` label, set once on StartTrading.
@@ -577,14 +553,24 @@ impl AppState {
         default_size_usdc: f64,
         user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>,
     ) -> Self {
-        Self::new_with_detection(default_size_usdc, user_trade_sync, true)
+        Self::new_with_detection(default_size_usdc, user_trade_sync, true, None)
     }
 
     pub fn new_with_detection(
         default_size_usdc: f64,
         user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>,
         detection_enabled: bool,
+        detection_cmd_tx: Option<mpsc::Sender<DetectionCmd>>,
     ) -> Self {
+        let detection_engine = if detection_enabled {
+            if let Some(tx) = detection_cmd_tx {
+                Some(DetectionEngine::Remote(tx))
+            } else {
+                Some(DetectionEngine::Inline(DetectionRuntime::new()))
+            }
+        } else {
+            None
+        };
         Self {
             ui_phase: UiPhase::WizardLoading,
             wizard_rows: Vec::new(),
@@ -620,9 +606,7 @@ impl AppState {
             cached_sentiment: SentimentDir::Unknown,
             detection_enabled,
             detection_signal: None,
-            detection_resolution_prior: ResolutionPrior::default(),
-            detection_current_window: None,
-            detection_completed_windows: VecDeque::with_capacity(DETECTION_COMPLETED_WINDOWS_MAX),
+            detection_engine,
             cached_countdown_secs: None,
             cached_pair_label: "\u{2014}/USD".to_string(), // "—/USD"
             user_trade_sync,
@@ -1225,212 +1209,62 @@ impl AppState {
         };
     }
 
-    fn start_detection_window_sample(&mut self) {
-        if !self.detection_enabled {
-            self.detection_current_window = None;
-            return;
-        }
-        let Some(market) = self.market.as_ref() else {
-            self.detection_current_window = None;
-            return;
-        };
-        let (asset_label, timeframe_label) = self
-            .market_profile
-            .as_ref()
-            .map(|p| (p.asset.label.to_string(), p.timeframe.label().to_string()))
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
-        self.detection_current_window = Some(DetectionWindowSample {
-            asset_label,
-            timeframe_label,
-            market_slug: market.slug.clone(),
-            opens_at: market.opens_at,
-            closes_at: market.closes_at,
-            price_to_beat: self.price_to_beat(),
-            close_spot: self.spot_price,
-            resolved: None,
-            spot_series: Vec::new(),
-            up_series: Vec::new(),
-            down_series: Vec::new(),
-        });
-    }
-
-    fn update_detection_window_spot(&mut self) {
+    #[inline]
+    fn detection_dispatch(&mut self, cmd: DetectionCmd) {
         if !self.detection_enabled {
             return;
         }
-        let price_to_beat = self.price_to_beat();
-        if let Some(sample) = self.detection_current_window.as_mut() {
-            if sample.price_to_beat.is_none() {
-                sample.price_to_beat = price_to_beat;
+        match &mut self.detection_engine {
+            Some(DetectionEngine::Inline(rt)) => {
+                rt.apply(cmd);
+                self.detection_signal = rt.last_signal();
             }
-            sample.close_spot = self.spot_price;
-            let Some(price) = self.spot_price else {
-                return;
-            };
-            let now = Utc::now();
-            let distance_bps = sample
-                .price_to_beat
-                .filter(|target| target.is_finite() && *target > 0.0)
-                .map(|target| (price - target) / target * 10_000.0);
-            sample.spot_series.push(DetectionSpotPoint {
-                rel_secs: (now - sample.opens_at).num_seconds(),
-                secs_to_close: (sample.closes_at - now).num_seconds(),
-                price,
-                distance_bps,
-            });
-        }
-    }
-
-    fn record_detection_book_point(&mut self, outcome: Outcome, book: &BookSnapshot) {
-        if !self.detection_enabled {
-            return;
-        }
-        let Some(sample) = self.detection_current_window.as_mut() else {
-            return;
-        };
-        let now = Utc::now();
-        let point = DetectionBookPoint {
-            rel_secs: (now - sample.opens_at).num_seconds(),
-            secs_to_close: (sample.closes_at - now).num_seconds(),
-            bid: book.bids.first().map(|l| l.price),
-            ask: book.asks.first().map(|l| l.price),
-            mid: book_mid(book),
-        };
-        let series = match outcome {
-            Outcome::Up => &mut sample.up_series,
-            Outcome::Down => &mut sample.down_series,
-        };
-        if series.len() == DETECTION_WINDOW_BOOK_POINTS_MAX {
-            series.remove(0);
-        }
-        series.push(point);
-    }
-
-    fn finalize_detection_window_sample(&mut self) {
-        if !self.detection_enabled {
-            self.detection_current_window = None;
-            return;
-        }
-        let Some(mut sample) = self.detection_current_window.take() else {
-            return;
-        };
-        if Utc::now() < sample.closes_at {
-            return;
-        }
-        if sample.price_to_beat.is_none() {
-            sample.price_to_beat = self.price_to_beat();
-        }
-        if sample.close_spot.is_none() {
-            sample.close_spot = self.spot_price;
-        }
-        sample.resolved = match (sample.close_spot, sample.price_to_beat) {
-            (Some(close), Some(target)) => Some(if close >= target {
-                Outcome::Up
-            } else {
-                Outcome::Down
-            }),
-            _ => None,
-        };
-        self.learn_from_detection_window_sample(&sample);
-        if self.detection_completed_windows.len() == DETECTION_COMPLETED_WINDOWS_MAX {
-            self.detection_completed_windows.pop_front();
-        }
-        self.detection_completed_windows.push_back(sample);
-    }
-
-    fn learn_from_detection_window_sample(&mut self, sample: &DetectionWindowSample) {
-        let Some(resolved) = sample.resolved else {
-            return;
-        };
-        let resolved = match resolved {
-            Outcome::Up => DetectionOutcome::Up,
-            Outcome::Down => DetectionOutcome::Down,
-        };
-        let window_secs = (sample.closes_at - sample.opens_at).num_seconds().max(1);
-        for point in &sample.spot_series {
-            let Some(distance_bps) = point.distance_bps else {
-                continue;
-            };
-            self.detection_resolution_prior.record_observation(
-                distance_bps,
-                point.rel_secs,
-                window_secs,
-                resolved,
-            );
-        }
-    }
-
-    fn recompute_detection_signal(&mut self) {
-        if !self.detection_enabled {
-            self.detection_signal = None;
-            return;
-        }
-        let Some(market) = self.market.as_ref() else {
-            self.detection_signal = None;
-            return;
-        };
-        let Some(spot_price) = self.spot_price else {
-            self.detection_signal = None;
-            return;
-        };
-        let Some(price_to_beat) = self.price_to_beat() else {
-            self.detection_signal = None;
-            return;
-        };
-        let (Some(up_book), Some(down_book)) = (self.book_up.as_deref(), self.book_down.as_deref())
-        else {
-            self.detection_signal = None;
-            return;
-        };
-        let window_secs = (market.closes_at - market.opens_at).num_seconds().max(1);
-        let elapsed_secs = (Utc::now() - market.opens_at)
-            .num_seconds()
-            .clamp(0, window_secs);
-        let cfg = WindowBidConfig {
-            tick_size: market.tick_size.parse::<f64>().unwrap_or(0.01),
-            ..WindowBidConfig::default()
-        };
-        let decision = crate::detection::decide_window_bid(
-            &WindowBidInput {
-                spot_price,
-                price_to_beat,
-                elapsed_secs,
-                window_secs,
-                up_book,
-                down_book,
-            },
-            &cfg,
-        );
-        let outcome = match decision {
-            BidDecision::Bid { outcome, .. }
-            | BidDecision::Skip {
-                best_outcome: Some(outcome),
-                ..
-            } => match outcome {
-                DetectionOutcome::Up => Outcome::Up,
-                DetectionOutcome::Down => Outcome::Down,
-            },
-            BidDecision::Skip {
-                best_outcome: None, ..
-            } => {
-                if spot_price >= price_to_beat {
-                    Outcome::Up
-                } else {
-                    Outcome::Down
-                }
+            Some(DetectionEngine::Remote(tx)) => {
+                let _ = tx.try_send(cmd);
             }
-        };
-        self.detection_signal = Some(DetectionSignalView { outcome, decision });
+            None => {}
+        }
     }
 
     pub fn detection_status_line(&self) -> String {
         if !self.detection_enabled {
             return String::new();
         }
-        match self.detection_signal {
+        match &self.detection_signal {
             Some(view) => format!("Detection: {}", detection_decision_label(view)),
             None => "Detection: waiting for spot + UP/DOWN books".to_string(),
         }
+    }
+
+    #[cfg(test)]
+    fn detection_inline_engine(&self) -> Option<&DetectionRuntime> {
+        match &self.detection_engine {
+            Some(DetectionEngine::Inline(rt)) => Some(rt),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detection_current_window(
+        &self,
+    ) -> Option<&crate::detection_runtime::DetectionWindowSample> {
+        self.detection_inline_engine()
+            .and_then(|rt| rt.current_window())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detection_completed_windows(
+        &self,
+    ) -> Option<&VecDeque<crate::detection_runtime::DetectionWindowSample>> {
+        self.detection_inline_engine()
+            .map(|rt| rt.completed_windows())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detection_resolution_prior_total_observations(&self) -> u32 {
+        self.detection_inline_engine()
+            .map(|rt| rt.resolution_prior_total_observations())
+            .unwrap_or(0)
     }
 
     // ── Mutations ───────────────────────────────────────────────────
@@ -1462,8 +1296,10 @@ impl AppState {
                         }
                     }
                 }
-                self.update_detection_window_spot();
-                self.recompute_detection_signal();
+                self.detection_dispatch(DetectionCmd::SpotAndBeat {
+                    spot: p.price,
+                    price_to_beat: self.price_to_beat(),
+                });
             }
             AppEvent::Book(mut b) => {
                 b.asset_id = canonical_clob_token_id(&b.asset_id).into_owned();
@@ -1471,10 +1307,10 @@ impl AppState {
                 let snap = Arc::new(b);
                 let mut detection_outcome = None;
                 if let Some(m) = &self.market {
-                    if snap.asset_id == m.up_token_id {
+                    if clob_asset_ids_match(snap.asset_id.as_str(), m.up_token_id.as_str()) {
                         self.book_up = Some(Arc::clone(&snap));
                         detection_outcome = Some(Outcome::Up);
-                    } else if snap.asset_id == m.down_token_id {
+                    } else if clob_asset_ids_match(snap.asset_id.as_str(), m.down_token_id.as_str()) {
                         self.book_down = Some(Arc::clone(&snap));
                         detection_outcome = Some(Outcome::Down);
                     }
@@ -1500,8 +1336,10 @@ impl AppState {
                 }
                 self.recompute_sentiment();
                 if let Some(outcome) = detection_outcome {
-                    self.record_detection_book_point(outcome, snap.as_ref());
-                    self.recompute_detection_signal();
+                    self.detection_dispatch(DetectionCmd::Book {
+                        is_up: matches!(outcome, Outcome::Up),
+                        book: (*snap).clone(),
+                    });
                 }
             }
             AppEvent::MarketRoll {
@@ -1509,7 +1347,12 @@ impl AppState {
                 buy_trail_bps,
                 buy_trail_activation_bps,
             } => {
-                self.finalize_detection_window_sample();
+                let m_snap = DetectionMarketSnap::from(&market);
+                let (asset_label, timeframe_label) = self
+                    .market_profile
+                    .as_ref()
+                    .map(|p| (p.asset.label.to_string(), p.timeframe.label().to_string()))
+                    .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
                 // Close any positions from the previous market — they'll resolve
                 // via Polymarket and show up as realized once winnings redeem.
                 // We keep realized_pnl but zero out live positions for the new market.
@@ -1536,7 +1379,11 @@ impl AppState {
                 self.cached_sentiment = SentimentDir::Unknown;
                 self.detection_signal = None;
                 self.cached_countdown_secs = None;
-                self.start_detection_window_sample();
+                self.detection_dispatch(DetectionCmd::MarketRolled {
+                    market: m_snap,
+                    asset_label,
+                    timeframe_label,
+                });
             }
             AppEvent::PriceToBeatRefresh {
                 slug,
@@ -1547,8 +1394,7 @@ impl AppState {
                         if let Some(ptb) = price_to_beat {
                             m.price_to_beat = Some(ptb);
                             self.latched_price_to_beat = None;
-                            self.update_detection_window_spot();
-                            self.recompute_detection_signal();
+                            self.detection_dispatch(DetectionCmd::SetPriceToBeat(self.price_to_beat()));
                         }
                     }
                 }
@@ -1884,7 +1730,6 @@ impl AppState {
                 self.spot_price = None;
                 self.spot_price_ts = None;
                 self.market = None;
-                self.detection_current_window = None;
                 self.book_up = None;
                 self.book_down = None;
                 self.latched_price_to_beat = None;
@@ -1902,10 +1747,10 @@ impl AppState {
                 self.cached_pair_label = format!("{}/USD", p.asset.label);
                 self.cached_sentiment = SentimentDir::Unknown;
                 self.detection_signal = None;
-                self.detection_resolution_prior = ResolutionPrior::default();
                 self.cached_countdown_secs = None;
                 self.buy_trail_bps = 0;
                 self.buy_trail_activation_bps = 0;
+                self.detection_dispatch(DetectionCmd::Clear);
             }
             AppEvent::RunTakeProfitAfterMarketBuy { .. } => {
                 // Dispatched from `main::apply_app_event` (needs `TradingClient`); no UI state change here.
@@ -1989,6 +1834,9 @@ impl AppState {
                     self.trailing.remove(&k);
                 }
             }
+            AppEvent::DetectionUpdate { signal } => {
+                self.detection_signal = signal;
+            }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }
         self.cached_book_watch_tokens = collect_book_watch_token_ids(self);
@@ -2002,8 +1850,8 @@ fn side_str(s: Side) -> &'static str {
     }
 }
 
-fn detection_decision_label(view: DetectionSignalView) -> String {
-    match view.decision {
+fn detection_decision_label(view: &DetectionSignalView) -> String {
+    match &view.decision {
         BidDecision::Bid {
             bid_price,
             fair_probability,
@@ -2013,10 +1861,10 @@ fn detection_decision_label(view: DetectionSignalView) -> String {
         } => format!(
             "{} BID @ {:.2} fair {:.0}% edge {:+.1}% EV {:+.3}",
             view.outcome.as_str(),
-            bid_price,
-            fair_probability * 100.0,
-            edge * 100.0,
-            expected_value
+            *bid_price,
+            *fair_probability * 100.0,
+            *edge * 100.0,
+            *expected_value
         ),
         BidDecision::Skip {
             reason,
@@ -2037,7 +1885,7 @@ fn detection_decision_label(view: DetectionSignalView) -> String {
                     "{} skip: {} (best fair {:.0}%)",
                     view.outcome.as_str(),
                     reason,
-                    p * 100.0
+                    *p * 100.0
                 )
             } else {
                 format!("skip: {reason}")
@@ -2810,6 +2658,7 @@ pub fn resolve_trailing_sell(
 mod tests {
     use super::*;
 
+    use crate::detection::DetectionOutcome;
     use crate::feeds::chainlink::PriceTick;
     use crate::feeds::clob_ws::{BookLevel, BookSnapshot};
     use crate::feeds::user_trade_sync::UserTradeSync;
@@ -3952,7 +3801,8 @@ mod tests {
         .await;
 
         let sample = s
-            .detection_completed_windows
+            .detection_completed_windows()
+            .expect("inline detection")
             .back()
             .expect("completed window");
         assert_eq!(sample.asset_label, "BTC");
@@ -3960,10 +3810,10 @@ mod tests {
         assert_eq!(sample.market_slug, "btc-updown-5m-old");
         assert_eq!(sample.price_to_beat, Some(100.0));
         assert_eq!(sample.close_spot, Some(101.0));
-        assert_eq!(sample.resolved, Some(Outcome::Up));
+        assert_eq!(sample.resolved, Some(DetectionOutcome::Up));
         assert_eq!(sample.spot_series.len(), 1);
         assert_eq!(sample.spot_series[0].price, 101.0);
-        assert_eq!(s.detection_resolution_prior.total_observations(), 1);
+        assert_eq!(s.detection_resolution_prior_total_observations(), 1);
         assert_eq!(sample.up_series.len(), 1);
         assert_eq!(sample.up_series[0].bid, Some(0.56));
         assert_eq!(sample.up_series[0].ask, Some(0.58));
@@ -4022,7 +3872,7 @@ mod tests {
 
     #[tokio::test]
     async fn detection_disabled_does_not_queue_jobs_or_collect_windows() {
-        let mut s = AppState::new_with_detection(5.0, Arc::new(UserTradeSync::new()), false);
+        let mut s = AppState::new_with_detection(5.0, Arc::new(UserTradeSync::new()), false, None);
         let mut m = test_market("UP_OFF", "DOWN_OFF", "0xoff");
         m.price_to_beat = Some(100.0);
         s.apply(AppEvent::MarketRoll {
@@ -4049,7 +3899,7 @@ mod tests {
         }))
         .await;
 
-        assert!(s.detection_current_window.is_none());
+        assert!(s.detection_current_window().is_none());
         assert!(s.detection_status_line().is_empty());
     }
 

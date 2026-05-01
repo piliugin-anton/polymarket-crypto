@@ -1251,11 +1251,13 @@ mod tests {
             5.0,
             std::sync::Arc::new(crate::feeds::user_trade_sync::UserTradeSync::new()),
             true,
+            None,
         );
         let disabled = AppState::new_with_detection(
             5.0,
             std::sync::Arc::new(crate::feeds::user_trade_sync::UserTradeSync::new()),
             false,
+            None,
         );
         assert_eq!(
             help_block_height(&enabled),

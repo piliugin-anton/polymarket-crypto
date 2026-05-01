@@ -14,6 +14,15 @@ pub enum DetectionOutcome {
     Down,
 }
 
+impl DetectionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "UP",
+            Self::Down => "DOWN",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DetectionContext {
     pub outcome: DetectionOutcome,
@@ -180,23 +189,42 @@ pub fn decide_window_bid(input: &WindowBidInput<'_>, cfg: &WindowBidConfig) -> B
         };
     }
 
-    let up = bid_candidate(
-        DetectionOutcome::Up,
-        input.up_book,
+    // Shared across UP/DOWN: same oracle context, only the favorable-bps sign flips per outcome.
+    let (raw_bps, scale_bps) = match raw_and_scale_bps(
         input.spot_price,
         input.price_to_beat,
         input.elapsed_secs,
         input.window_secs,
+    ) {
+        Some(v) => v,
+        None => {
+            return BidDecision::Skip {
+                reason: BidSkipReason::BadInput,
+                best_outcome: None,
+                best_fair_probability: None,
+            };
+        }
+    };
+
+    let up = bid_candidate(
+        DetectionOutcome::Up,
+        input.up_book,
+        raw_bps,
+        scale_bps,
+        input.elapsed_secs,
+        input.window_secs,
         cfg,
+        None,
     );
     let down = bid_candidate(
         DetectionOutcome::Down,
         input.down_book,
-        input.spot_price,
-        input.price_to_beat,
+        raw_bps,
+        scale_bps,
         input.elapsed_secs,
         input.window_secs,
         cfg,
+        None,
     );
 
     let best_fair = [up.as_ref(), down.as_ref()]
@@ -223,6 +251,32 @@ pub fn decide_window_bid(input: &WindowBidInput<'_>, cfg: &WindowBidConfig) -> B
         })
 }
 
+/// Oracle distance (bps vs target) and heuristic temperature — reused for both outcomes.
+#[inline]
+fn raw_and_scale_bps(
+    spot_price: f64,
+    price_to_beat: f64,
+    elapsed_secs: i64,
+    window_secs: i64,
+) -> Option<(f64, f64)> {
+    if !spot_price.is_finite()
+        || !price_to_beat.is_finite()
+        || spot_price <= 0.0
+        || price_to_beat <= 0.0
+        || window_secs <= 0
+    {
+        return None;
+    }
+    let raw_bps = (spot_price - price_to_beat) / price_to_beat * 10_000.0;
+    if !raw_bps.is_finite() {
+        return None;
+    }
+    let elapsed = elapsed_secs.clamp(0, window_secs) as f64;
+    let remaining_frac = 1.0 - elapsed / window_secs as f64;
+    let scale_bps = 12.0 + 90.0 * remaining_frac;
+    Some((raw_bps, scale_bps))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct WindowBidCandidate {
     outcome: DetectionOutcome,
@@ -235,14 +289,17 @@ struct WindowBidCandidate {
 fn bid_candidate(
     outcome: DetectionOutcome,
     book: &BookSnapshot,
-    spot_price: f64,
-    price_to_beat: f64,
+    raw_bps: f64,
+    scale_bps: f64,
     elapsed_secs: i64,
     window_secs: i64,
     cfg: &WindowBidConfig,
+    resolution_prior: Option<&ResolutionPrior>,
 ) -> Option<WindowBidCandidate> {
-    let best_bid = book.bids.first()?.price;
-    let best_ask = book.asks.first()?.price;
+    let bid0 = book.bids.first()?;
+    let ask0 = book.asks.first()?;
+    let best_bid = bid0.price;
+    let best_ask = ask0.price;
     if !is_probability(best_bid) || !is_probability(best_ask) || best_bid >= best_ask {
         return None;
     }
@@ -252,7 +309,7 @@ fn bid_candidate(
         return None;
     }
 
-    let top_bid_size = book.bids.first().map(|level| level.size).unwrap_or(0.0);
+    let top_bid_size = bid0.size;
     if top_bid_size < cfg.min_top_bid_size {
         return None;
     }
@@ -262,14 +319,14 @@ fn bid_candidate(
         return None;
     }
 
-    let ctx = DetectionContext {
+    let fair_probability = fair_probability_for_outcome(
         outcome,
-        spot_price,
-        price_to_beat,
+        raw_bps,
+        scale_bps,
         elapsed_secs,
         window_secs,
-    };
-    let fair_probability = contextual_resolution_probability(&ctx, None)?;
+        resolution_prior,
+    )?;
     let bid_price = maker_bid_price(best_bid, best_ask, fair_probability, cfg)?;
     let edge = fair_probability - bid_price;
     let expected_value = binary_expected_value(fair_probability, bid_price);
@@ -296,32 +353,35 @@ fn maker_bid_price(
 }
 
 fn bid_skip_reason(input: &WindowBidInput<'_>, cfg: &WindowBidConfig) -> BidSkipReason {
-    let books = [input.up_book, input.down_book];
-    if books
-        .iter()
-        .any(|book| book.bids.first().is_none() || book.asks.first().is_none())
+    let up = input.up_book;
+    let down = input.down_book;
+    if up.bids.first().is_none()
+        || up.asks.first().is_none()
+        || down.bids.first().is_none()
+        || down.asks.first().is_none()
     {
         return BidSkipReason::NoBook;
     }
-    if books.iter().all(|book| {
+    let spread_wide = |book: &BookSnapshot| {
         let bid = book.bids.first().map(|level| level.price).unwrap_or(0.0);
         let ask = book.asks.first().map(|level| level.price).unwrap_or(1.0);
         ((ask - bid) / cfg.tick_size).round() > cfg.max_spread_ticks as f64
-    }) {
+    };
+    if spread_wide(up) && spread_wide(down) {
         return BidSkipReason::SpreadTooWide;
     }
-    if books.iter().all(|book| {
+    let thin = |book: &BookSnapshot| {
         book.bids
             .first()
             .map(|level| level.size < cfg.min_top_bid_size)
             .unwrap_or(true)
-    }) {
+    };
+    if thin(up) && thin(down) {
         return BidSkipReason::QueueTooThin;
     }
-    if books
-        .iter()
-        .all(|book| depth_imbalance(book, 3) < cfg.min_depth_imbalance)
-    {
+    let imb_up = depth_imbalance(up, 3);
+    let imb_down = depth_imbalance(down, 3);
+    if imb_up < cfg.min_depth_imbalance && imb_down < cfg.min_depth_imbalance {
         return BidSkipReason::BookImbalance;
     }
     BidSkipReason::NoPositiveEdge
@@ -331,29 +391,26 @@ fn binary_expected_value(win_probability: f64, price: f64) -> f64 {
     win_probability * (1.0 - price) - (1.0 - win_probability) * price
 }
 
-fn contextual_resolution_probability(
-    ctx: &DetectionContext,
+/// Fair probability for one outcome; `raw_bps` / `scale_bps` from [`raw_and_scale_bps`].
+#[inline]
+fn fair_probability_for_outcome(
+    outcome: DetectionOutcome,
+    raw_bps: f64,
+    scale_bps: f64,
+    elapsed_secs: i64,
+    window_secs: i64,
     resolution_prior: Option<&ResolutionPrior>,
 ) -> Option<f64> {
-    if !ctx.spot_price.is_finite()
-        || !ctx.price_to_beat.is_finite()
-        || ctx.spot_price <= 0.0
-        || ctx.price_to_beat <= 0.0
-        || ctx.window_secs <= 0
-    {
+    if !scale_bps.is_finite() || scale_bps <= 0.0 {
         return None;
     }
-    let raw_bps = (ctx.spot_price - ctx.price_to_beat) / ctx.price_to_beat * 10_000.0;
-    let favorable_bps = match ctx.outcome {
+    let favorable_bps = match outcome {
         DetectionOutcome::Up => raw_bps,
         DetectionOutcome::Down => -raw_bps,
     };
-    let elapsed = ctx.elapsed_secs.clamp(0, ctx.window_secs) as f64;
-    let remaining_frac = 1.0 - elapsed / ctx.window_secs as f64;
-    let scale_bps = 12.0 + 90.0 * remaining_frac;
     let heuristic = sigmoid(favorable_bps / scale_bps).clamp(0.01, 0.99);
     if let Some(learned) = resolution_prior
-        .and_then(|prior| prior.estimate(ctx.outcome, raw_bps, ctx.elapsed_secs, ctx.window_secs))
+        .and_then(|prior| prior.estimate(outcome, raw_bps, elapsed_secs, window_secs))
     {
         Some(
             (heuristic * (1.0 - learned.confidence) + learned.probability * learned.confidence)
@@ -362,6 +419,26 @@ fn contextual_resolution_probability(
     } else {
         Some(heuristic)
     }
+}
+
+fn contextual_resolution_probability(
+    ctx: &DetectionContext,
+    resolution_prior: Option<&ResolutionPrior>,
+) -> Option<f64> {
+    let (raw_bps, scale_bps) = raw_and_scale_bps(
+        ctx.spot_price,
+        ctx.price_to_beat,
+        ctx.elapsed_secs,
+        ctx.window_secs,
+    )?;
+    fair_probability_for_outcome(
+        ctx.outcome,
+        raw_bps,
+        scale_bps,
+        ctx.elapsed_secs,
+        ctx.window_secs,
+        resolution_prior,
+    )
 }
 
 fn context_bucket(
@@ -386,20 +463,21 @@ fn sigmoid(x: f64) -> f64 {
 }
 
 fn depth_imbalance(book: &BookSnapshot, levels: usize) -> f64 {
-    let bid_depth = book
-        .bids
-        .iter()
-        .take(levels)
-        .filter(|level| level.size.is_finite() && level.size > 0.0)
-        .map(|level| level.size)
-        .sum::<f64>();
-    let ask_depth = book
-        .asks
-        .iter()
-        .take(levels)
-        .filter(|level| level.size.is_finite() && level.size > 0.0)
-        .map(|level| level.size)
-        .sum::<f64>();
+    debug_assert!(levels <= 8);
+    let mut bid_depth = 0.0_f64;
+    for level in book.bids.iter().take(levels) {
+        let s = level.size;
+        if s.is_finite() && s > 0.0 {
+            bid_depth += s;
+        }
+    }
+    let mut ask_depth = 0.0_f64;
+    for level in book.asks.iter().take(levels) {
+        let s = level.size;
+        if s.is_finite() && s > 0.0 {
+            ask_depth += s;
+        }
+    }
     let total = bid_depth + ask_depth;
     if total <= 0.0 {
         0.0

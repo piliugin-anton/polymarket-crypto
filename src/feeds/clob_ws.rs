@@ -40,8 +40,9 @@ use crate::config::CLOB_WS_URL;
 use crate::trading::canonical_clob_token_id;
 
 const PRICE_KEY_SCALE: f64 = 1_000_000.0;
-/// Maximum distinct token IDs tracked in one WS session (UP + DOWN + trailing tails).
-const MAX_BOOKS: usize = 8;
+/// Maximum distinct token IDs tracked in one WS session (UP + DOWN + trailing / pending tails).
+/// Must match `Touched::flags` length; `collect_book_watch_token_ids` can exceed a small pair.
+const MAX_BOOKS: usize = 32;
 
 #[inline(always)]
 fn price_to_key(p: f64) -> i64 {
@@ -256,13 +257,24 @@ impl BookDb {
     }
 
     /// O(n) scan — returns existing index or appends a new entry.
-    fn find_or_insert(&mut self, canonical_id: &str) -> usize {
+    ///
+    /// When at capacity, returns `None` so callers skip updates (avoids corrupting another
+    /// book and avoids panicking on `Touched` indices). Logged once per overflow token.
+    fn find_or_insert(&mut self, canonical_id: &str) -> Option<usize> {
         if let Some(i) = self
             .books
             .iter()
             .position(|b| b.canonical_id == canonical_id)
         {
-            return i;
+            return Some(i);
+        }
+        if self.books.len() >= MAX_BOOKS {
+            tracing::debug!(
+                cap = MAX_BOOKS,
+                %canonical_id,
+                "CLOB book db at capacity — dropping updates for this token"
+            );
+            return None;
         }
         let i = self.books.len();
         self.books.push(TokenBook {
@@ -270,7 +282,7 @@ impl BookDb {
             bids: BookSide::new(),
             asks: BookSide::new(),
         });
-        i
+        Some(i)
     }
 }
 
@@ -355,11 +367,20 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
         info!(i, token_id_prefix = %prefix, "CLOB WS subscribe token");
     }
 
+    if token_ids.len() > MAX_BOOKS {
+        warn!(
+            n = token_ids.len(),
+            cap = MAX_BOOKS,
+            "CLOB subscribe token list exceeds local book capacity — extra markets get no L2 cache"
+        );
+    }
     let mut db = BookDb::new();
     // Pre-register slots in the same order as `token_ids` so index 0 = UP, 1 = DOWN.
     for id in token_ids {
         let cid = ensure_canonical(id);
-        db.find_or_insert(cid.as_ref());
+        if db.find_or_insert(cid.as_ref()).is_none() {
+            break;
+        }
     }
 
     // Output buffers reused across snapshots (swapped out into each BookSnapshot).
@@ -434,10 +455,15 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                         Ok(msg) => {
                             for ch in msg.price_changes {
                                 let cid = ensure_canonical(&ch.asset_id);
-                                let i   = db.find_or_insert(cid.as_ref());
+                                let Some(i) = db.find_or_insert(cid.as_ref()) else {
+                                    continue;
+                                };
                                 let key = price_to_key(ch.price);
-                                if ch.side { db.books[i].bids.upsert(key, ch.size); }
-                                else       { db.books[i].asks.upsert(key, ch.size); }
+                                if ch.side {
+                                    db.books[i].bids.upsert(key, ch.size);
+                                } else {
+                                    db.books[i].asks.upsert(key, ch.size);
+                                }
                                 touched.set(i);
                             }
                         }
@@ -455,8 +481,10 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                 }
 
                 // Emit one snapshot per touched token — only valid indices are set.
-                for (i, &hit) in touched.flags[..db.books.len()].iter().enumerate() {
-                    if hit {
+                // Never slice `flags` past its length (was a panic when `db.books.len() > MAX_BOOKS`).
+                let n_emit = db.books.len().min(touched.flags.len());
+                for i in 0..n_emit {
+                    if touched.flags[i] {
                         let book = &db.books[i];
                         emit_snapshot(
                             &book.canonical_id,
@@ -485,7 +513,7 @@ fn apply_event(db: &mut BookDb, ev: RawEvent) -> Option<usize> {
             asks,
         } => {
             let cid = ensure_canonical(&asset_id);
-            let i = db.find_or_insert(cid.as_ref());
+            let i = db.find_or_insert(cid.as_ref())?;
             let book = &mut db.books[i];
             book.bids
                 .replace_from(bids.into_iter().map(|l| (price_to_key(l.price), l.size)));
@@ -495,7 +523,7 @@ fn apply_event(db: &mut BookDb, ev: RawEvent) -> Option<usize> {
         }
         RawEvent::PriceChange { asset_id, changes } => {
             let cid = ensure_canonical(&asset_id);
-            let i = db.find_or_insert(cid.as_ref());
+            let i = db.find_or_insert(cid.as_ref())?;
             let book = &mut db.books[i];
             for c in changes {
                 let key = price_to_key(c.price);
