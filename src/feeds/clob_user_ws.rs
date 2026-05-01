@@ -26,14 +26,14 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
 use crate::app::{open_orders_from_clob, AppEvent, OpenOrderRow, Outcome};
-use crate::take_profit::outcomes_with_duplicate_resting_sells;
 use crate::config::CLOB_WS_USER_URL;
 use crate::feeds::user_trade_sync::UserTradeSync;
 use crate::net;
+use crate::take_profit::outcomes_with_duplicate_resting_sells;
 use crate::trading::{
-    canonical_clob_token_id, clob_asset_ids_match, parse_clob_side_str, parse_user_channel_values,
-    try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, Side, TradingClient,
-    norm_order_id_key,
+    canonical_clob_token_id, clob_asset_ids_match, norm_order_id_key, parse_clob_side_str,
+    parse_user_channel_values, try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, Side,
+    TradingClient,
 };
 
 type UserWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -41,8 +41,8 @@ type UserWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// `watch` payload for the user channel: CLOB `market` = Gamma `conditionId` + outcome token ids.
 #[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct UserWsMarket {
-    pub condition_id:  String,
-    pub up_token_id:   String,
+    pub condition_id: String,
+    pub up_token_id: String,
     pub down_token_id: String,
 }
 
@@ -61,9 +61,9 @@ pub struct UserOpenOrdersLedger {
 
 struct LedgerInner {
     market: String,
-    up:     String,
-    down:   String,
-    by_id:  HashMap<String, ClobOpenOrder>,
+    up: String,
+    down: String,
+    by_id: HashMap<String, ClobOpenOrder>,
 }
 
 impl UserOpenOrdersLedger {
@@ -71,9 +71,9 @@ impl UserOpenOrdersLedger {
         Self {
             inner: Mutex::new(LedgerInner {
                 market: String::new(),
-                up:     String::new(),
-                down:   String::new(),
-                by_id:  HashMap::new(),
+                up: String::new(),
+                down: String::new(),
+                by_id: HashMap::new(),
             }),
         }
     }
@@ -215,7 +215,8 @@ impl UserOpenOrdersLedger {
         } else if let Some(a) = jstr2(v, "asset_id", "assetId") {
             if !g.up.is_empty() {
                 let t = canonical_clob_token_id(a);
-                if t != g.up && t != g.down
+                if t != g.up
+                    && t != g.down
                     && !clob_asset_ids_match(a, g.up.as_str())
                     && !clob_asset_ids_match(a, g.down.as_str())
                 {
@@ -277,9 +278,7 @@ fn is_order_event(v: &Value) -> bool {
 
 fn markets_eq(a: &str, b: &str) -> bool {
     fn norm_m(s: &str) -> String {
-        s.trim()
-            .trim_start_matches("0x")
-            .to_ascii_lowercase()
+        s.trim().trim_start_matches("0x").to_ascii_lowercase()
     }
     !a.is_empty() && !b.is_empty() && norm_m(a) == norm_m(b)
 }
@@ -302,7 +301,9 @@ fn clob_order_from_user_ws_order_value(v: &Value) -> Option<ClobOpenOrder> {
         return None;
     }
     let original_size = jstr2(v, "original_size", "originalSize")?.to_string();
-    let size_matched = jstr2(v, "size_matched", "sizeMatched").unwrap_or("0").to_string();
+    let size_matched = jstr2(v, "size_matched", "sizeMatched")
+        .unwrap_or("0")
+        .to_string();
     Some(ClobOpenOrder {
         id,
         asset_id,
@@ -361,8 +362,7 @@ pub fn spawn(
 }
 
 fn bundle_has_markets(b: &UserWsBundle) -> bool {
-    !b.active.condition_id.is_empty()
-        || b.extras.iter().any(|e| !e.condition_id.is_empty())
+    !b.active.condition_id.is_empty() || b.extras.iter().any(|e| !e.condition_id.is_empty())
 }
 
 async fn wait_nonempty_bundle(rx: &mut watch::Receiver<UserWsBundle>) -> Result<()> {
@@ -397,14 +397,10 @@ fn resolve_trade_outcome(bundle: &UserWsBundle, asset_id: &str) -> Option<Outcom
         if m.condition_id.is_empty() {
             continue;
         }
-        if token_s == m.up_token_id
-            || clob_asset_ids_match(asset_id, &m.up_token_id)
-        {
+        if token_s == m.up_token_id || clob_asset_ids_match(asset_id, &m.up_token_id) {
             return Some(Outcome::Up);
         }
-        if token_s == m.down_token_id
-            || clob_asset_ids_match(asset_id, &m.down_token_id)
-        {
+        if token_s == m.down_token_id || clob_asset_ids_match(asset_id, &m.down_token_id) {
             return Some(Outcome::Down);
         }
     }
@@ -472,7 +468,10 @@ async fn sync_condition_subscriptions(
         send_initial_user_sub_multi(ws, creds, &ids).await?;
         *subscribed = desired.clone();
         *handshake_done = true;
-        info!(n = subscribed.len(), "CLOB user WS initial subscribe (multi-market)");
+        info!(
+            n = subscribed.len(),
+            "CLOB user WS initial subscribe (multi-market)"
+        );
         return Ok(());
     }
 
@@ -502,14 +501,8 @@ async fn run_session(
     loop {
         wait_nonempty_bundle(market_watch).await?;
         let mut desired = desired_condition_ids(&market_watch.borrow());
-        sync_condition_subscriptions(
-            ws,
-            creds,
-            &mut subscribed,
-            &desired,
-            &mut handshake_done,
-        )
-        .await?;
+        sync_condition_subscriptions(ws, creds, &mut subscribed, &desired, &mut handshake_done)
+            .await?;
 
         tokio::select! {
             r = market_watch.changed() => {
@@ -632,8 +625,8 @@ mod tests {
     async fn user_ws_ledger_place_then_cancel_empties_ui() {
         let l = UserOpenOrdersLedger::new();
         l.roll_market(&UserWsMarket {
-            condition_id:  "0xabc1".to_string(),
-            up_token_id:   "111".to_string(),
+            condition_id: "0xabc1".to_string(),
+            up_token_id: "111".to_string(),
             down_token_id: "222".to_string(),
         })
         .await;

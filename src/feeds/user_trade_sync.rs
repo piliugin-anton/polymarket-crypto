@@ -27,9 +27,9 @@ const MAX_WAIT: usize = 32;
 
 #[derive(Debug, Clone)]
 struct WaitSlot {
-    oid:     String, // norm
-    qty:     f64,
-    price:   f64,
+    oid: String, // norm
+    qty: f64,
+    price: f64,
     created: Instant,
 }
 
@@ -47,23 +47,23 @@ impl fmt::Debug for UserTradeSync {
 struct Inner {
     /// Trade IDs that have been fully committed to AppState (via `after_ws_user_fill_committed`
     /// or `ack_claimed_for_ws_fill`). Only this set is checked by `fill_already_committed`.
-    seen_trades:      std::collections::HashSet<String>,
+    seen_trades: std::collections::HashSet<String>,
     /// Trade IDs claimed in `before_ws_user_fill_apply` to block duplicate WS deliveries at
     /// the pre-check before the event even reaches the event loop. Separate from `seen_trades`
     /// so `fill_already_committed` (event-loop guard) does not fire for the first delivery.
-    pretask_claimed:  std::collections::HashSet<String>,
-    ack_wait:         Vec<WaitSlot>,
-    ws_wait:          Vec<WaitSlot>,
+    pretask_claimed: std::collections::HashSet<String>,
+    ack_wait: Vec<WaitSlot>,
+    ws_wait: Vec<WaitSlot>,
 }
 
 impl UserTradeSync {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
-                seen_trades:     std::collections::HashSet::new(),
+                seen_trades: std::collections::HashSet::new(),
                 pretask_claimed: std::collections::HashSet::new(),
-                ack_wait:        Vec::new(),
-                ws_wait:         Vec::new(),
+                ack_wait: Vec::new(),
+                ws_wait: Vec::new(),
             }),
         }
     }
@@ -117,7 +117,12 @@ impl UserTradeSync {
         prune_stale(&mut g.ack_wait);
         push_cap(
             &mut g.ack_wait,
-            WaitSlot { oid: o, qty, price, created: Instant::now() },
+            WaitSlot {
+                oid: o,
+                qty,
+                price,
+                created: Instant::now(),
+            },
         );
     }
 
@@ -138,8 +143,7 @@ impl UserTradeSync {
         let o = norm_order_id_key(taker_or_leg_id);
         let mut g = self.inner.lock().await;
         if !clob_trade_id.is_empty()
-            && (g.seen_trades.contains(clob_trade_id)
-                || g.pretask_claimed.contains(clob_trade_id))
+            && (g.seen_trades.contains(clob_trade_id) || g.pretask_claimed.contains(clob_trade_id))
         {
             return false;
         }
@@ -153,9 +157,11 @@ impl UserTradeSync {
         }
         prune_stale(&mut g.ack_wait);
         prune_stale(&mut g.ws_wait);
-        if let Some(i) = g.ack_wait.iter().position(|w| {
-            w.oid == o && close_enough(w.qty, qty) && close_enough(w.price, price)
-        }) {
+        if let Some(i) = g
+            .ack_wait
+            .iter()
+            .position(|w| w.oid == o && close_enough(w.qty, qty) && close_enough(w.price, price))
+        {
             g.ack_wait.remove(i);
             return false;
         }
@@ -182,7 +188,12 @@ impl UserTradeSync {
         prune_stale(&mut g.ack_wait);
         push_cap(
             &mut g.ws_wait,
-            WaitSlot { oid: o, qty, price, created: Instant::now() },
+            WaitSlot {
+                oid: o,
+                qty,
+                price,
+                created: Instant::now(),
+            },
         );
     }
 
@@ -257,14 +268,21 @@ mod tests {
     async fn ack_then_ws_dedupes() {
         let s = UserTradeSync::new();
         s.after_order_ack_applied("0xabc1", 10.0, 0.55).await;
-        assert!(!s.before_ws_user_fill_apply("T-1", "0xabc1", 10.0, 0.55).await);
+        assert!(
+            !s.before_ws_user_fill_apply("T-1", "0xabc1", 10.0, 0.55)
+                .await
+        );
     }
 
     #[tokio::test]
     async fn ws_then_ack_dedupes() {
         let s = UserTradeSync::new();
-        assert!(s.before_ws_user_fill_apply("T-2", "0xdef2", 5.0, 0.40).await);
-        s.after_ws_user_fill_committed("T-2", "0xdef2", 5.0, 0.40).await;
+        assert!(
+            s.before_ws_user_fill_apply("T-2", "0xdef2", 5.0, 0.40)
+                .await
+        );
+        s.after_ws_user_fill_committed("T-2", "0xdef2", 5.0, 0.40)
+            .await;
         assert!(!s.before_order_ack_apply("0xdef2", 5.0, 0.40).await);
     }
 
@@ -274,12 +292,18 @@ mod tests {
     async fn event_loop_guard_ack_raced_ahead_of_ws_fill() {
         let s = UserTradeSync::new();
         // WS pre-check passes (no ack yet) and claims T-3 in pretask_claimed
-        assert!(s.before_ws_user_fill_apply("T-3", "0xorder3", 8.0, 0.60).await);
+        assert!(
+            s.before_ws_user_fill_apply("T-3", "0xorder3", 8.0, 0.60)
+                .await
+        );
         // OrderAck is processed first in the event loop before UserChannelFill is handled
         assert!(s.before_order_ack_apply("0xorder3", 8.0, 0.60).await);
         s.after_order_ack_applied("0xorder3", 8.0, 0.60).await;
         // Now UserChannelFill reaches the event-loop handler — ack_claimed_for_ws_fill catches it
-        assert!(s.ack_claimed_for_ws_fill("0xorder3", 8.0, 0.60, "T-3").await);
+        assert!(
+            s.ack_claimed_for_ws_fill("0xorder3", 8.0, 0.60, "T-3")
+                .await
+        );
         // ack_claimed_for_ws_fill moved T-3 into seen_trades
         assert!(s.fill_already_committed("T-3").await);
     }
@@ -291,9 +315,15 @@ mod tests {
     async fn ws_duplicate_confirmed_blocked_in_pretask() {
         let s = UserTradeSync::new();
         // First CONFIRMED delivery — claimed in pretask_claimed and forwarded
-        assert!(s.before_ws_user_fill_apply("T-4", "0xorder4", 3.0, 0.45).await);
+        assert!(
+            s.before_ws_user_fill_apply("T-4", "0xorder4", 3.0, 0.45)
+                .await
+        );
         // Second CONFIRMED delivery for same trade ID — blocked right here, never queued
-        assert!(!s.before_ws_user_fill_apply("T-4", "0xorder4", 3.0, 0.45).await);
+        assert!(
+            !s.before_ws_user_fill_apply("T-4", "0xorder4", 3.0, 0.45)
+                .await
+        );
     }
 
     // Normal WS fill: the pre-check claim (in pretask_claimed) must NOT trigger
@@ -302,11 +332,15 @@ mod tests {
     async fn normal_ws_fill_not_blocked_by_fill_already_committed() {
         let s = UserTradeSync::new();
         // Pre-check claims T-6 in pretask_claimed, returns true (forward to queue)
-        assert!(s.before_ws_user_fill_apply("T-6", "0xorder6", 5.0, 0.50).await);
+        assert!(
+            s.before_ws_user_fill_apply("T-6", "0xorder6", 5.0, 0.50)
+                .await
+        );
         // Event-loop guard must NOT fire — T-6 is not yet in seen_trades
         assert!(!s.fill_already_committed("T-6").await);
         // After the event loop commits it, the guard fires correctly
-        s.after_ws_user_fill_committed("T-6", "0xorder6", 5.0, 0.50).await;
+        s.after_ws_user_fill_committed("T-6", "0xorder6", 5.0, 0.50)
+            .await;
         assert!(s.fill_already_committed("T-6").await);
     }
 
@@ -316,7 +350,8 @@ mod tests {
     async fn event_loop_guard_catches_duplicate_in_queue() {
         let s = UserTradeSync::new();
         // Simulate first event being committed (seen_trades updated)
-        s.after_ws_user_fill_committed("T-5", "0xorder5", 2.0, 0.30).await;
+        s.after_ws_user_fill_committed("T-5", "0xorder5", 2.0, 0.30)
+            .await;
         // Second event reaches the event-loop handler
         assert!(s.fill_already_committed("T-5").await);
     }

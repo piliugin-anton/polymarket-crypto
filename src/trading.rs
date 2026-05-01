@@ -10,13 +10,13 @@
 //! every order-posting request is authed with L2 (HMAC-SHA256 over
 //! `timestamp + method + path + body` using the base64-decoded `secret`).
 
-use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Utc};
-use alloy_primitives::{Address, U256, B256, hex};
+use alloy_primitives::{hex, Address, B256, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{sol, SolStruct, Eip712Domain, eip712_domain};
+use alloy_sol_types::{eip712_domain, sol, Eip712Domain, SolStruct};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -98,11 +98,24 @@ fn domain_v2(verifying_contract: Address) -> Eip712Domain {
 // ── Public types ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side { Buy, Sell }
+pub enum Side {
+    Buy,
+    Sell,
+}
 
 impl Side {
-    fn as_u8(self) -> u8 { match self { Side::Buy => 0, Side::Sell => 1 } }
-    fn as_str(self) -> &'static str { match self { Side::Buy => "BUY", Side::Sell => "SELL" } }
+    fn as_u8(self) -> u8 {
+        match self {
+            Side::Buy => 0,
+            Side::Sell => 1,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,18 +129,22 @@ pub enum OrderType {
 }
 
 impl OrderType {
-    fn as_str(self) -> &'static str { match self {
-        OrderType::Gtc => "GTC", OrderType::Fok => "FOK",
-        OrderType::Fak => "FAK", OrderType::Gtd => "GTD",
-    } }
+    fn as_str(self) -> &'static str {
+        match self {
+            OrderType::Gtc => "GTC",
+            OrderType::Fok => "FOK",
+            OrderType::Fak => "FAK",
+            OrderType::Gtd => "GTD",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct OrderArgs {
     pub token_id: String,
-    pub side:     Side,
-    pub price:    f64,     // 0.01..=0.99
-    pub size:     f64,     // in shares
+    pub side: Side,
+    pub price: f64, // 0.01..=0.99
+    pub size: f64,  // in shares
     pub neg_risk: bool,
     /// Gamma `orderPriceMinTickSize` as string, e.g. `"0.01"` — drives amount rounding per
     /// `clob-client-v2` `ROUNDING_CONFIG` / `getOrderRawAmounts`.
@@ -146,18 +163,21 @@ pub struct OrderArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiCreds {
-    #[serde(rename = "apiKey")] pub api_key: String,
-    pub secret:     String, // base64
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+    pub secret: String, // base64
     pub passphrase: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PostOrderResponse {
-    #[serde(default)] pub success:  bool,
+    #[serde(default)]
+    pub success: bool,
     #[serde(default)]
     #[serde(rename = "orderID")]
     pub order_id: Option<String>,
-    #[serde(default)] pub status:   Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
     /// Matched **BUY**: USDC spent (decimal string). Matched **SELL**: shares sold — see API response.
     #[serde(default, rename = "makingAmount")]
     pub making_amount: Option<String>,
@@ -165,7 +185,7 @@ pub struct PostOrderResponse {
     #[serde(default, rename = "takingAmount")]
     pub taking_amount: Option<String>,
     #[serde(default, rename = "errorMsg")]
-    pub error:    Option<String>,
+    pub error: Option<String>,
 }
 
 impl PostOrderResponse {
@@ -258,9 +278,11 @@ impl PostOrderResponse {
         order_type: OrderType,
     ) -> Option<(f64, f64)> {
         let from_api = match side {
-            Side::Buy => self.matched_buy_fill_shares_and_avg_price()
+            Side::Buy => self
+                .matched_buy_fill_shares_and_avg_price()
                 .filter(|(sh, _)| Self::parsed_buy_fill_plausible(*sh, req_shares)),
-            Side::Sell => self.matched_sell_fill_shares_and_avg_price()
+            Side::Sell => self
+                .matched_sell_fill_shares_and_avg_price()
                 .filter(|(sh, _)| Self::parsed_buy_fill_plausible(*sh, req_shares)),
         };
         if let Some(pair) = from_api {
@@ -548,12 +570,12 @@ pub struct UserChannelTradeFill {
     /// `Trade.id` (same namespace as `GET /data/trades`) — for de-dupe vs REST and OrderAck.
     pub clob_trade_id: String,
     /// `taker_order_id` or, when you are the maker, the maker's `order_id` for this leg.
-    pub order_leg_id:  String,
-    pub asset_id:      String,
-    pub side:          Side,
-    pub qty:           f64,
-    pub price:         f64,
-    pub match_ts:      DateTime<Utc>,
+    pub order_leg_id: String,
+    pub asset_id: String,
+    pub side: Side,
+    pub qty: f64,
+    pub price: f64,
+    pub match_ts: DateTime<Utc>,
     /// `trader_side == MAKER` on the user-channel row (resting fill vs aggressive / FAK).
     pub from_maker_leg: bool,
 }
@@ -644,7 +666,9 @@ pub fn try_parse_user_channel_trade(
         }
         let mut picked: Option<(String, f64, String, f64, Option<String>)> = None;
         for m in arr {
-            let Some((oid_raw, q, leg_asset, leg_price, leg_side)) = parse_user_channel_maker_leg(m) else {
+            let Some((oid_raw, q, leg_asset, leg_price, leg_side)) =
+                parse_user_channel_maker_leg(m)
+            else {
                 continue;
             };
             let nk = norm_order_id_key(&oid_raw);
@@ -667,7 +691,9 @@ pub fn try_parse_user_channel_trade(
                     .collect();
                 if owner_rows.len() == 1 {
                     let m0 = owner_rows[0];
-                    if let Some((oid_raw, q, leg_asset, leg_price, leg_side)) = parse_user_channel_maker_leg(m0) {
+                    if let Some((oid_raw, q, leg_asset, leg_price, leg_side)) =
+                        parse_user_channel_maker_leg(m0)
+                    {
                         let aid = leg_asset.unwrap_or_else(|| top_asset_id.clone());
                         let px = leg_price.unwrap_or(top_price);
                         picked = Some((oid_raw, q, aid, px, leg_side));
@@ -679,7 +705,8 @@ pub fn try_parse_user_channel_trade(
             match arr.len() {
                 1 => {
                     let m0 = arr.first()?;
-                    let (oid_raw, q, leg_asset, leg_price, leg_side) = parse_user_channel_maker_leg(m0)?;
+                    let (oid_raw, q, leg_asset, leg_price, leg_side) =
+                        parse_user_channel_maker_leg(m0)?;
                     let aid = leg_asset.unwrap_or_else(|| top_asset_id.clone());
                     let px = leg_price.unwrap_or(top_price);
                     picked = Some((oid_raw, q, aid, px, leg_side));
@@ -706,19 +733,22 @@ pub fn try_parse_user_channel_trade(
         (tid, q, top_asset_id.clone(), top_price, None)
     };
     let nk_leg = norm_order_id_key(&order_leg_id);
-    let side = order_side_by_norm_id.get(&nk_leg).copied().unwrap_or_else(|| {
-        if is_maker {
-            leg_maker_side
-                .as_deref()
-                .and_then(parse_clob_side_str)
-                .unwrap_or_else(|| match taker_side {
-                    Side::Buy => Side::Sell,
-                    Side::Sell => Side::Buy,
-                })
-        } else {
-            taker_side
-        }
-    });
+    let side = order_side_by_norm_id
+        .get(&nk_leg)
+        .copied()
+        .unwrap_or_else(|| {
+            if is_maker {
+                leg_maker_side
+                    .as_deref()
+                    .and_then(parse_clob_side_str)
+                    .unwrap_or_else(|| match taker_side {
+                        Side::Buy => Side::Sell,
+                        Side::Sell => Side::Buy,
+                    })
+            } else {
+                taker_side
+            }
+        });
     if order_leg_id.is_empty() {
         return None;
     }
@@ -806,7 +836,10 @@ impl FillWaitRegistry {
         }
     }
 
-    pub async fn register_buy_fill_waiter(&self, order_id: &str) -> oneshot::Receiver<UserTradeFill> {
+    pub async fn register_buy_fill_waiter(
+        &self,
+        order_id: &str,
+    ) -> oneshot::Receiver<UserTradeFill> {
         let (tx, rx) = oneshot::channel();
         let key = norm_order_id_key(order_id);
         if !key.is_empty() {
@@ -834,7 +867,9 @@ impl FillWaitRegistry {
 
     async fn dispatch_trade_value(&self, v: &serde_json::Value) {
         let status = v.get("status").and_then(|s| s.as_str());
-        if !status.is_some_and(|s| s.eq_ignore_ascii_case("CONFIRMED") || s.eq_ignore_ascii_case("MINED")) {
+        if !status
+            .is_some_and(|s| s.eq_ignore_ascii_case("CONFIRMED") || s.eq_ignore_ascii_case("MINED"))
+        {
             return;
         }
 
@@ -957,7 +992,9 @@ mod user_channel_trade_parse_tests {
     #[test]
     fn mined_status_parses_when_ledger_matches() {
         let mut v = trade_two_makers();
-        v.as_object_mut().unwrap().insert("status".into(), json!("MINED"));
+        v.as_object_mut()
+            .unwrap()
+            .insert("status".into(), json!("MINED"));
         let mut ks = HashSet::new();
         ks.insert(norm_order_id_key("0xmine"));
         let f = try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).unwrap();
@@ -967,7 +1004,9 @@ mod user_channel_trade_parse_tests {
     #[test]
     fn matched_status_is_ignored() {
         let mut v = trade_two_makers();
-        v.as_object_mut().unwrap().insert("status".into(), json!("MATCHED"));
+        v.as_object_mut()
+            .unwrap()
+            .insert("status".into(), json!("MATCHED"));
         let mut ks = HashSet::new();
         ks.insert(norm_order_id_key("0xmine"));
         assert!(try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).is_none());
@@ -976,7 +1015,9 @@ mod user_channel_trade_parse_tests {
     #[test]
     fn failed_status_is_ignored() {
         let mut v = trade_two_makers();
-        v.as_object_mut().unwrap().insert("status".into(), json!("FAILED"));
+        v.as_object_mut()
+            .unwrap()
+            .insert("status".into(), json!("FAILED"));
         let mut ks = HashSet::new();
         ks.insert(norm_order_id_key("0xmine"));
         assert!(try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).is_none());
@@ -985,7 +1026,9 @@ mod user_channel_trade_parse_tests {
     #[test]
     fn retrying_status_is_ignored() {
         let mut v = trade_two_makers();
-        v.as_object_mut().unwrap().insert("status".into(), json!("RETRYING"));
+        v.as_object_mut()
+            .unwrap()
+            .insert("status".into(), json!("RETRYING"));
         let mut ks = HashSet::new();
         ks.insert(norm_order_id_key("0xmine"));
         assert!(try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).is_none());
@@ -1088,7 +1131,10 @@ fn buy_fill_shares_from_trades_for_order(
         if parse_clob_side_str(&t.side) != Some(Side::Buy) {
             continue;
         }
-        let role = t.trader_side.as_deref().map(|s| s.trim().to_ascii_uppercase());
+        let role = t
+            .trader_side
+            .as_deref()
+            .map(|s| s.trim().to_ascii_uppercase());
 
         match role.as_deref() {
             Some("TAKER") => {
@@ -1161,7 +1207,10 @@ fn net_shares_on_token_from_trades(trades: &[ClobTrade], token_id: &str) -> f64 
         let Some(side) = parse_clob_side_str(&t.side) else {
             continue;
         };
-        let role = t.trader_side.as_deref().map(|s| s.trim().to_ascii_uppercase());
+        let role = t
+            .trader_side
+            .as_deref()
+            .map(|s| s.trim().to_ascii_uppercase());
         let qty = if matches!(role.as_deref(), Some("MAKER") | Some("M")) {
             let Ok(qty) = t.size.parse::<f64>() else {
                 continue;
@@ -1189,7 +1238,11 @@ fn net_shares_on_token_from_trades(trades: &[ClobTrade], token_id: &str) -> f64 
 fn take_profit_sell_cap(need: f64, bal: f64, replay: f64) -> f64 {
     const EPS: f64 = 1e-9;
     let bal = if bal.is_finite() { bal.max(0.0) } else { 0.0 };
-    let replay = if replay.is_finite() { replay.max(0.0) } else { 0.0 };
+    let replay = if replay.is_finite() {
+        replay.max(0.0)
+    } else {
+        0.0
+    };
     let tol = f64::max(0.02, 0.02 * f64::max(need, f64::max(bal, replay)));
 
     let sell_cap = match (bal > EPS, replay > EPS) {
@@ -1258,10 +1311,10 @@ struct TradingState {
 // ── Client ──────────────────────────────────────────────────────────
 
 pub struct TradingClient {
-    http:   reqwest::Client,
+    http: reqwest::Client,
     signer: PrivateKeySigner,
     config: Config,
-    state:  RwLock<TradingState>,
+    state: RwLock<TradingState>,
     /// Serializes the first L1→L2 credential derivation so concurrent callers don't race.
     creds_derive_lock: AsyncMutex<()>,
     /// User-channel `trade` events (see `feeds::clob_user_ws`) wake these waiters by order id.
@@ -1270,8 +1323,7 @@ pub struct TradingClient {
 
 impl TradingClient {
     pub fn new(config: Config) -> Result<Self> {
-        let signer: PrivateKeySigner = config.private_key.parse()
-            .context("parsing private key")?;
+        let signer: PrivateKeySigner = config.private_key.parse().context("parsing private key")?;
         Ok(Self {
             http: crate::net::reqwest_client()?,
             signer,
@@ -1312,7 +1364,12 @@ impl TradingClient {
             }
         }
         let url = format!("{CLOB_HOST}/version");
-        let resp = self.http.get(&url).send().await.with_context(|| url.clone())?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| url.clone())?;
         let status = resp.status();
         let txt = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -1365,7 +1422,7 @@ impl TradingClient {
             }
         }
 
-        let ts: i64   = chrono::Utc::now().timestamp();
+        let ts: i64 = chrono::Utc::now().timestamp();
         let nonce: u64 = 0;
         let auth = self.compute_clob_auth(ts, nonce).await?;
 
@@ -1377,9 +1434,9 @@ impl TradingClient {
         );
 
         // 1) Try derive (GET) — returns existing creds if they exist.
-        let (get_status, get_body) = self.send_auth(
-            reqwest::Method::GET, "/auth/derive-api-key", &auth,
-        ).await?;
+        let (get_status, get_body) = self
+            .send_auth(reqwest::Method::GET, "/auth/derive-api-key", &auth)
+            .await?;
         tracing::info!(
             status = %get_status,
             body   = %snip(&get_body),
@@ -1400,9 +1457,9 @@ impl TradingClient {
         }
 
         // 2) Fallback: create fresh creds.
-        let (post_status, post_body) = self.send_auth(
-            reqwest::Method::POST, "/auth/api-key", &auth,
-        ).await?;
+        let (post_status, post_body) = self
+            .send_auth(reqwest::Method::POST, "/auth/api-key", &auth)
+            .await?;
         tracing::info!(
             status = %post_status,
             body   = %snip(&post_body),
@@ -1445,18 +1502,20 @@ impl TradingClient {
     async fn send_auth(
         &self,
         method: reqwest::Method,
-        path:   &str,
-        auth:   &ClobAuthDebug,
+        path: &str,
+        auth: &ClobAuthDebug,
     ) -> Result<(reqwest::StatusCode, String)> {
         let url = format!("{CLOB_HOST}{path}");
-        let req = self.http.request(method, &url)
-            .header("POLY_ADDRESS",   &auth.address)
+        let req = self
+            .http
+            .request(method, &url)
+            .header("POLY_ADDRESS", &auth.address)
             .header("POLY_SIGNATURE", &auth.signature)
             .header("POLY_TIMESTAMP", auth.timestamp.to_string())
-            .header("POLY_NONCE",     auth.nonce.to_string());
+            .header("POLY_NONCE", auth.nonce.to_string());
         let resp = req.send().await.with_context(|| url.to_string())?;
         let status = resp.status();
-        let body   = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         Ok((status, body))
     }
 
@@ -1476,10 +1535,9 @@ impl TradingClient {
 
         // `ClobAuth(address address,string timestamp,uint256 nonce,string message)`
         // — computed by hand because `address` is reserved in the sol! macro.
-        let type_hash = keccak256(
-            b"ClobAuth(address address,string timestamp,uint256 nonce,string message)"
-        );
-        let ts_str  = ts.to_string();
+        let type_hash =
+            keccak256(b"ClobAuth(address address,string timestamp,uint256 nonce,string message)");
+        let ts_str = ts.to_string();
         let message = "This message attests that I control the given wallet";
 
         let mut buf = Vec::with_capacity(32 * 5);
@@ -1503,14 +1561,14 @@ impl TradingClient {
         let sig = self.signer.sign_hash(&digest).await?;
 
         Ok(ClobAuthDebug {
-            address:     format!("{:#x}", self.signer.address()),
-            timestamp:   ts,
+            address: format!("{:#x}", self.signer.address()),
+            timestamp: ts,
             nonce,
-            type_hash:   hex::encode(type_hash),
-            domain_sep:  hex::encode(domain_sep),
+            type_hash: hex::encode(type_hash),
+            domain_sep: hex::encode(domain_sep),
             struct_hash: hex::encode(struct_hash),
-            digest:      hex::encode(digest),
-            signature:   format!("0x{}", hex::encode(sig.as_bytes())),
+            digest: hex::encode(digest),
+            signature: format!("0x{}", hex::encode(sig.as_bytes())),
         })
     }
 
@@ -1527,17 +1585,24 @@ impl TradingClient {
         println!("signer (EOA) : {signer_addr:#x}");
         println!("funder       : {funder:#x}");
         println!("sig_type     : {sig_type} ({:?})", self.config.sig_type);
-        println!("proxy        : {}", crate::net::proxy_env().as_deref().unwrap_or("<none>"));
+        println!(
+            "proxy        : {}",
+            crate::net::proxy_env().as_deref().unwrap_or("<none>")
+        );
         println!("CLOB host    : {CLOB_HOST}\n");
 
         // Sanity checks for common misconfigurations.
         if signer_addr == funder && sig_type != 0 {
             println!("⚠  POLYMARKET_FUNDER equals your signer address but POLYMARKET_SIG_TYPE={sig_type}.");
             println!("   For a plain EOA wallet set POLYMARKET_SIG_TYPE=0.");
-            println!("   For a Safe proxy, POLYMARKET_FUNDER must be the Safe address (not the EOA).\n");
+            println!(
+                "   For a Safe proxy, POLYMARKET_FUNDER must be the Safe address (not the EOA).\n"
+            );
         }
         if signer_addr != funder && sig_type == 0 {
-            println!("⚠  POLYMARKET_FUNDER differs from your signer but POLYMARKET_SIG_TYPE=0 (EOA).");
+            println!(
+                "⚠  POLYMARKET_FUNDER differs from your signer but POLYMARKET_SIG_TYPE=0 (EOA)."
+            );
             println!("   If the funder is a Gnosis Safe you own, set POLYMARKET_SIG_TYPE=2.\n");
         }
 
@@ -1545,9 +1610,13 @@ impl TradingClient {
         let auth = self.compute_clob_auth(ts, 0).await?;
 
         println!("L1 auth material:");
-        println!("  timestamp    {}  ({})", auth.timestamp,
+        println!(
+            "  timestamp    {}  ({})",
+            auth.timestamp,
             chrono::DateTime::<chrono::Utc>::from_timestamp(auth.timestamp, 0)
-                .map(|d| d.to_rfc3339()).unwrap_or_default());
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default()
+        );
         println!("  nonce        {}", auth.nonce);
         println!("  type_hash    0x{}", auth.type_hash);
         println!("  domain_sep   0x{}", auth.domain_sep);
@@ -1557,7 +1626,9 @@ impl TradingClient {
 
         // Request 1: GET derive
         println!("→ GET {CLOB_HOST}/auth/derive-api-key");
-        let (s, b) = self.send_auth(reqwest::Method::GET, "/auth/derive-api-key", &auth).await?;
+        let (s, b) = self
+            .send_auth(reqwest::Method::GET, "/auth/derive-api-key", &auth)
+            .await?;
         println!("← {} {}", s.as_u16(), s.canonical_reason().unwrap_or(""));
         println!("  {}\n", b.trim());
         if s.is_success() {
@@ -1569,7 +1640,9 @@ impl TradingClient {
 
         // Request 2: POST create
         println!("→ POST {CLOB_HOST}/auth/api-key");
-        let (s2, b2) = self.send_auth(reqwest::Method::POST, "/auth/api-key", &auth).await?;
+        let (s2, b2) = self
+            .send_auth(reqwest::Method::POST, "/auth/api-key", &auth)
+            .await?;
         println!("← {} {}", s2.as_u16(), s2.canonical_reason().unwrap_or(""));
         println!("  {}\n", b2.trim());
         if s2.is_success() {
@@ -1582,19 +1655,28 @@ impl TradingClient {
         // Neither worked. Print a tailored troubleshooting hint.
         println!("✗ both endpoints failed.  Likely causes:");
         println!();
-        if s.as_u16() == 401 { println!("  401 on derive → L1 signature does not recover to POLY_ADDRESS.") }
+        if s.as_u16() == 401 {
+            println!("  401 on derive → L1 signature does not recover to POLY_ADDRESS.")
+        }
         match s2.as_u16() {
             401 => println!("  401 on create → L1 signature does not recover to POLY_ADDRESS."),
-            403 => println!("  403 on create → wallet is recognised but not permitted (region block?)."),
+            403 => println!(
+                "  403 on create → wallet is recognised but not permitted (region block?)."
+            ),
             404 => println!("  404 on create → endpoint path wrong for your cluster."),
             _ => {}
         }
         if b.contains("timestamp") || b2.contains("timestamp") {
             println!("  Possible clock skew — `sudo ntpdate pool.ntp.org` or equivalent.");
         }
-        if b.contains("signature") || b2.contains("signature")
-           || b.contains("address") || b2.contains("address") {
-            println!("  Signature/address mismatch — verify POLYMARKET_PK corresponds to POLY_ADDRESS.");
+        if b.contains("signature")
+            || b2.contains("signature")
+            || b.contains("address")
+            || b2.contains("address")
+        {
+            println!(
+                "  Signature/address mismatch — verify POLYMARKET_PK corresponds to POLY_ADDRESS."
+            );
         }
         println!("  If you've never used this wallet on polymarket.com, log in there first.");
         println!("  Compare the signature above against py-clob-client with the same ts/nonce.");
@@ -1619,15 +1701,18 @@ impl TradingClient {
                 return Ok(*cached);
             }
         }
-        state.fee_rate_cache.insert(token_id.to_string(), (bps, Instant::now()));
+        state
+            .fee_rate_cache
+            .insert(token_id.to_string(), (bps, Instant::now()));
         Ok(bps)
     }
 
     async fn fetch_fee_rate_bps_uncached(&self, token_id: &str) -> Result<u64> {
-        let mut url = url::Url::parse(&format!("{CLOB_HOST}/fee-rate"))
-            .context("parse /fee-rate URL")?;
+        let mut url =
+            url::Url::parse(&format!("{CLOB_HOST}/fee-rate")).context("parse /fee-rate URL")?;
         url.query_pairs_mut().append_pair("token_id", token_id);
-        let resp = self.http
+        let resp = self
+            .http
             .get(url.as_str())
             .send()
             .await
@@ -1746,7 +1831,8 @@ impl TradingClient {
     /// Hot paths (e.g. SELL sizing in [`Self::place_order`]) pass `false`; cache is primed at startup
     /// and via [`Self::prewarm_order_context`] / [`Self::refresh_conditional_balance_allowance_cache`].
     pub async fn fetch_conditional_balance_shares(&self, token_id: &str) -> Result<f64> {
-        self.fetch_conditional_balance_shares_impl(token_id, false).await
+        self.fetch_conditional_balance_shares_impl(token_id, false)
+            .await
     }
 
     async fn fetch_conditional_balance_shares_impl(
@@ -1769,18 +1855,22 @@ impl TradingClient {
 
         let l2_sig = l2_hmac(&creds.secret, ts, "GET", path, "")?;
 
-        let resp = self.http
+        let resp = self
+            .http
             .get(url.as_str())
-            .header("POLY_ADDRESS",    format!("{:#x}", self.signer.address()))
-            .header("POLY_API_KEY",    &creds.api_key)
+            .header("POLY_ADDRESS", format!("{:#x}", self.signer.address()))
+            .header("POLY_API_KEY", &creds.api_key)
             .header("POLY_PASSPHRASE", &creds.passphrase)
-            .header("POLY_TIMESTAMP",  ts.to_string())
-            .header("POLY_SIGNATURE",  l2_sig)
+            .header("POLY_TIMESTAMP", ts.to_string())
+            .header("POLY_SIGNATURE", l2_sig)
             .send()
             .await
             .context("GET /balance-allowance")?;
         let status = resp.status();
-        let txt = resp.text().await.context("reading /balance-allowance body")?;
+        let txt = resp
+            .text()
+            .await
+            .context("reading /balance-allowance body")?;
         if !status.is_success() {
             return Err(anyhow!(
                 "CLOB GET /balance-allowance failed: {} — {}",
@@ -1825,7 +1915,10 @@ impl TradingClient {
             .await
             .context("GET /balance-allowance COLLATERAL")?;
         let status = resp.status();
-        let txt = resp.text().await.context("reading /balance-allowance body")?;
+        let txt = resp
+            .text()
+            .await
+            .context("reading /balance-allowance body")?;
         if !status.is_success() {
             return Err(anyhow!(
                 "CLOB GET /balance-allowance (COLLATERAL) failed: {} — {}",
@@ -1862,8 +1955,8 @@ impl TradingClient {
         let mut out = Vec::new();
         loop {
             let ts = chrono::Utc::now().timestamp();
-            let mut url = url::Url::parse(&format!("{CLOB_HOST}{path}"))
-                .context("parse /data/trades URL")?;
+            let mut url =
+                url::Url::parse(&format!("{CLOB_HOST}{path}")).context("parse /data/trades URL")?;
             url.query_pairs_mut()
                 .append_pair("maker_address", &maker)
                 .append_pair("market", condition_id)
@@ -1902,15 +1995,18 @@ impl TradingClient {
     }
 
     /// Open orders for `condition_id` (Gamma `conditionId` / CLOB `market`).
-    pub async fn fetch_open_orders_for_market(&self, condition_id: &str) -> Result<Vec<ClobOpenOrder>> {
+    pub async fn fetch_open_orders_for_market(
+        &self,
+        condition_id: &str,
+    ) -> Result<Vec<ClobOpenOrder>> {
         let creds = self.ensure_creds().await?;
         let path = "/data/orders";
         let mut cursor = TRADES_INITIAL_CURSOR.to_string();
         let mut out = Vec::new();
         loop {
             let ts = chrono::Utc::now().timestamp();
-            let mut url = url::Url::parse(&format!("{CLOB_HOST}{path}"))
-                .context("parse /data/orders URL")?;
+            let mut url =
+                url::Url::parse(&format!("{CLOB_HOST}{path}")).context("parse /data/orders URL")?;
             url.query_pairs_mut()
                 .append_pair("market", condition_id)
                 .append_pair("next_cursor", &cursor);
@@ -1948,9 +2044,11 @@ impl TradingClient {
     }
 
     /// Build + sign an order and POST it to the CLOB.
-    pub async fn place_order(&self, mut args: OrderArgs, order_type: OrderType)
-        -> Result<PostOrderResponse>
-    {
+    pub async fn place_order(
+        &self,
+        mut args: OrderArgs,
+        order_type: OrderType,
+    ) -> Result<PostOrderResponse> {
         if matches!(order_type, OrderType::Gtc | OrderType::Gtd) {
             args.price = snap_limit_order_price_to_tick(args.price, &args.tick_size);
         }
@@ -1972,16 +2070,15 @@ impl TradingClient {
                 if !fast_first_sell_post {
                     let settle_idx = post_attempt as usize;
                     let settle_idx = settle_idx.min(SELL_ORDER_PREP_SETTLE_MS.len() - 1);
-                    tokio::time::sleep(Duration::from_millis(SELL_ORDER_PREP_SETTLE_MS[settle_idx]))
-                        .await;
+                    tokio::time::sleep(Duration::from_millis(
+                        SELL_ORDER_PREP_SETTLE_MS[settle_idx],
+                    ))
+                    .await;
 
                     let bal = self
                         .fetch_conditional_balance_shares_impl(&args.token_id, false)
                         .await?;
-                    if bal < 1e-6
-                        && args.size > 1e-9
-                        && post_attempt + 1 < max_post_attempts
-                    {
+                    if bal < 1e-6 && args.size > 1e-9 && post_attempt + 1 < max_post_attempts {
                         tracing::warn!(
                             post_attempt,
                             bal,
@@ -2057,8 +2154,16 @@ impl TradingClient {
 
             let token_id_u256 = U256::from_str(&args.token_id).context("token_id")?;
 
-            let verifying_v1 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V1 } else { CTF_EXCHANGE_V1 };
-            let verifying_v2 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V2 } else { CTF_EXCHANGE_V2 };
+            let verifying_v1 = if args.neg_risk {
+                NEG_RISK_CTF_EXCHANGE_V1
+            } else {
+                CTF_EXCHANGE_V1
+            };
+            let verifying_v2 = if args.neg_risk {
+                NEG_RISK_CTF_EXCHANGE_V2
+            } else {
+                CTF_EXCHANGE_V2
+            };
 
             const PUBLIC_TAKER: &str = "0x0000000000000000000000000000000000000000";
             const ZERO32: &str =
@@ -2092,11 +2197,14 @@ impl TradingClient {
 
                     #[derive(Serialize)]
                     struct OrderPayloadV1<'a> {
-                        #[serde(rename = "deferExec")] defer_exec: bool,
-                        #[serde(rename = "postOnly")] post_only: bool,
+                        #[serde(rename = "deferExec")]
+                        defer_exec: bool,
+                        #[serde(rename = "postOnly")]
+                        post_only: bool,
                         order: OrderWireV1,
                         owner: &'a str,
-                        #[serde(rename = "orderType")] order_type: &'a str,
+                        #[serde(rename = "orderType")]
+                        order_type: &'a str,
                     }
                     #[derive(Serialize)]
                     struct OrderWireV1 {
@@ -2104,14 +2212,19 @@ impl TradingClient {
                         maker: String,
                         signer: String,
                         taker: String,
-                        #[serde(rename = "tokenId")] token_id: String,
-                        #[serde(rename = "makerAmount")] maker_amount: String,
-                        #[serde(rename = "takerAmount")] taker_amount: String,
+                        #[serde(rename = "tokenId")]
+                        token_id: String,
+                        #[serde(rename = "makerAmount")]
+                        maker_amount: String,
+                        #[serde(rename = "takerAmount")]
+                        taker_amount: String,
                         side: String,
                         expiration: String,
                         nonce: String,
-                        #[serde(rename = "feeRateBps")] fee_rate_bps: String,
-                        #[serde(rename = "signatureType")] signature_type: u8,
+                        #[serde(rename = "feeRateBps")]
+                        fee_rate_bps: String,
+                        #[serde(rename = "signatureType")]
+                        signature_type: u8,
                         signature: String,
                     }
                     let payload = OrderPayloadV1 {
@@ -2161,11 +2274,14 @@ impl TradingClient {
 
                     #[derive(Serialize)]
                     struct OrderPayloadV2<'a> {
-                        #[serde(rename = "deferExec")] defer_exec: bool,
-                        #[serde(rename = "postOnly")] post_only: bool,
+                        #[serde(rename = "deferExec")]
+                        defer_exec: bool,
+                        #[serde(rename = "postOnly")]
+                        post_only: bool,
                         order: OrderWireV2,
                         owner: &'a str,
-                        #[serde(rename = "orderType")] order_type: &'a str,
+                        #[serde(rename = "orderType")]
+                        order_type: &'a str,
                     }
                     #[derive(Serialize)]
                     struct OrderWireV2 {
@@ -2173,13 +2289,17 @@ impl TradingClient {
                         maker: String,
                         signer: String,
                         taker: String,
-                        #[serde(rename = "tokenId")] token_id: String,
-                        #[serde(rename = "makerAmount")] maker_amount: String,
-                        #[serde(rename = "takerAmount")] taker_amount: String,
+                        #[serde(rename = "tokenId")]
+                        token_id: String,
+                        #[serde(rename = "makerAmount")]
+                        maker_amount: String,
+                        #[serde(rename = "takerAmount")]
+                        taker_amount: String,
                         side: String,
                         expiration: String,
                         nonce: String,
-                        #[serde(rename = "signatureType")] signature_type: u8,
+                        #[serde(rename = "signatureType")]
+                        signature_type: u8,
                         signature: String,
                         timestamp: String,
                         metadata: String,
@@ -2249,7 +2369,9 @@ impl TradingClient {
             }
         }
 
-        Err(anyhow!("internal error: place_order POST loop did not return"))
+        Err(anyhow!(
+            "internal error: place_order POST loop did not return"
+        ))
     }
 
     async fn post_order_http(
@@ -2263,26 +2385,26 @@ impl TradingClient {
         // Use pre-decoded key bytes when available to skip base64 decode on the hot path.
         let l2_sig = match self.state.try_read().ok().and_then(|g| g.hmac_key.clone()) {
             Some(key) => l2_hmac_bytes(&key, ts, "POST", path, &body)?,
-            None      => l2_hmac(&creds.secret, ts, "POST", path, &body)?,
+            None => l2_hmac(&creds.secret, ts, "POST", path, &body)?,
         };
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{CLOB_HOST}{path}"))
-            .header("POLY_ADDRESS",     format!("{:#x}", self.signer.address()))
-            .header("POLY_API_KEY",     &creds.api_key)
-            .header("POLY_PASSPHRASE",  &creds.passphrase)
-            .header("POLY_TIMESTAMP",   ts.to_string())
-            .header("POLY_SIGNATURE",   l2_sig)
-            .header("Content-Type",     "application/json")
+            .header("POLY_ADDRESS", format!("{:#x}", self.signer.address()))
+            .header("POLY_API_KEY", &creds.api_key)
+            .header("POLY_PASSPHRASE", &creds.passphrase)
+            .header("POLY_TIMESTAMP", ts.to_string())
+            .header("POLY_SIGNATURE", l2_sig)
+            .header("Content-Type", "application/json")
             .body(body)
             .send()
             .await?;
 
         let status = resp.status();
-        let txt    = resp.text().await?;
+        let txt = resp.text().await?;
         if !status.is_success() {
-            let detail = extract_clob_error_text(&txt)
-                .unwrap_or_else(|| format!("HTTP {status}"));
+            let detail = extract_clob_error_text(&txt).unwrap_or_else(|| format!("HTTP {status}"));
             return Err(anyhow!("CLOB POST /order: {detail}"));
         }
         if matches!(order_type, OrderType::Fak | OrderType::Gtd) {
@@ -2303,20 +2425,20 @@ impl TradingClient {
         let ts = chrono::Utc::now().timestamp();
         let path = "/cancel-all";
         let l2_sig = l2_hmac(&creds.secret, ts, "DELETE", path, "")?;
-        let resp = self.http
+        let resp = self
+            .http
             .delete(format!("{CLOB_HOST}{path}"))
-            .header("POLY_ADDRESS",    format!("{:#x}", self.signer.address()))
-            .header("POLY_API_KEY",    &creds.api_key)
+            .header("POLY_ADDRESS", format!("{:#x}", self.signer.address()))
+            .header("POLY_API_KEY", &creds.api_key)
             .header("POLY_PASSPHRASE", &creds.passphrase)
-            .header("POLY_TIMESTAMP",  ts.to_string())
-            .header("POLY_SIGNATURE",  l2_sig)
+            .header("POLY_TIMESTAMP", ts.to_string())
+            .header("POLY_SIGNATURE", l2_sig)
             .send()
             .await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            let detail = extract_clob_error_text(&body)
-                .unwrap_or_else(|| format!("HTTP {status}"));
+            let detail = extract_clob_error_text(&body).unwrap_or_else(|| format!("HTTP {status}"));
             return Err(anyhow!("cancel-all: {detail}"));
         }
         Ok(())
@@ -2333,22 +2455,22 @@ impl TradingClient {
         let path = "/order";
         let body = serde_json::json!({ "orderID": oid }).to_string();
         let l2_sig = l2_hmac(&creds.secret, ts, "DELETE", path, &body)?;
-        let resp = self.http
+        let resp = self
+            .http
             .delete(format!("{CLOB_HOST}{path}"))
-            .header("POLY_ADDRESS",     format!("{:#x}", self.signer.address()))
-            .header("POLY_API_KEY",     &creds.api_key)
-            .header("POLY_PASSPHRASE",  &creds.passphrase)
-            .header("POLY_TIMESTAMP",   ts.to_string())
-            .header("POLY_SIGNATURE",   l2_sig)
-            .header("Content-Type",     "application/json")
+            .header("POLY_ADDRESS", format!("{:#x}", self.signer.address()))
+            .header("POLY_API_KEY", &creds.api_key)
+            .header("POLY_PASSPHRASE", &creds.passphrase)
+            .header("POLY_TIMESTAMP", ts.to_string())
+            .header("POLY_SIGNATURE", l2_sig)
+            .header("Content-Type", "application/json")
             .body(body.clone())
             .send()
             .await?;
         let status = resp.status();
         let txt = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            let detail = extract_clob_error_text(&txt)
-                .unwrap_or_else(|| format!("HTTP {status}"));
+            let detail = extract_clob_error_text(&txt).unwrap_or_else(|| format!("HTTP {status}"));
             return Err(anyhow!("cancel_order: {detail}"));
         }
         #[derive(Debug, Deserialize)]
@@ -2366,7 +2488,11 @@ impl TradingClient {
         {
             return Err(anyhow!("cancel_order: not canceled {oid}: {err}"));
         }
-        if !parsed.canceled.iter().any(|c| norm_order_id_key(c) == norm_order_id_key(oid)) {
+        if !parsed
+            .canceled
+            .iter()
+            .any(|c| norm_order_id_key(c) == norm_order_id_key(oid))
+        {
             debug!(
                 order_id = %oid,
                 response = %snip(&txt),
@@ -2619,9 +2745,14 @@ fn amounts_for(
                 let mut taker_ticks = ((size_shares * scale as f64).ceil() as i64).max(1);
                 for _ in 0..50_000u32 {
                     let s = taker_ticks as f64 / scale as f64;
-                    if let Some((raw_maker, raw_taker)) =
-                        get_order_raw_amounts_official(Side::Buy, s, price, price_dec, size_dec, amount_dec)
-                    {
+                    if let Some((raw_maker, raw_taker)) = get_order_raw_amounts_official(
+                        Side::Buy,
+                        s,
+                        price,
+                        price_dec,
+                        size_dec,
+                        amount_dec,
+                    ) {
                         if raw_maker + 1e-12 >= floor_notional {
                             return (
                                 clob_float_to_micros_py_style(raw_maker),
@@ -2669,7 +2800,10 @@ fn amounts_for(
                 .map(|n| round_down_f64(n, USDC_DECIMALS))
                 .unwrap_or_else(|| round_up_f64(size_shares * raw_price, USDC_DECIMALS));
 
-            if !size_shares.is_finite() || size_shares <= 0.0 || !floor_notional.is_finite() || floor_notional <= 0.0
+            if !size_shares.is_finite()
+                || size_shares <= 0.0
+                || !floor_notional.is_finite()
+                || floor_notional <= 0.0
             {
                 return (U256::ZERO, U256::ZERO);
             }
@@ -2753,14 +2887,14 @@ fn l2_hmac(secret_b64: &str, ts: i64, method: &str, path: &str, body: &str) -> R
 /// Intermediate values produced during L1 auth signing — useful for diagnostics.
 #[derive(Debug, Clone)]
 pub struct ClobAuthDebug {
-    pub address:     String,
-    pub timestamp:   i64,
-    pub nonce:       u64,
-    pub type_hash:   String,
-    pub domain_sep:  String,
+    pub address: String,
+    pub timestamp: i64,
+    pub nonce: u64,
+    pub type_hash: String,
+    pub domain_sep: String,
     pub struct_hash: String,
-    pub digest:      String,
-    pub signature:   String,
+    pub digest: String,
+    pub signature: String,
 }
 
 /// User-facing message from CLOB JSON (`error` or `errorMsg`). Avoids putting full response bodies in the TUI.
@@ -2785,8 +2919,11 @@ fn extract_clob_error_text(body: &str) -> Option<String> {
 /// Shorten long response bodies for log output.
 fn snip(s: &str) -> String {
     let one_line: String = s.chars().filter(|&c| c != '\n' && c != '\r').collect();
-    if one_line.chars().count() <= 200 { one_line }
-    else { one_line.chars().take(200).collect::<String>() + "…" }
+    if one_line.chars().count() <= 200 {
+        one_line
+    } else {
+        one_line.chars().take(200).collect::<String>() + "…"
+    }
 }
 
 #[cfg(test)]
@@ -2902,15 +3039,21 @@ mod fill_for_position_ack_tests {
     #[test]
     fn resting_limit_does_not_fake_position() {
         let p = r(true, Some("live"), None, None);
-        assert!(p.fill_for_position_ack(Side::Buy, 10.0, 0.5, OrderType::Gtd).is_none());
+        assert!(p
+            .fill_for_position_ack(Side::Buy, 10.0, 0.5, OrderType::Gtd)
+            .is_none());
         let p = r(true, Some("open"), None, None);
-        assert!(p.fill_for_position_ack(Side::Sell, 10.0, 0.5, OrderType::Gtd).is_none());
+        assert!(p
+            .fill_for_position_ack(Side::Sell, 10.0, 0.5, OrderType::Gtd)
+            .is_none());
     }
 
     #[test]
     fn matched_without_amounts_uses_submitted_size() {
         let p = r(true, Some("matched"), None, None);
-        let (q, px) = p.fill_for_position_ack(Side::Buy, 12.0, 0.48, OrderType::Gtd).unwrap();
+        let (q, px) = p
+            .fill_for_position_ack(Side::Buy, 12.0, 0.48, OrderType::Gtd)
+            .unwrap();
         assert!((q - 12.0).abs() < 1e-9);
         assert!((px - 0.48).abs() < 1e-9);
     }
@@ -2925,7 +3068,9 @@ mod fill_for_position_ack_tests {
             taking_amount: None,
             error: None,
         };
-        let (q, px) = p.fill_for_position_ack(Side::Buy, 4.0, 0.6, OrderType::Fak).unwrap();
+        let (q, px) = p
+            .fill_for_position_ack(Side::Buy, 4.0, 0.6, OrderType::Fak)
+            .unwrap();
         assert!((q - 4.0).abs() < 1e-9);
         assert!((px - 0.6).abs() < 1e-9);
     }
@@ -2933,7 +3078,9 @@ mod fill_for_position_ack_tests {
     #[test]
     fn partial_fill_amounts_preferred_for_sell() {
         let p = r(true, Some("live"), Some("2.0"), Some("0.9"));
-        let (q, px) = p.fill_for_position_ack(Side::Sell, 10.0, 0.5, OrderType::Gtd).unwrap();
+        let (q, px) = p
+            .fill_for_position_ack(Side::Sell, 10.0, 0.5, OrderType::Gtd)
+            .unwrap();
         assert!((q - 2.0).abs() < 1e-9);
         assert!((px - 0.45).abs() < 1e-9);
     }
@@ -2943,7 +3090,9 @@ mod fill_for_position_ack_tests {
     #[test]
     fn fak_buy_prefers_api_over_request_when_plausible_rejects_small_fill() {
         let p = r(true, Some("matched"), Some("0.00025"), Some("0.0005"));
-        let strict = p.fill_for_position_ack(Side::Buy, 10.0, 0.5, OrderType::Fak).unwrap();
+        let strict = p
+            .fill_for_position_ack(Side::Buy, 10.0, 0.5, OrderType::Fak)
+            .unwrap();
         assert!((strict.0 - 10.0).abs() < 1e-9);
         let loose = p.fak_fill_for_position_ack(Side::Buy, 10.0, 0.5).unwrap();
         assert!((loose.0 - 0.0005).abs() < 1e-12);
@@ -2952,12 +3101,7 @@ mod fill_for_position_ack_tests {
 
     #[test]
     fn fak_buy_uses_exact_taking_amount_vs_rough_request() {
-        let p = r(
-            true,
-            Some("matched"),
-            Some("5.04435025"),
-            Some("10.087"),
-        );
+        let p = r(true, Some("matched"), Some("5.04435025"), Some("10.087"));
         let (q, px) = p.fak_fill_for_position_ack(Side::Buy, 10.0, 0.5).unwrap();
         assert!((q - 10.087).abs() < 1e-9);
         assert!((px - 5.04435025 / 10.087).abs() < 1e-9);
@@ -3284,14 +3428,7 @@ mod limit_gtd_buy_amounts_tests {
 
     #[test]
     fn gtd_buy_with_notional_implied_on_0_01_tick() {
-        let (mk, tk) = amounts_for(
-            Side::Buy,
-            250.0,
-            0.55,
-            "0.01",
-            Some(100.0),
-            OrderType::Gtd,
-        );
+        let (mk, tk) = amounts_for(Side::Buy, 250.0, 0.55, "0.01", Some(100.0), OrderType::Gtd);
         assert!(!mk.is_zero() && !tk.is_zero());
         let implied = buy_implied_price_micros(mk, tk);
         assert_eq!(implied % 10_000, 0, "implied_micros={implied}");
@@ -3299,14 +3436,7 @@ mod limit_gtd_buy_amounts_tests {
 
     #[test]
     fn gtd_buy_one_dollar_notional_implied_on_tick() {
-        let (mk, tk) = amounts_for(
-            Side::Buy,
-            50.0,
-            0.73,
-            "0.01",
-            Some(1.0),
-            OrderType::Gtd,
-        );
+        let (mk, tk) = amounts_for(Side::Buy, 50.0, 0.73, "0.01", Some(1.0), OrderType::Gtd);
         assert!(!mk.is_zero() && !tk.is_zero());
         assert_eq!(buy_implied_price_micros(mk, tk) % 10_000, 0);
     }
@@ -3329,7 +3459,11 @@ mod fak_market_sell_amounts_tests {
     fn fak_sell_half_share_at_one_cent_rounds_taker_to_one_cent() {
         let (mk, tk) = amounts_for(Side::Sell, 0.5, 0.01, "0.01", None, OrderType::Fak);
         assert!(!mk.is_zero() && !tk.is_zero());
-        assert_eq!(tk, U256::from(10_000u64), "taker should be $0.01 in 1e6 micros");
+        assert_eq!(
+            tk,
+            U256::from(10_000u64),
+            "taker should be $0.01 in 1e6 micros"
+        );
     }
 
     #[test]

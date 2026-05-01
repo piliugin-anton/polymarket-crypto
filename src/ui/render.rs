@@ -11,12 +11,14 @@
 
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph, Row, Table, Wrap, BorderType, Cell, Clear},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
 };
 
 use std::time::Instant;
 
-use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome, SentimentDir, UiPhase};
+use crate::app::{
+    AppState, DepositModalPhase, InputMode, LimitField, Outcome, SentimentDir, UiPhase,
+};
 use crate::bridge_deposit::SOLANA_MAINNET_USDC_MINT;
 use crate::market_profile::Timeframe;
 
@@ -38,12 +40,13 @@ pub fn draw(f: &mut Frame, s: &AppState) {
     }
     let area = f.area();
     let chunks = Layout::vertical([
-        Constraint::Length(4), // header
-        Constraint::Min(8),    // main — book + positions (less vertical space than before)
+        Constraint::Length(4),                    // header
+        Constraint::Min(8), // main — book + positions (less vertical space than before)
         Constraint::Length(8), // open orders
         Constraint::Length(8), // fills
         Constraint::Length(help_block_height(s)), // help
-    ]).split(area);
+    ])
+    .split(area);
 
     draw_header_row(f, chunks[0], s);
     draw_main(f, chunks[1], s);
@@ -51,7 +54,12 @@ pub fn draw(f: &mut Frame, s: &AppState) {
     draw_fills(f, chunks[3], s);
     draw_help(f, chunks[4], s);
 
-    if let InputMode::LimitModal { outcome, side, field } = s.input_mode {
+    if let InputMode::LimitModal {
+        outcome,
+        side,
+        field,
+    } = s.input_mode
+    {
         draw_limit_modal(f, area, s, outcome, side, field);
     }
     if let Some(ref phase) = s.deposit_modal {
@@ -93,11 +101,16 @@ fn draw_balance_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(Span::styled(" Balance ", Style::default().add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Balance ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
     let inner_w = block.inner(area).width.max(1) as usize;
     let line1 = balance_row_right_aligned("Cash ", &cash, inner_w, Color::Cyan, true);
     let line2 = balance_row_right_aligned("Claimable ", &claimable, inner_w, Color::White, false);
-    let p = Paragraph::new(vec![line1, line2]).block(block).wrap(Wrap { trim: false });
+    let p = Paragraph::new(vec![line1, line2])
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
 
@@ -136,8 +149,7 @@ fn draw_wizard(f: &mut Frame, s: &AppState) {
             } else {
                 format!("{title}\n")
             };
-            let p = Paragraph::new(header.as_str())
-                .style(Style::default().fg(Color::White));
+            let p = Paragraph::new(header.as_str()).style(Style::default().fg(Color::White));
             f.render_widget(p, inner);
             let start_row = 2u16;
             let visible = (inner.height.saturating_sub(start_row + 1)) as usize;
@@ -165,9 +177,9 @@ fn draw_wizard(f: &mut Frame, s: &AppState) {
                     Style::default().fg(Color::White)
                 };
                 let r = Rect {
-                    x:      inner.x + 1,
-                    y:      inner.y + start_row + i as u16,
-                    width:  inner.width.saturating_sub(2),
+                    x: inner.x + 1,
+                    y: inner.y + start_row + i as u16,
+                    width: inner.width.saturating_sub(2),
                     height: 1,
                 };
                 f.render_widget(Paragraph::new(line).style(style), r);
@@ -176,9 +188,17 @@ fn draw_wizard(f: &mut Frame, s: &AppState) {
         UiPhase::WizardPickTimeframe => {
             let p = Paragraph::new("Time window (↑/↓) Enter  ·  Esc/B back  ·  Q quit\n")
                 .style(Style::default().fg(Color::White));
-            f.render_widget(p, Rect { x: inner.x, y: inner.y, width: inner.width, height: 2 });
+            f.render_widget(
+                p,
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: 2,
+                },
+            );
             let options: [(usize, &str, Timeframe); 2] = [
-                (0, "5 minutes",  Timeframe::M5),
+                (0, "5 minutes", Timeframe::M5),
                 (1, "15 minutes", Timeframe::M15),
             ];
             for (idx, (i, desc, tf)) in options.iter().enumerate() {
@@ -191,9 +211,9 @@ fn draw_wizard(f: &mut Frame, s: &AppState) {
                     Style::default().fg(Color::White)
                 };
                 let r = Rect {
-                    x:      inner.x + 1,
-                    y:      inner.y + 3 + idx as u16,
-                    width:  inner.width.saturating_sub(2),
+                    x: inner.x + 1,
+                    y: inner.y + 3 + idx as u16,
+                    width: inner.width.saturating_sub(2),
                     height: 1,
                 };
                 f.render_widget(Paragraph::new(line).style(style), r);
@@ -228,14 +248,15 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
     let pair = s.cached_pair_label.as_str();
     let price_cell = match s.spot_price {
         Some(p) => format!("${}", fmt_money_decimals(p, dec as u32)),
-        None    => "—".to_string(),
+        None => "—".to_string(),
     };
     let (colour, arrow) = match s.spot_above_target() {
-        Some(true)  => (Color::Green, "▲"),
-        Some(false) => (Color::Red,   "▼"),
-        None        => (Color::Gray,  "·"),
+        Some(true) => (Color::Green, "▲"),
+        Some(false) => (Color::Red, "▼"),
+        None => (Color::Gray, "·"),
     };
-    let target = s.price_to_beat()
+    let target = s
+        .price_to_beat()
         .map(|t| format!("Open: ${}", fmt_money_decimals(t, dec as u32)))
         .unwrap_or_else(|| "Open: —".into());
     let delta = match (s.spot_price, s.price_to_beat()) {
@@ -246,23 +267,32 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
     let sentiment_spans: Vec<Span> = match s.cached_sentiment {
         SentimentDir::Up => vec![
             Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("▲", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "▲",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ],
         SentimentDir::Down => vec![
             Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("▼", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "▼",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
         ],
         SentimentDir::Neutral => vec![
             Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("·",  Style::default().fg(Color::DarkGray)),
+            Span::styled("·", Style::default().fg(Color::DarkGray)),
         ],
         SentimentDir::Unknown => vec![
             Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("—",  Style::default().fg(Color::DarkGray)),
+            Span::styled("—", Style::default().fg(Color::DarkGray)),
         ],
     };
 
-    let cd = s.cached_countdown_secs
+    let cd = s
+        .cached_countdown_secs
         .map(|c| format!("{:02}:{:02}", c / 60, c % 60))
         .unwrap_or_else(|| "—".into());
 
@@ -272,9 +302,15 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
             format!("{pair} (Chainlink)  "),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled(price_cell, Style::default().fg(colour).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            price_cell,
+            Style::default().fg(colour).add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
-        Span::styled(arrow, Style::default().fg(colour).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            arrow,
+            Style::default().fg(colour).add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(delta, Style::default().fg(colour)),
         Span::raw("  "),
@@ -288,15 +324,20 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
         Span::raw("   "),
         Span::styled(
             format!("Closes in {cd}"),
-            Style::default().fg(match s.cached_countdown_secs {
-                Some(c) if c < 30  => Color::Red,
-                Some(c) if c < 120 => Color::Yellow,
-                _                  => Color::Green,
-            }).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(match s.cached_countdown_secs {
+                    Some(c) if c < 30 => Color::Red,
+                    Some(c) if c < 120 => Color::Yellow,
+                    _ => Color::Green,
+                })
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
         Span::styled(
-            s.market.as_ref().map(|m| truncate(&m.question, 60)).unwrap_or_default(),
+            s.market
+                .as_ref()
+                .map(|m| truncate(&m.question, 60))
+                .unwrap_or_default(),
             Style::default().fg(Color::White),
         ),
     ];
@@ -314,28 +355,39 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
         .as_ref()
         .map(|p| format!(" {} {} ", p.asset.label, p.timeframe.tui_phrase()))
         .unwrap_or_else(|| " — ".to_string());
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
-        .title(Span::styled(block_title, Style::default().add_modifier(Modifier::BOLD)));
-    let p = Paragraph::new(vec![line1, line2]).block(block).wrap(Wrap { trim: false });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            block_title,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    let p = Paragraph::new(vec![line1, line2])
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
 
 // ── Main (book + positions) ─────────────────────────────────────────
 fn draw_main(f: &mut Frame, area: Rect, s: &AppState) {
-    let cols = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
     draw_book(f, cols[0], s);
     draw_positions(f, cols[1], s);
 }
 
 fn draw_book(f: &mut Frame, area: Rect, s: &AppState) {
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Order Book ")
         .title_style(Style::default().add_modifier(Modifier::BOLD));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let split = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
-    draw_book_side(f, split[0], s, Outcome::Up,   Color::Green);
+    let split =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
+    draw_book_side(f, split[0], s, Outcome::Up, Color::Green);
     draw_book_side(f, split[1], s, Outcome::Down, Color::Red);
 }
 
@@ -359,8 +411,11 @@ fn draw_book_side(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcome, col
         };
         if let Some(m) = mid {
             rows.push(Row::new(vec![
-                Cell::from(format!("── {:.2} ──", m))
-                    .style(Style::default().fg(colour).add_modifier(Modifier::BOLD | Modifier::DIM)),
+                Cell::from(format!("── {:.2} ──", m)).style(
+                    Style::default()
+                        .fg(colour)
+                        .add_modifier(Modifier::BOLD | Modifier::DIM),
+                ),
                 Cell::from(""),
             ]));
         }
@@ -380,38 +435,52 @@ fn draw_book_side(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcome, col
             .style(Style::default().fg(colour).add_modifier(Modifier::BOLD)),
         Cell::from("size").style(Style::default().fg(Color::DarkGray)),
     ]);
-    let table = Table::new(rows, [Constraint::Percentage(55), Constraint::Percentage(45)])
-        .header(header)
-        .column_spacing(1);
+    let table = Table::new(
+        rows,
+        [Constraint::Percentage(55), Constraint::Percentage(45)],
+    )
+    .header(header)
+    .column_spacing(1);
     f.render_widget(table, area);
 }
 
 fn draw_positions(f: &mut Frame, area: Rect, s: &AppState) {
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Positions ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let rows = Layout::vertical([
-        Constraint::Length(3), Constraint::Length(3), Constraint::Length(1),
-        Constraint::Length(2), Constraint::Length(2), Constraint::Min(0),
-    ]).split(inner);
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Min(0),
+    ])
+    .split(inner);
 
-    render_position_line(f, rows[0], s, Outcome::Up,   Color::Green);
+    render_position_line(f, rows[0], s, Outcome::Up, Color::Green);
     render_position_line(f, rows[1], s, Outcome::Down, Color::Red);
 
     let realized = Paragraph::new(Line::from(vec![
         Span::styled("Realized ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("${:+.2}", s.realized_pnl),
-            pnl_style(s.realized_pnl).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("${:+.2}", s.realized_pnl),
+            pnl_style(s.realized_pnl).add_modifier(Modifier::BOLD),
+        ),
     ]));
     f.render_widget(realized, rows[3]);
 
     let total_pnl = s.total_pnl();
     let total = Paragraph::new(Line::from(vec![
         Span::styled("Total    ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("${:+.2}", total_pnl),
-            pnl_style(total_pnl).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+        Span::styled(
+            format!("${:+.2}", total_pnl),
+            pnl_style(total_pnl).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ),
     ]));
     f.render_widget(total, rows[4]);
 }
@@ -419,11 +488,18 @@ fn draw_positions(f: &mut Frame, area: Rect, s: &AppState) {
 fn render_position_line(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcome, colour: Color) {
     let p = s.position(outcome);
     let upnl = s.unrealized_pnl(outcome);
-    let mark = s.mark(outcome).map(|m| format!("{:.2}", m)).unwrap_or_else(|| "—".into());
+    let mark = s
+        .mark(outcome)
+        .map(|m| format!("{:.2}", m))
+        .unwrap_or_else(|| "—".into());
     let lines = vec![
         Line::from(vec![
-            Span::styled(format!("  {}  ", outcome.as_str()),
-                Style::default().fg(colour).add_modifier(Modifier::BOLD | Modifier::REVERSED)),
+            Span::styled(
+                format!("  {}  ", outcome.as_str()),
+                Style::default()
+                    .fg(colour)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            ),
             Span::raw("  "),
             Span::raw(format!("{:.2} sh @ {:.2}", p.shares, p.avg_entry)),
         ]),
@@ -439,52 +515,88 @@ fn render_position_line(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcom
 
 // ── Open orders ─────────────────────────────────────────────────────
 fn draw_open_orders(f: &mut Frame, area: Rect, s: &AppState) {
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Open Orders ");
-    let rows: Vec<Row> = s.open_orders.iter().take(6).map(|o| {
-        let side_cell = Cell::from(match o.side { crate::trading::Side::Buy => "BUY", _ => "SELL" })
-            .style(Style::default().fg(match o.side { crate::trading::Side::Buy => Color::Green, _ => Color::Red }));
-        Row::new(vec![
-            side_cell,
-            Cell::from(o.outcome.as_str()).style(Style::default().fg(
-                match o.outcome { Outcome::Up => Color::Green, Outcome::Down => Color::Red }
-            )),
-            Cell::from(format!("{:.2}", o.price)),
-            Cell::from(format!("{:.2}", o.remaining)),
-        ])
-    }).collect();
+    let rows: Vec<Row> = s
+        .open_orders
+        .iter()
+        .take(6)
+        .map(|o| {
+            let side_cell = Cell::from(match o.side {
+                crate::trading::Side::Buy => "BUY",
+                _ => "SELL",
+            })
+            .style(Style::default().fg(match o.side {
+                crate::trading::Side::Buy => Color::Green,
+                _ => Color::Red,
+            }));
+            Row::new(vec![
+                side_cell,
+                Cell::from(o.outcome.as_str()).style(Style::default().fg(match o.outcome {
+                    Outcome::Up => Color::Green,
+                    Outcome::Down => Color::Red,
+                })),
+                Cell::from(format!("{:.2}", o.price)),
+                Cell::from(format!("{:.2}", o.remaining)),
+            ])
+        })
+        .collect();
     let widths = [
         Constraint::Length(5),  // side
         Constraint::Length(5),  // outcome
         Constraint::Length(8),  // price
         Constraint::Length(10), // remaining
     ];
-    let header = Row::new(["side", "out", "price", "left"])
-        .style(Style::default().fg(Color::DarkGray));
-    let table = Table::new(rows, widths).header(header).block(block).column_spacing(1);
+    let header =
+        Row::new(["side", "out", "price", "left"]).style(Style::default().fg(Color::DarkGray));
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(1);
     f.render_widget(table, area);
 }
 
 // ── Fills ───────────────────────────────────────────────────────────
 fn draw_fills(f: &mut Frame, area: Rect, s: &AppState) {
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Fills ");
-    let rows: Vec<Row> = s.fills.iter().take(6).map(|f| {
-        let side_cell = Cell::from(match f.side { crate::trading::Side::Buy => "BUY", _ => "SELL" })
-            .style(Style::default().fg(match f.side { crate::trading::Side::Buy => Color::Green, _ => Color::Red }));
-        Row::new(vec![
-            Cell::from(f.ts.format("%H:%M:%S").to_string()).style(Style::default().fg(Color::DarkGray)),
-            side_cell,
-            Cell::from(f.outcome.as_str()).style(Style::default().fg(
-                match f.outcome { Outcome::Up => Color::Green, Outcome::Down => Color::Red }
-            )),
-            Cell::from(format!("{:.2}", f.qty)),
-            Cell::from(format!("@ {:.2}", f.price)),
-            Cell::from(format!("= ${:.2}", f.qty * f.price)),
-            Cell::from(if f.realized.abs() > 1e-9 { format!("{:+.2}", f.realized) } else { String::new() })
+    let rows: Vec<Row> = s
+        .fills
+        .iter()
+        .take(6)
+        .map(|f| {
+            let side_cell = Cell::from(match f.side {
+                crate::trading::Side::Buy => "BUY",
+                _ => "SELL",
+            })
+            .style(Style::default().fg(match f.side {
+                crate::trading::Side::Buy => Color::Green,
+                _ => Color::Red,
+            }));
+            Row::new(vec![
+                Cell::from(f.ts.format("%H:%M:%S").to_string())
+                    .style(Style::default().fg(Color::DarkGray)),
+                side_cell,
+                Cell::from(f.outcome.as_str()).style(Style::default().fg(match f.outcome {
+                    Outcome::Up => Color::Green,
+                    Outcome::Down => Color::Red,
+                })),
+                Cell::from(format!("{:.2}", f.qty)),
+                Cell::from(format!("@ {:.2}", f.price)),
+                Cell::from(format!("= ${:.2}", f.qty * f.price)),
+                Cell::from(if f.realized.abs() > 1e-9 {
+                    format!("{:+.2}", f.realized)
+                } else {
+                    String::new()
+                })
                 .style(pnl_style(f.realized)),
-        ])
-    }).collect();
+            ])
+        })
+        .collect();
     let widths = [
         Constraint::Length(8),  // ts
         Constraint::Length(5),  // side
@@ -496,7 +608,10 @@ fn draw_fills(f: &mut Frame, area: Rect, s: &AppState) {
     ];
     let header = Row::new(["time", "side", "out", "qty", "px", "notional", "pnl"])
         .style(Style::default().fg(Color::DarkGray));
-    let table = Table::new(rows, widths).header(header).block(block).column_spacing(1);
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(1);
     f.render_widget(table, area);
 }
 
@@ -505,11 +620,16 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
     let size_span = match s.input_mode {
         InputMode::EditSize => Span::styled(
             format!("[{}_]", s.size_input),
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         _ => Span::styled(
             format!("[{}]", s.size_input),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
     };
 
@@ -517,18 +637,32 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         Span::styled("size ", Style::default().fg(Color::DarkGray)),
         size_span,
         Span::raw(" "),
-        Span::raw("[w]"), Span::styled(" buy UP", Style::default().fg(Color::Green)), sep(),
-        Span::raw("[s]"), Span::styled(" buy ", Style::default().fg(Color::Green)),
-        Span::styled("DOWN", Style::default().fg(Color::Red)), sep(),
-        Span::raw("[a]"), Span::styled(" sell ", Style::default().fg(Color::Red)),
-        Span::styled("UP", Style::default().fg(Color::Green)), sep(),
-        Span::raw("[d]"), Span::styled(" sell DOWN", Style::default().fg(Color::Red)), sep(),
-        key("l", "limit"), sep(),
-        key("c", "cancel all"), sep(),
-        key("x", "redeem all"), sep(),
-        key("f", "SOL USDC dep"), sep(),
-        key("e", "resize"), sep(),
-        key("Esc", "timeframe"), sep(),
+        Span::raw("[w]"),
+        Span::styled(" buy UP", Style::default().fg(Color::Green)),
+        sep(),
+        Span::raw("[s]"),
+        Span::styled(" buy ", Style::default().fg(Color::Green)),
+        Span::styled("DOWN", Style::default().fg(Color::Red)),
+        sep(),
+        Span::raw("[a]"),
+        Span::styled(" sell ", Style::default().fg(Color::Red)),
+        Span::styled("UP", Style::default().fg(Color::Green)),
+        sep(),
+        Span::raw("[d]"),
+        Span::styled(" sell DOWN", Style::default().fg(Color::Red)),
+        sep(),
+        key("l", "limit"),
+        sep(),
+        key("c", "cancel all"),
+        sep(),
+        key("x", "redeem all"),
+        sep(),
+        key("f", "SOL USDC dep"),
+        sep(),
+        key("e", "resize"),
+        sep(),
+        key("Esc", "timeframe"),
+        sep(),
         key("q", "quit"),
     ]);
 
@@ -543,7 +677,9 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         ]));
     }
 
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
 }
@@ -551,7 +687,9 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
 fn key(k: &str, label: &str) -> Span<'static> {
     Span::from(format!("[{k}] {label}"))
 }
-fn sep() -> Span<'static> { Span::styled("  ", Style::default()) }
+fn sep() -> Span<'static> {
+    Span::styled("  ", Style::default())
+}
 
 // ── Order error toast (bottom-right; non-blocking) ───────────────────
 fn draw_order_error_toast(f: &mut Frame, screen: Rect, message: &str) {
@@ -559,10 +697,7 @@ fn draw_order_error_toast(f: &mut Frame, screen: Rect, message: &str) {
     let max_box_w = screen.width.saturating_sub(margin * 2).clamp(24, 50);
     let inner_w = (max_box_w as usize).saturating_sub(2).max(8);
     let nchars = message.chars().count();
-    let nlines = nchars
-        .saturating_add(inner_w.saturating_sub(1))
-        / inner_w
-        .max(1);
+    let nlines = nchars.saturating_add(inner_w.saturating_sub(1)) / inner_w.max(1);
     let content_lines = (nlines as u16).clamp(1, 5);
     let box_h = (2u16 + content_lines).min(screen.height.saturating_sub(margin * 2));
     let area = bottom_right_rect(screen, max_box_w, box_h, margin);
@@ -576,7 +711,10 @@ fn draw_order_error_toast(f: &mut Frame, screen: Rect, message: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(Span::styled(" Order error ", text_style.add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            " Order error ",
+            text_style.add_modifier(Modifier::BOLD),
+        ))
         .border_style(border_style)
         .style(Style::default().bg(dialog_bg));
     let inner = block.inner(area);
@@ -588,9 +726,14 @@ fn draw_order_error_toast(f: &mut Frame, screen: Rect, message: &str) {
 }
 
 // ── Limit modal ─────────────────────────────────────────────────────
-fn draw_limit_modal(f: &mut Frame, screen: Rect, s: &AppState,
-    outcome: Outcome, side: crate::trading::Side, field: LimitField)
-{
+fn draw_limit_modal(
+    f: &mut Frame,
+    screen: Rect,
+    s: &AppState,
+    outcome: Outcome,
+    side: crate::trading::Side,
+    field: LimitField,
+) {
     let area = centered(screen, 52, 10);
     f.render_widget(Clear, area);
     // Darker fills so white/light-gray text and borders stay readable in any 16‑color theme.
@@ -604,28 +747,35 @@ fn draw_limit_modal(f: &mut Frame, screen: Rect, s: &AppState,
         .add_modifier(Modifier::BOLD);
     let text_main = Style::default().fg(Color::Rgb(248, 252, 250)).bg(dialog_bg);
     let text_muted = Style::default().fg(Color::Rgb(185, 198, 192)).bg(dialog_bg);
-    let title = format!(" Limit {} {} ",
-        match side { crate::trading::Side::Buy => "BUY", _ => "SELL" },
-        outcome.as_str());
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-        .title(Span::styled(
-            title,
-            text_main.add_modifier(Modifier::BOLD),
-        ))
+    let title = format!(
+        " Limit {} {} ",
+        match side {
+            crate::trading::Side::Buy => "BUY",
+            _ => "SELL",
+        },
+        outcome.as_str()
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .title(Span::styled(title, text_main.add_modifier(Modifier::BOLD)))
         .border_style(border_style)
         .style(Style::default().bg(dialog_bg).fg(Color::Rgb(248, 252, 250)));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let rows = Layout::vertical([
-        Constraint::Length(1), Constraint::Length(1),
-        Constraint::Length(1), Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(0),
-    ]).split(inner);
+    ])
+    .split(inner);
 
     let price_hl = matches!(field, LimitField::Price);
-    let size_hl  = matches!(field, LimitField::Size);
+    let size_hl = matches!(field, LimitField::Size);
     let label_style = text_muted;
     let mk = |highlighted: bool, label: &str, val: &str| {
         let style = if highlighted {
@@ -641,8 +791,14 @@ fn draw_limit_modal(f: &mut Frame, screen: Rect, s: &AppState,
             Span::styled(format!("[{val}]"), style),
         ])
     };
-    f.render_widget(Paragraph::new(mk(price_hl, "price", &s.limit_price_input)), rows[0]);
-    f.render_widget(Paragraph::new(mk(size_hl,  "size",  &s.limit_size_input )), rows[1]);
+    f.render_widget(
+        Paragraph::new(mk(price_hl, "price", &s.limit_price_input)),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(mk(size_hl, "size", &s.limit_size_input)),
+        rows[1],
+    );
     let size_hint = match side {
         crate::trading::Side::Buy => "size = USDC notional",
         crate::trading::Side::Sell => "size = shares",
@@ -694,7 +850,10 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(Span::styled(" Solana USDC deposit ", text_main.add_modifier(Modifier::BOLD)))
+                .title(Span::styled(
+                    " Solana USDC deposit ",
+                    text_main.add_modifier(Modifier::BOLD),
+                ))
                 .border_style(border_style)
                 .style(Style::default().bg(dialog_bg));
             let inner = block.inner(area);
@@ -706,10 +865,7 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
                     text_muted,
                 )),
             ];
-            f.render_widget(
-                Paragraph::new(lines).alignment(Alignment::Center),
-                inner,
-            );
+            f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
         }
         DepositModalPhase::Failed(msg) => {
             let inner_w = screen.width.saturating_sub(8).clamp(40, 58) as usize;
@@ -722,7 +878,10 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(Span::styled(" Solana deposit — error ", text_warn.add_modifier(Modifier::BOLD)))
+                .title(Span::styled(
+                    " Solana deposit — error ",
+                    text_warn.add_modifier(Modifier::BOLD),
+                ))
                 .border_style(border_style)
                 .style(Style::default().bg(dialog_bg));
             let inner = block.inner(area);
@@ -767,7 +926,7 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
                 + word_wrap_line_count(&mint_with_label, inner_w)
                 + word_wrap_line_count(send_hint, inner_w)
                 + 1)
-                .max(5) as u16; // trailing blank
+            .max(5) as u16; // trailing blank
             let head_h = header_wrapped_lines;
             let min_footer_lines: u16 = min_deposit_usd
                 .map(|v| {
@@ -801,9 +960,7 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
             ])
             .split(inner);
 
-            let mint_style = Style::default()
-                .fg(Color::Rgb(190, 230, 255))
-                .bg(dialog_bg);
+            let mint_style = Style::default().fg(Color::Rgb(190, 230, 255)).bg(dialog_bg);
             // ANSI red survives terminals without truecolor (Rgb foreground can look like default).
             let text_min_deposit = Style::default()
                 .fg(Color::LightRed)
@@ -816,7 +973,10 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
                 ]),
                 Line::from(vec![
                     Span::styled("Token: ", text_muted),
-                    Span::styled("USDC only (Solana SPL)", text_main.add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "USDC only (Solana SPL)",
+                        text_main.add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("Mint: ", text_muted),
@@ -837,9 +997,7 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
                 .map(|l| {
                     Line::from(Span::styled(
                         *l,
-                        Style::default()
-                            .fg(Color::Rgb(240, 248, 255))
-                            .bg(dialog_bg),
+                        Style::default().fg(Color::Rgb(240, 248, 255)).bg(dialog_bg),
                     ))
                 })
                 .collect();
@@ -854,7 +1012,10 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
                 footer.push(Line::from(Span::styled(s, text_min_deposit)));
             }
             footer.extend([
-                Line::from(Span::styled(svm_address.as_str(), text_main.add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(
+                    svm_address.as_str(),
+                    text_main.add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("esc ", text_muted),
@@ -925,7 +1086,11 @@ fn wrap_deposit_error(msg: &str, width: usize) -> Vec<String> {
         }
     }
     if out.is_empty() {
-        out.push(if msg.is_empty() { "Unknown error".into() } else { msg.to_string() });
+        out.push(if msg.is_empty() {
+            "Unknown error".into()
+        } else {
+            msg.to_string()
+        });
     }
     out
 }
@@ -934,14 +1099,24 @@ fn wrap_deposit_error(msg: &str, width: usize) -> Vec<String> {
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    Rect { x, y, width: w.min(area.width), height: h.min(area.height) }
+    Rect {
+        x,
+        y,
+        width: w.min(area.width),
+        height: h.min(area.height),
+    }
 }
 fn bottom_right_rect(screen: Rect, w: u16, h: u16, margin: u16) -> Rect {
     let w = w.min(screen.width.saturating_sub(margin * 2).max(1));
     let h = h.min(screen.height.saturating_sub(margin * 2).max(1));
     let x = screen.x + screen.width.saturating_sub(w + margin);
     let y = screen.y + screen.height.saturating_sub(h + margin);
-    Rect { x, y, width: w, height: h }
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }
 /// Cash / claimable: floor fractional cents so the panel never reads higher than on-chain amounts.
 fn fmt_balance_usdc(v: f64) -> String {
@@ -954,10 +1129,14 @@ fn fmt_money_decimals(v: f64, decimal_places: u32) -> String {
 
 fn fmt_money_decimals_inner(v: f64, decimal_places: u32, floor_frac: bool) -> String {
     let whole = v as i64;
-    let mult  = 10_f64.powi(decimal_places as i32);
+    let mult = 10_f64.powi(decimal_places as i32);
     let max_frac = mult as u64;
     let raw_frac = (v - whole as f64).abs() * mult;
-    let mut frac = if floor_frac { raw_frac.floor() as u64 } else { raw_frac.round() as u64 };
+    let mut frac = if floor_frac {
+        raw_frac.floor() as u64
+    } else {
+        raw_frac.round() as u64
+    };
     let mut w = whole;
     if frac >= max_frac {
         w += if v >= 0.0 { 1 } else { -1 };
@@ -984,7 +1163,9 @@ fn fmt_money_decimals_inner(v: f64, decimal_places: u32, floor_frac: bool) -> St
     // Single allocation sized to fit the result.
     // Worst case: sign(1) + digits(20) + commas(6) + dot(1) + frac(4) = 32 bytes.
     let mut out = String::with_capacity(32);
-    if neg { out.push('-'); }
+    if neg {
+        out.push('-');
+    }
     for i in (0..ilen).rev() {
         let pos = ilen - 1 - i; // position from left, 0-indexed
         if pos > 0 && (ilen - pos) % 3 == 0 {
@@ -1022,9 +1203,13 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 fn pnl_style(v: f64) -> Style {
-    if v > 1e-9       { Style::default().fg(Color::Green) }
-    else if v < -1e-9 { Style::default().fg(Color::Red) }
-    else              { Style::default().fg(Color::Gray) }
+    if v > 1e-9 {
+        Style::default().fg(Color::Green)
+    } else if v < -1e-9 {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
 }
 
 #[cfg(test)]
@@ -1033,20 +1218,23 @@ mod tests {
 
     #[test]
     fn fmt_money_basic() {
-        assert_eq!(fmt_money_decimals_inner(1234.56,  2, false), "1,234.56");
-        assert_eq!(fmt_money_decimals_inner(0.0,      2, false), "0.00");
-        assert_eq!(fmt_money_decimals_inner(-99.5,    2, false), "-99.50");
-        assert_eq!(fmt_money_decimals_inner(1_000_000.0, 2, false), "1,000,000.00");
-        assert_eq!(fmt_money_decimals_inner(0.999,    2, false), "1.00"); // rounding carry
-        assert_eq!(fmt_money_decimals_inner(67_432.51, 2, true),  "67,432.50"); // floor_frac truncates towards zero
-        assert_eq!(fmt_money_decimals_inner(1.23456,  4, false), "1.2346");
+        assert_eq!(fmt_money_decimals_inner(1234.56, 2, false), "1,234.56");
+        assert_eq!(fmt_money_decimals_inner(0.0, 2, false), "0.00");
+        assert_eq!(fmt_money_decimals_inner(-99.5, 2, false), "-99.50");
+        assert_eq!(
+            fmt_money_decimals_inner(1_000_000.0, 2, false),
+            "1,000,000.00"
+        );
+        assert_eq!(fmt_money_decimals_inner(0.999, 2, false), "1.00"); // rounding carry
+        assert_eq!(fmt_money_decimals_inner(67_432.51, 2, true), "67,432.50"); // floor_frac truncates towards zero
+        assert_eq!(fmt_money_decimals_inner(1.23456, 4, false), "1.2346");
     }
 
     #[test]
     fn truncate_ascii_fast_path() {
         // No truncation — must not scan chars
         assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("",      5),  "");
+        assert_eq!(truncate("", 5), "");
     }
 
     #[test]
@@ -1069,7 +1257,10 @@ mod tests {
             std::sync::Arc::new(crate::feeds::user_trade_sync::UserTradeSync::new()),
             false,
         );
-        assert_eq!(help_block_height(&enabled), HELP_KEYS_LINES + HELP_DETECTION_LINES + 2);
+        assert_eq!(
+            help_block_height(&enabled),
+            HELP_KEYS_LINES + HELP_DETECTION_LINES + 2
+        );
         assert_eq!(help_block_height(&disabled), HELP_KEYS_LINES + 2);
     }
 }

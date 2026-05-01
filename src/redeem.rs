@@ -137,7 +137,10 @@ fn pack_safe_rel_signature(mut sig: [u8; 65]) -> Result<String> {
     packed.push(vb as u8);
     Ok(format!(
         "0x{}",
-        packed.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        packed
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     ))
 }
 
@@ -203,8 +206,8 @@ async fn relayer_get_nonce(http: &Client, signer: Address) -> Result<String> {
     if !status.is_success() {
         bail!("relayer /nonce failed: {status} — {}", txt.trim());
     }
-    let n: NonceResponse = serde_json::from_str(&txt)
-        .with_context(|| format!("decode /nonce: {}", txt.trim()))?;
+    let n: NonceResponse =
+        serde_json::from_str(&txt).with_context(|| format!("decode /nonce: {}", txt.trim()))?;
     Ok(n.nonce)
 }
 
@@ -220,8 +223,8 @@ async fn relayer_deployed(http: &Client, proxy_wallet: Address) -> Result<bool> 
     if !status.is_success() {
         bail!("relayer /deployed failed: {status} — {}", txt.trim());
     }
-    let d: DeployedResponse = serde_json::from_str(&txt)
-        .with_context(|| format!("decode /deployed: {}", txt.trim()))?;
+    let d: DeployedResponse =
+        serde_json::from_str(&txt).with_context(|| format!("decode /deployed: {}", txt.trim()))?;
     Ok(d.deployed)
 }
 
@@ -325,10 +328,7 @@ pub async fn redeem_resolved_positions(
         .relayer_api_key_address
         .context("POLYMARKET_RELAYER_API_KEY_ADDRESS")?;
 
-    let signer: PrivateKeySigner = cfg
-        .private_key
-        .parse()
-        .context("parse POLYMARKET_PK")?;
+    let signer: PrivateKeySigner = cfg.private_key.parse().context("parse POLYMARKET_PK")?;
     let derived_safe = derive_polymarket_safe(cfg.signer_address);
     if derived_safe != cfg.funder {
         bail!(
@@ -436,7 +436,11 @@ pub async fn redeem_resolved_positions(
         .join(", ");
     Ok(format!(
         "{markets} market(s){} → relayer {} ({}) [{ids}]",
-        if safe_operation == 1 { " (MultiSend batch)" } else { "" },
+        if safe_operation == 1 {
+            " (MultiSend batch)"
+        } else {
+            ""
+        },
         out.transaction_id,
         out.state
     ))

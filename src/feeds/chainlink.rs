@@ -24,36 +24,45 @@ fn snip(txt: &str, max: usize) -> String {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PriceTick {
-    pub price:        f64,
+    pub price: f64,
     pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct Envelope {
-    #[serde(default)] topic: String,
+    #[serde(default)]
+    topic: String,
     #[serde(default, rename = "type")]
     #[allow(dead_code)]
     kind: String,
-    #[serde(default)] payload: Option<Payload>,
+    #[serde(default)]
+    payload: Option<Payload>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Payload {
-    #[serde(default)] symbol:    String,
-    #[serde(default)] value:     Option<f64>,
-    #[serde(default)] timestamp: Option<u64>,
+    #[serde(default)]
+    symbol: String,
+    #[serde(default)]
+    value: Option<f64>,
+    #[serde(default)]
+    timestamp: Option<u64>,
 }
 
 fn chainlink_data_streams_env_set() -> bool {
-    let k = std::env::var("CHAINLINK_API_KEY").ok().filter(|s| !s.trim().is_empty());
-    let s = std::env::var("CHAINLINK_USER_SECRET").ok().filter(|s| !s.trim().is_empty());
+    let k = std::env::var("CHAINLINK_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let s = std::env::var("CHAINLINK_USER_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     k.is_some() && s.is_some()
 }
 
 /// Waits for a **non-empty** `symbol` on `symbol_rx` (e.g. `btc/usd`), then connects, reconnects
 /// on drop/failure, and re-reads the watch value so symbol changes can take effect.
 pub fn spawn(
-    tx:         mpsc::Sender<PriceTick>,
+    tx: mpsc::Sender<PriceTick>,
     symbol_rx: watch::Receiver<String>,
 ) -> tokio::task::JoinHandle<()> {
     if chainlink_data_streams_env_set() {
@@ -65,7 +74,7 @@ pub fn spawn(
 }
 
 fn spawn_rtds(
-    tx:         mpsc::Sender<PriceTick>,
+    tx: mpsc::Sender<PriceTick>,
     mut symbol_rx: watch::Receiver<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

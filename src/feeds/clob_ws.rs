@@ -57,14 +57,14 @@ fn key_to_price(k: i64) -> f64 {
 #[derive(Debug, Clone)]
 pub struct BookLevel {
     pub price: f64,
-    pub size:  f64,
+    pub size: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct BookSnapshot {
     pub asset_id: String,
-    pub bids:     Vec<BookLevel>, // sorted high → low
-    pub asks:     Vec<BookLevel>, // sorted low  → high
+    pub bids: Vec<BookLevel>, // sorted high → low
+    pub asks: Vec<BookLevel>, // sorted low  → high
 }
 
 // ── Zero-alloc serde visitors ─────────────────────────────────────────────────
@@ -124,13 +124,16 @@ enum RawEvent {
     #[serde(rename = "book")]
     Book {
         asset_id: String,
-        #[serde(default)] bids: Vec<RawLevel>,
-        #[serde(default)] asks: Vec<RawLevel>,
+        #[serde(default)]
+        bids: Vec<RawLevel>,
+        #[serde(default)]
+        asks: Vec<RawLevel>,
     },
     #[serde(rename = "price_change")]
     PriceChange {
         asset_id: String,
-        #[serde(default)] changes: Vec<RawChange>,
+        #[serde(default)]
+        changes: Vec<RawChange>,
     },
     #[serde(other)]
     Other,
@@ -139,16 +142,21 @@ enum RawEvent {
 /// Level from a full `book` snapshot — price/size parsed directly to `f64`, no String.
 #[derive(Deserialize)]
 struct RawLevel {
-    #[serde(deserialize_with = "deser_f64_str")] price: f64,
-    #[serde(deserialize_with = "deser_f64_str")] size:  f64,
+    #[serde(deserialize_with = "deser_f64_str")]
+    price: f64,
+    #[serde(deserialize_with = "deser_f64_str")]
+    size: f64,
 }
 
 /// Single level update from a `price_change` event.
 #[derive(Deserialize)]
 struct RawChange {
-    #[serde(deserialize_with = "deser_f64_str")] price: f64,
-    #[serde(deserialize_with = "deser_is_buy")]  side:  bool,
-    #[serde(deserialize_with = "deser_f64_str")] size:  f64,
+    #[serde(deserialize_with = "deser_f64_str")]
+    price: f64,
+    #[serde(deserialize_with = "deser_is_buy")]
+    side: bool,
+    #[serde(deserialize_with = "deser_f64_str")]
+    size: f64,
 }
 
 /// Alternate CLOB shape: `{ "market": …, "price_changes": […] }`.
@@ -164,9 +172,12 @@ struct MarketPriceChangesMsg {
 #[derive(Deserialize)]
 struct MarketPriceChangeItem {
     asset_id: String,
-    #[serde(deserialize_with = "deser_f64_str")] price: f64,
-    #[serde(deserialize_with = "deser_f64_str")] size:  f64,
-    #[serde(deserialize_with = "deser_is_buy")]  side:  bool,
+    #[serde(deserialize_with = "deser_f64_str")]
+    price: f64,
+    #[serde(deserialize_with = "deser_f64_str")]
+    size: f64,
+    #[serde(deserialize_with = "deser_is_buy")]
+    side: bool,
 }
 
 // ── Book state ────────────────────────────────────────────────────────────────
@@ -185,7 +196,9 @@ struct BookSide {
 
 impl BookSide {
     fn new() -> Self {
-        Self { levels: Vec::with_capacity(32) }
+        Self {
+            levels: Vec::with_capacity(32),
+        }
     }
 
     /// Replace entire side from an iterator in arbitrary order.
@@ -204,7 +217,9 @@ impl BookSide {
             Ok(i) => {
                 if size > 0.0 {
                     // SAFETY: binary_search_by_key returned Ok(i) ⟹ i < len.
-                    unsafe { self.levels.get_unchecked_mut(i).1 = size; }
+                    unsafe {
+                        self.levels.get_unchecked_mut(i).1 = size;
+                    }
                 } else {
                     self.levels.remove(i);
                 }
@@ -235,12 +250,18 @@ struct BookDb {
 
 impl BookDb {
     fn new() -> Self {
-        Self { books: Vec::with_capacity(MAX_BOOKS) }
+        Self {
+            books: Vec::with_capacity(MAX_BOOKS),
+        }
     }
 
     /// O(n) scan — returns existing index or appends a new entry.
     fn find_or_insert(&mut self, canonical_id: &str) -> usize {
-        if let Some(i) = self.books.iter().position(|b| b.canonical_id == canonical_id) {
+        if let Some(i) = self
+            .books
+            .iter()
+            .position(|b| b.canonical_id == canonical_id)
+        {
             return i;
         }
         let i = self.books.len();
@@ -260,9 +281,22 @@ struct Touched {
 }
 
 impl Touched {
-    #[inline] fn new()               -> Self { Self { flags: [false; MAX_BOOKS] } }
-    #[inline] fn set(&mut self, i: usize) { if i < MAX_BOOKS { self.flags[i] = true; } }
-    #[inline] fn reset(&mut self)         { self.flags = [false; MAX_BOOKS]; }
+    #[inline]
+    fn new() -> Self {
+        Self {
+            flags: [false; MAX_BOOKS],
+        }
+    }
+    #[inline]
+    fn set(&mut self, i: usize) {
+        if i < MAX_BOOKS {
+            self.flags[i] = true;
+        }
+    }
+    #[inline]
+    fn reset(&mut self) {
+        self.flags = [false; MAX_BOOKS];
+    }
 }
 
 // ── Canonical ID fast path ────────────────────────────────────────────────────
@@ -281,7 +315,10 @@ fn ensure_canonical(s: &str) -> std::borrow::Cow<'_, str> {
 
 // ── Spawn / run ───────────────────────────────────────────────────────────────
 
-pub fn spawn(token_ids: Vec<String>, tx: mpsc::Sender<BookSnapshot>) -> tokio::task::JoinHandle<()> {
+pub fn spawn(
+    token_ids: Vec<String>,
+    tx: mpsc::Sender<BookSnapshot>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             if let Err(e) = run_once(&token_ids, &tx).await {
@@ -300,12 +337,13 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
     info!(url = %CLOB_WS_URL, n = token_ids.len(), "CLOB WS connected");
 
     // Build subscription JSON manually — token IDs are all-decimal, no escaping needed.
-    let mut sub = String::with_capacity(
-        32 + token_ids.iter().map(|id| id.len() + 3).sum::<usize>(),
-    );
+    let mut sub =
+        String::with_capacity(32 + token_ids.iter().map(|id| id.len() + 3).sum::<usize>());
     sub.push_str(r#"{"type":"market","assets_ids":["#);
     for (j, id) in token_ids.iter().enumerate() {
-        if j > 0 { sub.push(','); }
+        if j > 0 {
+            sub.push(',');
+        }
         sub.push('"');
         sub.push_str(id);
         sub.push('"');
@@ -332,7 +370,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(10));
     ping.tick().await;
 
-    let mut first_text_logged    = false;
+    let mut first_text_logged = false;
     let mut first_non_text_logged = false;
     let mut n_frames = 0u64;
 
@@ -441,22 +479,31 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
 #[inline]
 fn apply_event(db: &mut BookDb, ev: RawEvent) -> Option<usize> {
     match ev {
-        RawEvent::Book { asset_id, bids, asks } => {
+        RawEvent::Book {
+            asset_id,
+            bids,
+            asks,
+        } => {
             let cid = ensure_canonical(&asset_id);
-            let i   = db.find_or_insert(cid.as_ref());
+            let i = db.find_or_insert(cid.as_ref());
             let book = &mut db.books[i];
-            book.bids.replace_from(bids.into_iter().map(|l| (price_to_key(l.price), l.size)));
-            book.asks.replace_from(asks.into_iter().map(|l| (price_to_key(l.price), l.size)));
+            book.bids
+                .replace_from(bids.into_iter().map(|l| (price_to_key(l.price), l.size)));
+            book.asks
+                .replace_from(asks.into_iter().map(|l| (price_to_key(l.price), l.size)));
             Some(i)
         }
         RawEvent::PriceChange { asset_id, changes } => {
             let cid = ensure_canonical(&asset_id);
-            let i   = db.find_or_insert(cid.as_ref());
+            let i = db.find_or_insert(cid.as_ref());
             let book = &mut db.books[i];
             for c in changes {
                 let key = price_to_key(c.price);
-                if c.side { book.bids.upsert(key, c.size); }
-                else      { book.asks.upsert(key, c.size); }
+                if c.side {
+                    book.bids.upsert(key, c.size);
+                } else {
+                    book.asks.upsert(key, c.size);
+                }
             }
             Some(i)
         }
@@ -468,18 +515,24 @@ fn apply_event(db: &mut BookDb, ev: RawEvent) -> Option<usize> {
 
 async fn emit_snapshot(
     asset_id: &str,
-    bids:     &BookSide,
-    asks:     &BookSide,
+    bids: &BookSide,
+    asks: &BookSide,
     out_bids: &mut Vec<BookLevel>,
     out_asks: &mut Vec<BookLevel>,
-    tx:       &mpsc::Sender<BookSnapshot>,
+    tx: &mpsc::Sender<BookSnapshot>,
 ) {
     out_bids.clear();
     out_asks.clear();
     // Bids: high → low  (reverse of ascending key order)
-    out_bids.extend(bids.levels.iter().rev().map(|&(k, s)| BookLevel { price: key_to_price(k), size: s }));
+    out_bids.extend(bids.levels.iter().rev().map(|&(k, s)| BookLevel {
+        price: key_to_price(k),
+        size: s,
+    }));
     // Asks: low → high (ascending key order = natural Vec order)
-    out_asks.extend(asks.levels.iter().map(|&(k, s)| BookLevel { price: key_to_price(k), size: s }));
+    out_asks.extend(asks.levels.iter().map(|&(k, s)| BookLevel {
+        price: key_to_price(k),
+        size: s,
+    }));
 
     // Swap the filled Vecs into the snapshot; the empty replacements allocate on
     // the next extend() call via ExactSizeIterator, sizing to exactly the level count.
@@ -488,8 +541,8 @@ async fn emit_snapshot(
     let _ = tx
         .send(BookSnapshot {
             asset_id: asset_id.to_owned(),
-            bids:     snap_bids,
-            asks:     snap_asks,
+            bids: snap_bids,
+            asks: snap_asks,
         })
         .await;
 }
@@ -498,7 +551,11 @@ async fn emit_snapshot(
 
 fn snip_frame(txt: &str, max: usize) -> String {
     let t = txt.trim();
-    if t.len() <= max { t.to_string() } else { format!("{}…", &t[..max]) }
+    if t.len() <= max {
+        t.to_string()
+    } else {
+        format!("{}…", &t[..max])
+    }
 }
 
 fn warn_unparsed_clob(t: &str) {

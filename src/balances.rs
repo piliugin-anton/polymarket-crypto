@@ -119,7 +119,10 @@ async fn rpc_eth_call(
 ) -> Result<Vec<u8>> {
     let data_hex = format!(
         "0x{}",
-        calldata.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        calldata
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     );
     let body = json!({
         "jsonrpc": "2.0",
@@ -170,10 +173,7 @@ async fn rpc_aggregate3_calls(
         let rows = decoded.returnData;
         let n = rows.len();
         if n != chunk.len() {
-            anyhow::bail!(
-                "aggregate3: got {n} results for {} calls",
-                chunk.len()
-            );
+            anyhow::bail!("aggregate3: got {n} results for {} calls", chunk.len());
         }
         for r in rows {
             out.push((r.success, r.returnData.to_vec()));
@@ -216,9 +216,19 @@ fn prepare_standard_claimable_parsed(rows: &[DataPosition]) -> StandardClaimPrep
             token_ids: vec![],
         };
     }
-    let mut conds: Vec<B256> = parsed.iter().map(|(c, _, _)| *c).collect::<HashSet<_>>().into_iter().collect();
+    let mut conds: Vec<B256> = parsed
+        .iter()
+        .map(|(c, _, _)| *c)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     conds.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-    let mut token_ids: Vec<U256> = parsed.iter().map(|(_, t, _)| *t).collect::<HashSet<_>>().into_iter().collect();
+    let mut token_ids: Vec<U256> = parsed
+        .iter()
+        .map(|(_, t, _)| *t)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     token_ids.sort();
     StandardClaimPrep {
         parsed,
@@ -252,7 +262,11 @@ fn claimable_standard_total_from_maps(
             total += api_fb;
             continue;
         }
-        let n = if tid == pos1_usdc || tid == pos1_pusd { n0 } else { n1 };
+        let n = if tid == pos1_usdc || tid == pos1_pusd {
+            n0
+        } else {
+            n1
+        };
         let slot_usdc = u256_to_usdc_f64(b * n / d);
         if slot_usdc > 1e-9 {
             total += slot_usdc;

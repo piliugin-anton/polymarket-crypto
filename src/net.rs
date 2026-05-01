@@ -25,8 +25,7 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    tungstenite::handshake::client::Response,
-    MaybeTlsStream, WebSocketStream,
+    tungstenite::handshake::client::Response, MaybeTlsStream, WebSocketStream,
 };
 use url::Url;
 
@@ -59,7 +58,9 @@ async fn ws_tcp_connect(url: &str) -> Result<TcpStream> {
 
 /// Read the proxy URL from env if present.
 pub fn proxy_env() -> Option<String> {
-    std::env::var("POLYMARKET_PROXY").ok().filter(|s| !s.is_empty())
+    std::env::var("POLYMARKET_PROXY")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Shared HTTP/2 + TCP keep-alive + idle pool settings for long-lived HTTPS clients (JSON-RPC, REST).
@@ -159,12 +160,15 @@ async fn http_connect(proxy: &Url, host: &str, port: u16) -> Result<TcpStream> {
             urldecode(proxy.username()),
             urldecode(proxy.password().unwrap_or("")),
         );
-        format!("Proxy-Authorization: Basic {}\r\n", BASE64_STANDARD.encode(cred))
+        format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            BASE64_STANDARD.encode(cred)
+        )
     };
-    let req = format!(
-        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}\r\n",
-    );
-    tcp.write_all(req.as_bytes()).await.context("write CONNECT")?;
+    let req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}\r\n",);
+    tcp.write_all(req.as_bytes())
+        .await
+        .context("write CONNECT")?;
 
     // Read response byte-by-byte so we stop *exactly* at \r\n\r\n and don't
     // accidentally consume bytes that belong to the upcoming TLS ClientHello.
@@ -184,8 +188,12 @@ async fn http_connect(proxy: &Url, host: &str, port: u16) -> Result<TcpStream> {
             (_, b'\r') => 1,
             _ => 0,
         };
-        if state == 4 { break; }
-        if response.len() > 8192 { bail!("proxy response too large"); }
+        if state == 4 {
+            break;
+        }
+        if response.len() > 8192 {
+            bail!("proxy response too large");
+        }
     }
 
     let text = String::from_utf8_lossy(&response);
@@ -225,12 +233,14 @@ async fn socks5_connect(proxy: &Url, host: &str, port: u16) -> Result<TcpStream>
 // (e.g. passwords containing `@` or `:`). Kept inline to avoid another dep.
 fn urldecode(s: &str) -> String {
     let bytes = s.as_bytes();
-    if !bytes.contains(&b'%') { return s.to_string(); }
+    if !bytes.contains(&b'%') {
+        return s.to_string();
+    }
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_nib(bytes[i+1]), hex_nib(bytes[i+2])) {
+            if let (Some(h), Some(l)) = (hex_nib(bytes[i + 1]), hex_nib(bytes[i + 2])) {
                 out.push((h << 4) | l);
                 i += 3;
                 continue;

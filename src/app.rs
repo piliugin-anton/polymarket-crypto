@@ -16,19 +16,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::detection::{
-    BidSignal, DetectionCandidate, DetectionConfig, DetectionContext, DetectionJob,
-    DetectionJobResult, DetectionOutcome, MarkovPrior, ResolutionPrior,
+    BidDecision, BidSkipReason, DetectionOutcome, ResolutionPrior, WindowBidConfig, WindowBidInput,
 };
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
 use crate::fees::polymarket_crypto_taker_fee_usdc;
 use crate::gamma::ActiveMarket;
 use crate::gamma_series::SeriesRow;
 use crate::market_profile::MarketProfile;
-use crate::trailing_stop::{Activation, Side as TrailSide, TickOutcome, TrailSpec, TrailingStop};
 use crate::trading::{
     canonical_clob_token_id, clob_asset_ids_match, norm_clob_owner, norm_order_id_key,
-    parse_clob_side_str, taker_trade_fill_shares, ClobMakerOrder, ClobOpenOrder, ClobTrade, OrderType, Side,
+    parse_clob_side_str, taker_trade_fill_shares, ClobMakerOrder, ClobOpenOrder, ClobTrade,
+    OrderType, Side,
 };
+use crate::trailing_stop::{Activation, Side as TrailSide, TickOutcome, TrailSpec, TrailingStop};
 use tracing::debug;
 
 /// Minimum outcome shares for a limit (GTD) order — enforced in the UI before submit.
@@ -39,8 +39,6 @@ pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
 /// `main.rs`).
 pub const TRAILING_SELL_MAX_PARALLEL: usize = 8;
 
-const DETECTION_HISTORY_MAX: usize = 256;
-const DETECTION_MIN_HISTORY: usize = 8;
 const DETECTION_WINDOW_BOOK_POINTS_MAX: usize = 512;
 const DETECTION_COMPLETED_WINDOWS_MAX: usize = 256;
 
@@ -82,27 +80,30 @@ pub const ORDER_ERROR_TOAST_TTL: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 pub struct OrderErrorToast {
     pub message: String,
-    pub until:   Instant,
+    pub until: Instant,
 }
 
 // ── Public event enum ───────────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum AppEvent {
-    Tick,                         // 1-Hz clock
+    Tick, // 1-Hz clock
     Price(PriceTick),
     Book(BookSnapshot),
     /// New active market + buy-side trail settings (from env at roll; used for maker WSS fills).
     MarketRoll {
-        market:                   ActiveMarket,
-        buy_trail_bps:            u32,
+        market: ActiveMarket,
+        buy_trail_bps: u32,
         buy_trail_activation_bps: u32,
     },
     /// Same slug as the active market — Polymarket crypto-price / Gamma refined `price_to_beat` (e.g. after a window roll). Must not trigger a full roll (positions would reset).
-    PriceToBeatRefresh { slug: String, price_to_beat: Option<f64> },
+    PriceToBeatRefresh {
+        slug: String,
+        price_to_beat: Option<f64>,
+    },
     /// CLOB positions for the current market: balances + cost basis replayed from `GET /data/trades`.
     PositionsLoaded {
-        position_up:   Position,
+        position_up: Position,
         position_down: Position,
         /// Capped before send — merged into `fills` and sorted by match time (newest first).
         fills_bootstrap: Vec<Fill>,
@@ -111,36 +112,42 @@ pub enum AppEvent {
     },
     /// CLOB user-channel `event_type: trade` — P&L / fills (paired with `OrderAck` de-dupe).
     UserChannelFill {
-        clob_trade_id:  String,
-        order_leg_id:   String,
-        side:             Side,
-        outcome:        Outcome,
+        clob_trade_id: String,
+        order_leg_id: String,
+        side: Side,
+        outcome: Outcome,
         /// CLOB `asset_id` for this leg (outcome token).
-        token_id:       String,
-        qty:              f64,
-        price:            f64,
-        ts:               DateTime<Utc>,
+        token_id: String,
+        qty: f64,
+        price: f64,
+        ts: DateTime<Utc>,
         /// `trader_side == MAKER` on the user-channel trade — resting limit fills (vs taker / FAK).
         from_maker_leg: bool,
     },
     /// Resting orders for the active market (`GET /data/orders`).
-    OpenOrdersLoaded { orders: Vec<OpenOrderRow> },
+    OpenOrdersLoaded {
+        orders: Vec<OpenOrderRow>,
+    },
     /// USDC.e cash + claimable from on-chain reads (Multicall3); neg-risk redeemable sums still use Data API.
-    BalancePanelLoaded { cash_usdc: f64, claimable_usdc: f64 },
+    BalancePanelLoaded {
+        cash_usdc: f64,
+        claimable_usdc: f64,
+    },
     /// `GET /holders` — per-`proxyWallet` sums: if a wallet holds both outcomes, only the larger leg counts; then summed per side (Sentiment).
-    TopHoldersSentiment { up_sum: f64, down_sum: f64 },
-    /// Background detection worker finished a Monte Carlo run.
-    DetectionSignalReady(DetectionJobResult),
+    TopHoldersSentiment {
+        up_sum: f64,
+        down_sum: f64,
+    },
     Key(crossterm::event::KeyEvent),
     /// `clob_order_id` is Polymarket `orderID` from the POST /order body — for fill de-dupe vs user WS.
     /// `token_id` is the CLOB outcome token this fill applies to (must match the order's asset).
     OrderAck {
-        side:            Side,
-        outcome:       Outcome,
-        qty:             f64,
-        price:           f64,
-        clob_order_id:   Option<String>,
-        token_id:        String,
+        side: Side,
+        outcome: Outcome,
+        qty: f64,
+        price: f64,
+        clob_order_id: Option<String>,
+        token_id: String,
     },
     /// Non-blocking status line only (no modal).
     OrderErr(String),
@@ -163,46 +170,61 @@ pub enum AppEvent {
     /// After a market **Buy** (FAK) with `MARKET_BUY_TAKE_PROFIT_BPS > 0` and `MARKET_BUY_TRAIL_BPS == 0`:
     /// consolidate take-profit vs open SELL legs and current position (handled in `main::apply_app_event`).
     RunTakeProfitAfterMarketBuy {
-        market:            crate::gamma::ActiveMarket,
-        outcome:         Outcome,
+        market: crate::gamma::ActiveMarket,
+        outcome: Outcome,
         take_profit_bps: u32,
         /// Same `qty` as the preceding [`AppEvent::OrderAck`] for this FAK BUY (CLOB fill estimate).
-        buy_ack_qty:     f64,
+        buy_ack_qty: f64,
     },
     /// User-channel `order` updates show **≥2** resting SELL on the same outcome — merge into one
     /// GTD (handled in `main::apply_app_event`).
-    MergeTakeProfitRestingSells { outcome: Outcome },
+    MergeTakeProfitRestingSells {
+        outcome: Outcome,
+    },
     /// After a market **Buy** (FAK) when `MARKET_BUY_TRAIL_BPS` is set: register until CLOB **mid**
     /// is at or above **gross** take-profit move from position entry (`MARKET_BUY_TAKE_PROFIT_BPS`).
     RequestTrailingArm {
-        outcome:         Outcome,
+        outcome: Outcome,
         /// Fill / REST estimate; used if position not yet updated.
-        entry_price:     f64,
+        entry_price: f64,
         plan_sell_shares: f64,
-        token_id:        String,
-        trail_bps:       u32,
+        token_id: String,
+        trail_bps: u32,
         /// Arm when `mid / entry >= 1 + activation_bps/10_000` (entry = live `avg_entry` with
         /// open size, else `entry_price`). Same bps as GTD take-profit target, not fee-solved.
-        activation_bps:  u32,
+        activation_bps: u32,
         /// Market where this token lives (for cross-market trailing after UI switches).
-        market:          ActiveMarket,
+        market: ActiveMarket,
     },
     /// Trailing FAK-SELL task finished: `success` when an order was accepted and UI ack sent;
     /// on failure (after retries) clears the stuck trail + pending.
     TrailingExitDispatchDone {
         token_id: String,
-        success:  bool,
-        error:    Option<String>,
+        success: bool,
+        error: Option<String>,
     },
 }
 
 // ── UI-level types ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Outcome { Up, Down }
+pub enum Outcome {
+    Up,
+    Down,
+}
 impl Outcome {
-    pub fn as_str(self) -> &'static str { match self { Outcome::Up => "UP", Outcome::Down => "DOWN" } }
-    pub fn opposite(self) -> Self { match self { Outcome::Up => Outcome::Down, Outcome::Down => Outcome::Up } }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Up => "UP",
+            Outcome::Down => "DOWN",
+        }
+    }
+    pub fn opposite(self) -> Self {
+        match self {
+            Outcome::Up => Outcome::Down,
+            Outcome::Down => Outcome::Up,
+        }
+    }
 }
 
 /// Client-side trailing for one outcome token — fed by CLOB best bid; see [`crate::trailing_stop`].
@@ -225,9 +247,9 @@ pub struct TrailingSession {
 /// Queued when the trail trips; `main` submits a FAK SELL (retries if the book is empty).
 #[derive(Debug, Clone)]
 pub struct TrailingExit {
-    pub token_id:    String,
-    pub market:      ActiveMarket,
-    pub outcome:     Outcome,
+    pub token_id: String,
+    pub market: ActiveMarket,
+    pub outcome: Outcome,
     pub sell_shares: f64,
 }
 
@@ -235,59 +257,59 @@ pub struct TrailingExit {
 /// **mid** implies a **gross** move of at least `activation_bps` from the position entry.
 #[derive(Debug, Clone)]
 pub struct PendingTrailArm {
-    pub market:          ActiveMarket,
-    pub outcome:         Outcome,
-    pub entry_price:     f64,
+    pub market: ActiveMarket,
+    pub outcome: Outcome,
+    pub entry_price: f64,
     pub plan_sell_shares: f64,
-    pub token_id:        String,
-    pub trail_bps:       u32,
-    pub activation_bps:  u32,
+    pub token_id: String,
+    pub trail_bps: u32,
+    pub activation_bps: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct DetectionSignalView {
     pub outcome: Outcome,
-    pub signal:  BidSignal,
+    pub decision: BidDecision,
 }
 
 #[allow(dead_code)] // Runtime dataset for later backtests/export; not all fields are rendered live.
 #[derive(Debug, Clone)]
 pub struct DetectionBookPoint {
-    pub rel_secs:      i64,
+    pub rel_secs: i64,
     pub secs_to_close: i64,
-    pub bid:           Option<f64>,
-    pub ask:           Option<f64>,
-    pub mid:           Option<f64>,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub mid: Option<f64>,
 }
 
 #[allow(dead_code)] // Runtime dataset for later backtests/export; not all fields are rendered live.
 #[derive(Debug, Clone)]
 pub struct DetectionSpotPoint {
-    pub rel_secs:      i64,
+    pub rel_secs: i64,
     pub secs_to_close: i64,
-    pub price:         f64,
-    pub distance_bps:  Option<f64>,
+    pub price: f64,
+    pub distance_bps: Option<f64>,
 }
 
 #[allow(dead_code)] // Runtime dataset for later backtests/export; not all fields are rendered live.
 #[derive(Debug, Clone)]
 pub struct DetectionWindowSample {
-    pub asset_label:    String,
+    pub asset_label: String,
     pub timeframe_label: String,
-    pub market_slug:    String,
-    pub opens_at:       DateTime<Utc>,
-    pub closes_at:      DateTime<Utc>,
-    pub price_to_beat:  Option<f64>,
-    pub close_spot:     Option<f64>,
-    pub resolved:       Option<Outcome>,
-    pub spot_series:    Vec<DetectionSpotPoint>,
-    pub up_series:      Vec<DetectionBookPoint>,
-    pub down_series:    Vec<DetectionBookPoint>,
+    pub market_slug: String,
+    pub opens_at: DateTime<Utc>,
+    pub closes_at: DateTime<Utc>,
+    pub price_to_beat: Option<f64>,
+    pub close_spot: Option<f64>,
+    pub resolved: Option<Outcome>,
+    pub spot_series: Vec<DetectionSpotPoint>,
+    pub up_series: Vec<DetectionBookPoint>,
+    pub down_series: Vec<DetectionBookPoint>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Position {
-    pub shares:    f64,
+    pub shares: f64,
     /// Volume-weighted average **USDC cost per share**, including Polymarket **taker** fees on buys
     /// (Crypto: `fee = C × 0.072 × p × (1-p)` per [fees](https://docs.polymarket.com/trading/fees)).
     pub avg_entry: f64,
@@ -295,11 +317,13 @@ pub struct Position {
 impl Position {
     fn add(&mut self, qty: f64, price: f64) {
         let new_total = self.shares + qty;
-        if new_total.abs() < 1e-9 { *self = Default::default(); return; }
-        let buy_cost =
-            qty.mul_add(price, polymarket_crypto_taker_fee_usdc(qty, price));
+        if new_total.abs() < 1e-9 {
+            *self = Default::default();
+            return;
+        }
+        let buy_cost = qty.mul_add(price, polymarket_crypto_taker_fee_usdc(qty, price));
         self.avg_entry = (self.shares * self.avg_entry + buy_cost) / new_total;
-        self.shares    = new_total;
+        self.shares = new_total;
     }
     fn reduce(&mut self, qty: f64, price: f64) -> f64 {
         // returns realized pnl for the portion closed (taker fee on sell deducted)
@@ -307,7 +331,9 @@ impl Position {
         let fee_out = polymarket_crypto_taker_fee_usdc(closed, price);
         let pnl = closed.mul_add(price, -fee_out) - closed * self.avg_entry;
         self.shares -= closed;
-        if self.shares.abs() < 1e-9 { *self = Default::default(); }
+        if self.shares.abs() < 1e-9 {
+            *self = Default::default();
+        }
         pnl
     }
 
@@ -343,20 +369,20 @@ impl Position {
 /// One row in the Open orders panel (current market only).
 #[derive(Debug, Clone)]
 pub struct OpenOrderRow {
-    pub side:    Side,
+    pub side: Side,
     pub outcome: Outcome,
-    pub price:   f64,
+    pub price: f64,
     /// Unfilled size (shares).
     pub remaining: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct Fill {
-    pub ts:       DateTime<Utc>,
-    pub side:     Side,
-    pub outcome:  Outcome,
-    pub qty:      f64,
-    pub price:    f64,
+    pub ts: DateTime<Utc>,
+    pub side: Side,
+    pub outcome: Outcome,
+    pub qty: f64,
+    pub price: f64,
     pub realized: f64, // only non-zero when the fill closes part of a position
     /// CLOB `Trade.id` when known — REST bootstrap / user WS (dedupe); absent for `OrderAck`-only rows.
     pub clob_trade_id: Option<String>,
@@ -366,11 +392,18 @@ pub struct Fill {
 pub enum InputMode {
     Normal,
     EditSize,
-    LimitModal { outcome: Outcome, side: Side, field: LimitField },
+    LimitModal {
+        outcome: Outcome,
+        side: Side,
+        field: LimitField,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LimitField { Price, Size }
+pub enum LimitField {
+    Price,
+    Size,
+}
 
 /// Center-screen Polymarket Bridge Solana USDC deposit dialog (`f` key).
 #[derive(Debug, Clone)]
@@ -437,43 +470,42 @@ pub fn collect_book_watch_token_ids(state: &AppState) -> Vec<String> {
     v
 }
 
-
 #[derive(Debug)]
 pub struct AppState {
     pub ui_phase: UiPhase,
     /// Gamma rows + fallback labels for the first wizard screen.
-    pub wizard_rows:        Vec<SeriesRow>,
-    pub wizard_list_idx:     usize,
+    pub wizard_rows: Vec<SeriesRow>,
+    pub wizard_list_idx: usize,
     /// Selected line in timeframe list (0 = 5m, 1 = 15m).
-    pub wizard_tf_idx:      usize,
+    pub wizard_tf_idx: usize,
     /// Last load error (wizard still usable via fallback list).
     pub wizard_series_error: Option<String>,
 
-    pub market:         Option<ActiveMarket>,
+    pub market: Option<ActiveMarket>,
     /// Chainlink spot (same stream as market resolution for crypto up/down).
-    pub spot_price:     Option<f64>,
-    pub spot_price_ts:   Option<DateTime<Utc>>,
+    pub spot_price: Option<f64>,
+    pub spot_price_ts: Option<DateTime<Utc>>,
     /// `arc` of the same profile passed at [`AppEvent::StartTrading`].
     pub market_profile: Option<Arc<MarketProfile>>,
 
     // One book per outcome token
     /// Shared with [`Self::watched_books`] when the same token is both on-screen and trail-watched.
-    pub book_up:        Option<Arc<BookSnapshot>>,
-    pub book_down:      Option<Arc<BookSnapshot>>,
+    pub book_up: Option<Arc<BookSnapshot>>,
+    pub book_down: Option<Arc<BookSnapshot>>,
 
-    pub position_up:    Position,
-    pub position_down:  Position,
-    pub realized_pnl:   f64,
+    pub position_up: Position,
+    pub position_down: Position,
+    pub realized_pnl: f64,
 
     /// Net long shares on UP token from FAK/ack path + resync on `PositionsLoaded` (for market SELL sizing).
-    pub fak_net_up:     f64,
+    pub fak_net_up: f64,
     /// Net long shares on DOWN token (same).
-    pub fak_net_down:   f64,
+    pub fak_net_down: f64,
 
-    pub fills:          VecDeque<Fill>,
+    pub fills: VecDeque<Fill>,
     /// Resting limit orders on the active market (from CLOB).
-    pub open_orders:    Vec<OpenOrderRow>,
-    pub status_line:    String,
+    pub open_orders: Vec<OpenOrderRow>,
+    pub status_line: String,
 
     /// USDC.e (`0x2791…174`) `balanceOf(funder)` on Polygon (via Multicall3).
     pub collateral_cash_usdc: Option<f64>,
@@ -487,11 +519,11 @@ pub struct AppState {
     latched_price_to_beat: Option<f64>,
 
     pub default_size_usdc: f64,
-    pub size_input:        String, // buffer while editing size
+    pub size_input: String, // buffer while editing size
     pub limit_price_input: String,
-    pub limit_size_input:  String,
+    pub limit_size_input: String,
 
-    pub input_mode:        InputMode,
+    pub input_mode: InputMode,
 
     /// When set, a bottom-right toast is drawn; keys are not blocked. Expires after [`ORDER_ERROR_TOAST_TTL`].
     pub order_error_toast: Option<OrderErrorToast>,
@@ -500,21 +532,15 @@ pub struct AppState {
     pub deposit_modal: Option<DepositModalPhase>,
 
     /// Net UP vs DOWN after per-wallet “max of UP/DOWN position” (see `fetch_top_holders_amount_sums`); header Sentiment.
-    pub top_holders_up_sum:   Option<f64>,
+    pub top_holders_up_sum: Option<f64>,
     pub top_holders_down_sum: Option<f64>,
 
     /// Pre-computed from CLOB mid + top-holder sums; updated on Book and TopHoldersSentiment events.
     pub cached_sentiment: SentimentDir,
     pub detection_enabled: bool,
-    /// Markov/Monte Carlo edge signal computed from recent CLOB mids.
+    /// Book/context bid decision for the active rolling market.
     pub detection_signal: Option<DetectionSignalView>,
-    detection_seq: u64,
-    pending_detection_job: Option<DetectionJob>,
-    detection_up_prior: MarkovPrior,
-    detection_down_prior: MarkovPrior,
     detection_resolution_prior: ResolutionPrior,
-    detection_up_history: VecDeque<f64>,
-    detection_down_history: VecDeque<f64>,
     detection_current_window: Option<DetectionWindowSample>,
     pub detection_completed_windows: VecDeque<DetectionWindowSample>,
     /// Updated once per second in the Tick handler; avoids `Utc::now()` in the draw path.
@@ -541,13 +567,16 @@ pub struct AppState {
     /// `send_book_watch_if_changed` in `main.rs` can read it without recomputing.
     pub cached_book_watch_tokens: Vec<String>,
     /// Last [`AppEvent::MarketRoll`] — arms trailing on **maker** user-channel BUY fills (resting limits).
-    pub buy_trail_bps:            u32,
+    pub buy_trail_bps: u32,
     pub buy_trail_activation_bps: u32,
 }
 
 impl AppState {
     #[cfg(test)]
-    pub fn new(default_size_usdc: f64, user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>) -> Self {
+    pub fn new(
+        default_size_usdc: f64,
+        user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>,
+    ) -> Self {
         Self::new_with_detection(default_size_usdc, user_trade_sync, true)
     }
 
@@ -557,17 +586,19 @@ impl AppState {
         detection_enabled: bool,
     ) -> Self {
         Self {
-            ui_phase:            UiPhase::WizardLoading,
-            wizard_rows:         Vec::new(),
-            wizard_list_idx:     0,
-            wizard_tf_idx:       0,
-            wizard_series_error:  None,
+            ui_phase: UiPhase::WizardLoading,
+            wizard_rows: Vec::new(),
+            wizard_list_idx: 0,
+            wizard_tf_idx: 0,
+            wizard_series_error: None,
             market: None,
             spot_price: None,
             spot_price_ts: None,
-            market_profile:       None,
-            book_up: None, book_down: None,
-            position_up: Default::default(), position_down: Default::default(),
+            market_profile: None,
+            book_up: None,
+            book_down: None,
+            position_up: Default::default(),
+            position_down: Default::default(),
             realized_pnl: 0.0,
             fak_net_up: 0.0,
             fak_net_down: 0.0,
@@ -580,7 +611,7 @@ impl AppState {
             default_size_usdc,
             size_input: format!("{default_size_usdc:.2}"),
             limit_price_input: String::new(),
-            limit_size_input:  String::new(),
+            limit_size_input: String::new(),
             input_mode: InputMode::Normal,
             order_error_toast: None,
             deposit_modal: None,
@@ -589,13 +620,7 @@ impl AppState {
             cached_sentiment: SentimentDir::Unknown,
             detection_enabled,
             detection_signal: None,
-            detection_seq: 0,
-            pending_detection_job: None,
-            detection_up_prior: MarkovPrior::default(),
-            detection_down_prior: MarkovPrior::default(),
             detection_resolution_prior: ResolutionPrior::default(),
-            detection_up_history: VecDeque::with_capacity(DETECTION_HISTORY_MAX),
-            detection_down_history: VecDeque::with_capacity(DETECTION_HISTORY_MAX),
             detection_current_window: None,
             detection_completed_windows: VecDeque::with_capacity(DETECTION_COMPLETED_WINDOWS_MAX),
             cached_countdown_secs: None,
@@ -607,7 +632,7 @@ impl AppState {
             pending_trailing_sells: VecDeque::new(),
             trailing_sell_in_flight: HashSet::new(),
             cached_book_watch_tokens: Vec::new(),
-            buy_trail_bps:            0,
+            buy_trail_bps: 0,
             buy_trail_activation_bps: 0,
         }
     }
@@ -615,13 +640,13 @@ impl AppState {
     /// Merge a pending trailing arm (same rules as [`AppEvent::RequestTrailingArm`]).
     fn merge_pending_trailing_buy_arm(
         &mut self,
-        outcome:         Outcome,
-        entry_price:     f64,
+        outcome: Outcome,
+        entry_price: f64,
         plan_sell_shares: f64,
-        token_id:        String,
-        trail_bps:       u32,
-        activation_bps:  u32,
-        market:          ActiveMarket,
+        token_id: String,
+        trail_bps: u32,
+        activation_bps: u32,
+        market: ActiveMarket,
     ) {
         let token_id = canonical_clob_token_id(&token_id).into_owned();
         if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
@@ -642,7 +667,8 @@ impl AppState {
                     if new_plan > 1e-9 {
                         p.plan_sell_shares = new_plan;
                         if old_plan > 1e-9 && old_entry.is_finite() && old_entry > 0.0 {
-                            p.entry_price = (old_plan * old_entry + add_plan * add_entry) / new_plan;
+                            p.entry_price =
+                                (old_plan * old_entry + add_plan * add_entry) / new_plan;
                         } else {
                             p.entry_price = add_entry;
                         }
@@ -797,7 +823,8 @@ impl AppState {
     /// `tracked_shares`, causing SELLs after a manual exit).
     pub fn outcome_for_active_token(&self, token_id: &str) -> Option<Outcome> {
         let m = self.market.as_ref()?;
-        if token_id == m.up_token_id.as_str() || clob_asset_ids_match(token_id, m.up_token_id.as_str())
+        if token_id == m.up_token_id.as_str()
+            || clob_asset_ids_match(token_id, m.up_token_id.as_str())
         {
             Some(Outcome::Up)
         } else if token_id == m.down_token_id.as_str()
@@ -812,7 +839,11 @@ impl AppState {
     /// Long shares available for trailing sizing: live REST/UI position when the trail’s market is
     /// the active one; else active-token mapping; else `sess.tracked_shares` for background tails.
     fn trail_live_shares(&self, sess: &TrailingSession) -> f64 {
-        if self.market.as_ref().is_some_and(|m| m.condition_id == sess.market.condition_id) {
+        if self
+            .market
+            .as_ref()
+            .is_some_and(|m| m.condition_id == sess.market.condition_id)
+        {
             return self.position(sess.outcome).shares.max(0.0);
         }
         if let Some(oc) = self.outcome_for_active_token(sess.token_id.as_str()) {
@@ -831,8 +862,7 @@ impl AppState {
             .trailing
             .iter()
             .filter(|(_, sess)| {
-                sess.market.condition_id == active_cid
-                    && self.position(sess.outcome).shares <= 1e-9
+                sess.market.condition_id == active_cid && self.position(sess.outcome).shares <= 1e-9
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -843,8 +873,7 @@ impl AppState {
             .pending_trail_arms
             .iter()
             .filter(|(_, p)| {
-                p.market.condition_id == active_cid
-                    && self.position(p.outcome).shares <= 1e-9
+                p.market.condition_id == active_cid && self.position(p.outcome).shares <= 1e-9
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -873,10 +902,16 @@ impl AppState {
     }
 
     pub fn position(&self, outcome: Outcome) -> &Position {
-        match outcome { Outcome::Up => &self.position_up, Outcome::Down => &self.position_down }
+        match outcome {
+            Outcome::Up => &self.position_up,
+            Outcome::Down => &self.position_down,
+        }
     }
     fn position_mut(&mut self, outcome: Outcome) -> &mut Position {
-        match outcome { Outcome::Up => &mut self.position_up, Outcome::Down => &mut self.position_down }
+        match outcome {
+            Outcome::Up => &mut self.position_up,
+            Outcome::Down => &mut self.position_down,
+        }
     }
 
     /// If session [`Self::fills`] imply **more** gross long shares than [`Position::shares`], bump
@@ -951,13 +986,13 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     fn install_trailing_session(
         &mut self,
-        market:          ActiveMarket,
-        outcome:         Outcome,
-        entry_price:     f64,
+        market: ActiveMarket,
+        outcome: Outcome,
+        entry_price: f64,
         plan_sell_shares: f64,
-        token_id:        String,
-        trail_bps:       u32,
-        tracked_shares:  f64,
+        token_id: String,
+        trail_bps: u32,
+        tracked_shares: f64,
     ) {
         let token_id = canonical_clob_token_id(&token_id).into_owned();
         if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
@@ -1070,12 +1105,22 @@ impl AppState {
         // Hot path: find the session with a single direct lookup — no String allocation.
         // canonical_clob_token_id is only called when the direct hit misses (non-canonical form).
         let tick = {
-            let Some(sess) = self.trailing.get(asset_id)
+            let Some(sess) = self
+                .trailing
+                .get(asset_id)
                 .or_else(|| {
                     let c = canonical_clob_token_id(asset_id);
-                    if c.as_ref() != asset_id { self.trailing.get(c.as_ref()) } else { None }
+                    if c.as_ref() != asset_id {
+                        self.trailing.get(c.as_ref())
+                    } else {
+                        None
+                    }
                 })
-                .or_else(|| self.trailing.values().find(|s| clob_asset_ids_match(&s.token_id, asset_id)))
+                .or_else(|| {
+                    self.trailing
+                        .values()
+                        .find(|s| clob_asset_ids_match(&s.token_id, asset_id))
+                })
             else {
                 return;
             };
@@ -1165,45 +1210,19 @@ impl AppState {
 
     fn recompute_sentiment(&mut self) {
         const SENT_EPS: f64 = 1e-6;
-        let m_up   = self.mark(Outcome::Up);
+        let m_up = self.mark(Outcome::Up);
         let m_down = self.mark(Outcome::Down);
         self.cached_sentiment = match (m_up, m_down) {
             (Some(u), Some(d)) if u > d + SENT_EPS => SentimentDir::Up,
             (Some(u), Some(d)) if d > u + SENT_EPS => SentimentDir::Down,
-            (Some(_), Some(_))                      => SentimentDir::Neutral,
+            (Some(_), Some(_)) => SentimentDir::Neutral,
             _ => match (self.top_holders_up_sum, self.top_holders_down_sum) {
                 (Some(u), Some(d)) if u > d + SENT_EPS => SentimentDir::Up,
                 (Some(u), Some(d)) if d > u + SENT_EPS => SentimentDir::Down,
-                (Some(_), Some(_))                      => SentimentDir::Neutral,
-                _                                       => SentimentDir::Unknown,
+                (Some(_), Some(_)) => SentimentDir::Neutral,
+                _ => SentimentDir::Unknown,
             },
         };
-    }
-
-    fn record_detection_mid(&mut self, outcome: Outcome) {
-        if !self.detection_enabled {
-            return;
-        }
-        let Some(mid) = self.mark(outcome) else {
-            return;
-        };
-        if !(0.0..=1.0).contains(&mid) || !mid.is_finite() {
-            return;
-        }
-        let (history, prior) = match outcome {
-            Outcome::Up => (&mut self.detection_up_history, &mut self.detection_up_prior),
-            Outcome::Down => (&mut self.detection_down_history, &mut self.detection_down_prior),
-        };
-        if history.back().is_some_and(|last| (last - mid).abs() < 1e-6) {
-            return;
-        }
-        if let Some(prev) = history.back().copied() {
-            prior.record_transition(prev, mid);
-        }
-        if history.len() == DETECTION_HISTORY_MAX {
-            history.pop_front();
-        }
-        history.push_back(mid);
     }
 
     fn start_detection_window_sample(&mut self) {
@@ -1305,7 +1324,11 @@ impl AppState {
             sample.close_spot = self.spot_price;
         }
         sample.resolved = match (sample.close_spot, sample.price_to_beat) {
-            (Some(close), Some(target)) => Some(if close >= target { Outcome::Up } else { Outcome::Down }),
+            (Some(close), Some(target)) => Some(if close >= target {
+                Outcome::Up
+            } else {
+                Outcome::Down
+            }),
             _ => None,
         };
         self.learn_from_detection_window_sample(&sample);
@@ -1337,96 +1360,67 @@ impl AppState {
         }
     }
 
-    fn detection_candidate_snapshot(
-        &self,
-        outcome: Outcome,
-        history: &VecDeque<f64>,
-    ) -> Option<DetectionCandidate> {
-        if history.len() < DETECTION_MIN_HISTORY {
-            return None;
+    fn recompute_detection_signal(&mut self) {
+        if !self.detection_enabled {
+            self.detection_signal = None;
+            return;
         }
-        let market_probability = self.best_bid(outcome).or_else(|| self.mark(outcome))?;
-        let prices: Vec<f64> = history.iter().copied().collect();
-        let outcome = match outcome {
-            Outcome::Up => DetectionOutcome::Up,
-            Outcome::Down => DetectionOutcome::Down,
+        let Some(market) = self.market.as_ref() else {
+            self.detection_signal = None;
+            return;
         };
-        Some(DetectionCandidate {
-            outcome,
-            prices,
-            market_probability,
-            context: self.detection_context(outcome),
-            prior: match outcome {
-                DetectionOutcome::Up => self.detection_up_prior.clone(),
-                DetectionOutcome::Down => self.detection_down_prior.clone(),
-            },
-            resolution_prior: self.detection_resolution_prior.clone(),
-        })
-    }
-
-    fn detection_context(&self, outcome: DetectionOutcome) -> Option<DetectionContext> {
-        let market = self.market.as_ref()?;
-        let spot_price = self.spot_price?;
-        let price_to_beat = self.price_to_beat()?;
+        let Some(spot_price) = self.spot_price else {
+            self.detection_signal = None;
+            return;
+        };
+        let Some(price_to_beat) = self.price_to_beat() else {
+            self.detection_signal = None;
+            return;
+        };
+        let (Some(up_book), Some(down_book)) = (self.book_up.as_deref(), self.book_down.as_deref())
+        else {
+            self.detection_signal = None;
+            return;
+        };
         let window_secs = (market.closes_at - market.opens_at).num_seconds().max(1);
         let elapsed_secs = (Utc::now() - market.opens_at)
             .num_seconds()
             .clamp(0, window_secs);
-        Some(DetectionContext {
-            outcome,
-            spot_price,
-            price_to_beat,
-            elapsed_secs,
-            window_secs,
-        })
-    }
-
-    fn queue_detection_job(&mut self) {
-        if !self.detection_enabled {
-            self.pending_detection_job = None;
-            return;
-        }
-        let candidates: Vec<_> = [
-            self.detection_candidate_snapshot(Outcome::Up, &self.detection_up_history),
-            self.detection_candidate_snapshot(Outcome::Down, &self.detection_down_history),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        if candidates.is_empty() {
-            return;
-        }
-        self.detection_seq = self.detection_seq.saturating_add(1);
-        self.pending_detection_job = Some(DetectionJob {
-            seq: self.detection_seq,
-            market_slug: self.market.as_ref().map(|m| m.slug.clone()),
-            candidates,
-            cfg: DetectionConfig::default(),
-        });
-    }
-
-    pub fn take_detection_job(&mut self) -> Option<DetectionJob> {
-        self.pending_detection_job.take()
-    }
-
-    fn apply_detection_result(&mut self, result: DetectionJobResult) {
-        if !self.detection_enabled {
-            return;
-        }
-        if result.seq != self.detection_seq {
-            return;
-        }
-        let current_slug = self.market.as_ref().map(|m| m.slug.as_str());
-        if result.market_slug.as_deref() != current_slug {
-            return;
-        }
-        self.detection_signal = result.best.map(|(outcome, signal)| DetectionSignalView {
-            outcome: match outcome {
+        let cfg = WindowBidConfig {
+            tick_size: market.tick_size.parse::<f64>().unwrap_or(0.01),
+            ..WindowBidConfig::default()
+        };
+        let decision = crate::detection::decide_window_bid(
+            &WindowBidInput {
+                spot_price,
+                price_to_beat,
+                elapsed_secs,
+                window_secs,
+                up_book,
+                down_book,
+            },
+            &cfg,
+        );
+        let outcome = match decision {
+            BidDecision::Bid { outcome, .. }
+            | BidDecision::Skip {
+                best_outcome: Some(outcome),
+                ..
+            } => match outcome {
                 DetectionOutcome::Up => Outcome::Up,
                 DetectionOutcome::Down => Outcome::Down,
             },
-            signal,
-        });
+            BidDecision::Skip {
+                best_outcome: None, ..
+            } => {
+                if spot_price >= price_to_beat {
+                    Outcome::Up
+                } else {
+                    Outcome::Down
+                }
+            }
+        };
+        self.detection_signal = Some(DetectionSignalView { outcome, decision });
     }
 
     pub fn detection_status_line(&self) -> String {
@@ -1434,8 +1428,8 @@ impl AppState {
             return String::new();
         }
         match self.detection_signal {
-            Some(view) => format!("Detection: {} {}", view.outcome.as_str(), view.signal.short_label()),
-            None => "Detection: warming up Markov history".to_string(),
+            Some(view) => format!("Detection: {}", detection_decision_label(view)),
+            None => "Detection: waiting for spot + UP/DOWN books".to_string(),
         }
     }
 
@@ -1450,13 +1444,15 @@ impl AppState {
                 {
                     self.order_error_toast = None;
                 }
-                self.cached_countdown_secs = self.market
+                self.cached_countdown_secs = self
+                    .market
                     .as_ref()
                     .map(|m| (m.closes_at - Utc::now()).num_seconds().max(0));
             }
             AppEvent::Price(p) => {
-                self.spot_price    = Some(p.price);
-                self.spot_price_ts = chrono::DateTime::<Utc>::from_timestamp_millis(p.timestamp_ms as i64);
+                self.spot_price = Some(p.price);
+                self.spot_price_ts =
+                    chrono::DateTime::<Utc>::from_timestamp_millis(p.timestamp_ms as i64);
                 if let Some(m) = &self.market {
                     if m.price_to_beat.is_none() && self.latched_price_to_beat.is_none() {
                         let open_ms = m.opens_at.timestamp_millis().max(0) as u64;
@@ -1467,7 +1463,7 @@ impl AppState {
                     }
                 }
                 self.update_detection_window_spot();
-                self.queue_detection_job();
+                self.recompute_detection_signal();
             }
             AppEvent::Book(mut b) => {
                 b.asset_id = canonical_clob_token_id(&b.asset_id).into_owned();
@@ -1486,10 +1482,16 @@ impl AppState {
                 // Use the cached sorted watch list — binary search, no HashSet allocation.
                 // cached_book_watch_tokens is rebuilt at the end of apply() to capture any
                 // state changes made by try_promote_pending_trail_any / apply_trailing_book_tick.
-                if self.cached_book_watch_tokens.binary_search(&id_for_trail).is_ok() {
-                    self.watched_books.insert(id_for_trail.clone(), Arc::clone(&snap));
+                if self
+                    .cached_book_watch_tokens
+                    .binary_search(&id_for_trail)
+                    .is_ok()
+                {
+                    self.watched_books
+                        .insert(id_for_trail.clone(), Arc::clone(&snap));
                     let tokens = &self.cached_book_watch_tokens;
-                    self.watched_books.retain(|k, _| tokens.binary_search(k).is_ok());
+                    self.watched_books
+                        .retain(|k, _| tokens.binary_search(k).is_ok());
                 }
 
                 self.try_promote_pending_trail_any(id_for_trail.as_str());
@@ -1499,11 +1501,9 @@ impl AppState {
                 self.recompute_sentiment();
                 if let Some(outcome) = detection_outcome {
                     self.record_detection_book_point(outcome, snap.as_ref());
-                    self.record_detection_mid(outcome);
-                    self.queue_detection_job();
+                    self.recompute_detection_signal();
                 }
             }
-            AppEvent::DetectionSignalReady(result) => self.apply_detection_result(result),
             AppEvent::MarketRoll {
                 market,
                 buy_trail_bps,
@@ -1522,7 +1522,8 @@ impl AppState {
                 self.market = Some(market);
                 self.buy_trail_bps = buy_trail_bps;
                 self.buy_trail_activation_bps = buy_trail_activation_bps;
-                self.book_up = None; self.book_down = None;
+                self.book_up = None;
+                self.book_down = None;
                 self.position_up = Default::default();
                 self.position_down = Default::default();
                 self.fak_net_up = 0.0;
@@ -1534,20 +1535,20 @@ impl AppState {
                 self.watched_books.clear();
                 self.cached_sentiment = SentimentDir::Unknown;
                 self.detection_signal = None;
-                self.detection_seq = self.detection_seq.saturating_add(1);
-                self.pending_detection_job = None;
-                self.detection_up_history.clear();
-                self.detection_down_history.clear();
                 self.cached_countdown_secs = None;
                 self.start_detection_window_sample();
             }
-            AppEvent::PriceToBeatRefresh { slug, price_to_beat } => {
+            AppEvent::PriceToBeatRefresh {
+                slug,
+                price_to_beat,
+            } => {
                 if let Some(m) = &mut self.market {
                     if m.slug == slug {
                         if let Some(ptb) = price_to_beat {
                             m.price_to_beat = Some(ptb);
                             self.latched_price_to_beat = None;
                             self.update_detection_window_spot();
+                            self.recompute_detection_signal();
                         }
                     }
                 }
@@ -1621,7 +1622,10 @@ impl AppState {
             AppEvent::OpenOrdersLoaded { orders } => {
                 self.open_orders = orders;
             }
-            AppEvent::BalancePanelLoaded { cash_usdc, claimable_usdc } => {
+            AppEvent::BalancePanelLoaded {
+                cash_usdc,
+                claimable_usdc,
+            } => {
                 self.collateral_cash_usdc = Some(cash_usdc);
                 self.collateral_claimable_usdc = Some(claimable_usdc);
             }
@@ -1649,7 +1653,10 @@ impl AppState {
                 // 2. `OrderAck` for the same fill is queued ahead of `UserChannelFill` and is
                 //    processed first; `ack_wait` now holds the entry but the WS pre-check already
                 //    returned `true` before that happened.
-                if self.user_trade_sync.fill_already_committed(&clob_trade_id).await
+                if self
+                    .user_trade_sync
+                    .fill_already_committed(&clob_trade_id)
+                    .await
                     || self
                         .user_trade_sync
                         .ack_claimed_for_ws_fill(&order_leg_id, qty, price, &clob_trade_id)
@@ -1740,7 +1747,11 @@ impl AppState {
                 let token_id = canonical_clob_token_id(&token_id).into_owned();
                 let mut do_pnl = true;
                 if let Some(ref oid) = clob_order_id {
-                    if !self.user_trade_sync.before_order_ack_apply(oid, qty, price).await {
+                    if !self
+                        .user_trade_sync
+                        .before_order_ack_apply(oid, qty, price)
+                        .await
+                    {
                         do_pnl = false;
                     }
                 }
@@ -1759,7 +1770,7 @@ impl AppState {
                         }
                         if qty > 1e-12 {
                             self.fills.push_back(Fill {
-                                ts:            Utc::now(),
+                                ts: Utc::now(),
                                 side,
                                 outcome: ui_oc,
                                 qty,
@@ -1773,7 +1784,9 @@ impl AppState {
                     }
                     trim_fills_to_cap(&mut self.fills, 64);
                     if let Some(ref oid) = clob_order_id {
-                        self.user_trade_sync.after_order_ack_applied(oid, qty, price).await;
+                        self.user_trade_sync
+                            .after_order_ack_applied(oid, qty, price)
+                            .await;
                     }
                     if let Some(oc) = filled_oc {
                         self.reconcile_position_shares_with_fill_deque(oc);
@@ -1819,7 +1832,7 @@ impl AppState {
                 self.status_line = format!("✗ {e}");
                 self.order_error_toast = Some(OrderErrorToast {
                     message: e,
-                    until:   Instant::now() + ORDER_ERROR_TOAST_TTL,
+                    until: Instant::now() + ORDER_ERROR_TOAST_TTL,
                 });
             }
             AppEvent::StatusInfo(msg) => self.status_line = msg,
@@ -1889,13 +1902,7 @@ impl AppState {
                 self.cached_pair_label = format!("{}/USD", p.asset.label);
                 self.cached_sentiment = SentimentDir::Unknown;
                 self.detection_signal = None;
-                self.detection_seq = self.detection_seq.saturating_add(1);
-                self.pending_detection_job = None;
-                self.detection_up_prior = MarkovPrior::default();
-                self.detection_down_prior = MarkovPrior::default();
                 self.detection_resolution_prior = ResolutionPrior::default();
-                self.detection_up_history.clear();
-                self.detection_down_history.clear();
                 self.cached_countdown_secs = None;
                 self.buy_trail_bps = 0;
                 self.buy_trail_activation_bps = 0;
@@ -1914,7 +1921,8 @@ impl AppState {
                 let token_id = canonical_clob_token_id(&token_id).into_owned();
                 // token_id is canonical; all keys/entries are canonical — direct equality suffices.
                 self.trailing_sell_in_flight.retain(|k| *k != token_id);
-                self.pending_trailing_sells.retain(|p| p.token_id != token_id);
+                self.pending_trailing_sells
+                    .retain(|p| p.token_id != token_id);
                 let tid = token_id.clone();
                 if !success {
                     let had_sess = trailing_map_key_for_asset(&self.trailing, tid.as_str())
@@ -1928,27 +1936,27 @@ impl AppState {
                             && sess.plan_sell_shares.is_finite()
                             && sess.plan_sell_shares > 0.0
                         {
-                            let entry = if self.market.as_ref().is_some_and(|m| {
-                                m.condition_id == sess.market.condition_id
-                            }) {
-                                    let pos = self.position(sess.outcome);
-                                    if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
-                                        pos.avg_entry
-                                    } else {
-                                        sess.stop.entry_price()
-                                    }
-                                } else if let Some(oc) =
-                                    self.outcome_for_active_token(&sess.token_id)
-                                {
-                                    let pos = self.position(oc);
-                                    if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
-                                        pos.avg_entry
-                                    } else {
-                                        sess.stop.entry_price()
-                                    }
+                            let entry = if self
+                                .market
+                                .as_ref()
+                                .is_some_and(|m| m.condition_id == sess.market.condition_id)
+                            {
+                                let pos = self.position(sess.outcome);
+                                if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                                    pos.avg_entry
                                 } else {
                                     sess.stop.entry_price()
-                                };
+                                }
+                            } else if let Some(oc) = self.outcome_for_active_token(&sess.token_id) {
+                                let pos = self.position(oc);
+                                if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                                    pos.avg_entry
+                                } else {
+                                    sess.stop.entry_price()
+                                }
+                            } else {
+                                sess.stop.entry_price()
+                            };
                             self.install_trailing_session(
                                 sess.market.clone(),
                                 sess.outcome,
@@ -1970,7 +1978,7 @@ impl AppState {
                         };
                         self.order_error_toast = Some(OrderErrorToast {
                             message: e,
-                            until:   Instant::now() + ORDER_ERROR_TOAST_TTL,
+                            until: Instant::now() + ORDER_ERROR_TOAST_TTL,
                         });
                     } else if re_armed {
                         let oc = session_outcome.unwrap_or(Outcome::Up);
@@ -1987,7 +1995,56 @@ impl AppState {
     }
 }
 
-fn side_str(s: Side) -> &'static str { match s { Side::Buy => "BUY", Side::Sell => "SELL" } }
+fn side_str(s: Side) -> &'static str {
+    match s {
+        Side::Buy => "BUY",
+        Side::Sell => "SELL",
+    }
+}
+
+fn detection_decision_label(view: DetectionSignalView) -> String {
+    match view.decision {
+        BidDecision::Bid {
+            bid_price,
+            fair_probability,
+            expected_value,
+            edge,
+            ..
+        } => format!(
+            "{} BID @ {:.2} fair {:.0}% edge {:+.1}% EV {:+.3}",
+            view.outcome.as_str(),
+            bid_price,
+            fair_probability * 100.0,
+            edge * 100.0,
+            expected_value
+        ),
+        BidDecision::Skip {
+            reason,
+            best_fair_probability,
+            ..
+        } => {
+            let reason = match reason {
+                BidSkipReason::BadInput => "bad input",
+                BidSkipReason::TooLate => "too late",
+                BidSkipReason::NoBook => "waiting for book",
+                BidSkipReason::SpreadTooWide => "spread too wide",
+                BidSkipReason::QueueTooThin => "queue too thin",
+                BidSkipReason::BookImbalance => "book imbalance",
+                BidSkipReason::NoPositiveEdge => "no edge",
+            };
+            if let Some(p) = best_fair_probability {
+                format!(
+                    "{} skip: {} (best fair {:.0}%)",
+                    view.outcome.as_str(),
+                    reason,
+                    p * 100.0
+                )
+            } else {
+                format!("skip: {reason}")
+            }
+        }
+    }
+}
 
 /// `VecDeque` front = latest `Fill::ts` (newest match time first).
 fn sort_fills_by_ts_desc(fills: &mut VecDeque<Fill>) {
@@ -2009,7 +2066,7 @@ fn trim_fills_to_cap(fills: &mut VecDeque<Fill>, cap: usize) {
 pub struct HydrateOrderSnap {
     /// [`norm_order_id_key`] for each open order id.
     pub known_order_keys: HashSet<String>,
-    pub side_by_norm_id:  HashMap<String, Side>,
+    pub side_by_norm_id: HashMap<String, Side>,
     pub asset_by_norm_id: HashMap<String, String>,
 }
 
@@ -2175,8 +2232,16 @@ fn hydrate_apply_position_fill(
     price: f64,
 ) -> (f64, f64) {
     if side == Side::Buy && trade_row_is_not_maker(t) {
-        let mk = t.making_amount.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let tk = t.taking_amount.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let mk = t
+            .making_amount
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let tk = t
+            .taking_amount
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         if let (Some(mk_s), Some(tk_s)) = (mk, tk) {
             if let (Ok(usdc), Ok(share_amt)) = (mk_s.parse::<f64>(), tk_s.parse::<f64>()) {
                 if usdc.is_finite() && usdc > 0.0 && share_amt.is_finite() && share_amt > 0.0 {
@@ -2232,7 +2297,10 @@ fn rest_trade_user_fill(
         return None;
     }
 
-    let role = t.trader_side.as_deref().map(|s| s.trim().to_ascii_uppercase());
+    let role = t
+        .trader_side
+        .as_deref()
+        .map(|s| s.trim().to_ascii_uppercase());
     let is_maker = matches!(role.as_deref(), Some("MAKER") | Some("M"));
 
     if !is_maker {
@@ -2252,7 +2320,9 @@ fn rest_trade_user_fill(
         return Some((taker_side, qty, price_top, fill_asset));
     }
 
-    if let Some(leg) = maker_leg_for_trade_row(t, up_token_id, down_token_id, order_snap, clob_api_key) {
+    if let Some(leg) =
+        maker_leg_for_trade_row(t, up_token_id, down_token_id, order_snap, clob_api_key)
+    {
         let nk_leg = norm_order_id_key(&leg.order_id);
         let side_from_leg = leg
             .side
@@ -2274,7 +2344,11 @@ fn rest_trade_user_fill(
         if !qty.is_finite() || qty <= 0.0 {
             return None;
         }
-        let px = match leg.price.as_ref().and_then(|s| s.trim().parse::<f64>().ok()) {
+        let px = match leg
+            .price
+            .as_ref()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+        {
             Some(p) if p.is_finite() && p > 0.0 => p,
             _ => price_top,
         };
@@ -2338,7 +2412,9 @@ pub fn escrow_sell_shares_from_clob_orders(
         } else {
             continue;
         };
-        let Some(side) = parse_clob_side(&o.side) else { continue };
+        let Some(side) = parse_clob_side(&o.side) else {
+            continue;
+        };
         if side != Side::Sell {
             continue;
         }
@@ -2372,7 +2448,9 @@ pub fn open_orders_from_clob(
         } else {
             continue;
         };
-        let Some(side) = parse_clob_side(&o.side) else { continue };
+        let Some(side) = parse_clob_side(&o.side) else {
+            continue;
+        };
         let orig = o.original_size.parse::<f64>().unwrap_or(f64::NAN);
         let matched = o.size_matched.parse::<f64>().unwrap_or(0.0);
         let price = o.price.parse::<f64>().unwrap_or(f64::NAN);
@@ -2392,11 +2470,17 @@ pub fn open_orders_from_clob(
     }
     out.sort_by(|a, b| {
         let ord_o = match (a.outcome, b.outcome) {
-            (Outcome::Up, Outcome::Up) | (Outcome::Down, Outcome::Down) => std::cmp::Ordering::Equal,
+            (Outcome::Up, Outcome::Up) | (Outcome::Down, Outcome::Down) => {
+                std::cmp::Ordering::Equal
+            }
             (Outcome::Up, Outcome::Down) => std::cmp::Ordering::Less,
             (Outcome::Down, Outcome::Up) => std::cmp::Ordering::Greater,
         };
-        ord_o.then_with(|| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal))
+        ord_o.then_with(|| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
     out
 }
@@ -2415,7 +2499,11 @@ fn merge_chain_balance(
     escrow_sell: f64,
     data_api: Option<(f64, f64)>,
 ) -> Position {
-    let spendable = if balance.is_finite() { balance.max(0.0) } else { 0.0 };
+    let spendable = if balance.is_finite() {
+        balance.max(0.0)
+    } else {
+        0.0
+    };
     let escrow = if escrow_sell.is_finite() && escrow_sell > 0.0 {
         escrow_sell
     } else {
@@ -2430,9 +2518,8 @@ fn merge_chain_balance(
         .map(|(s, _)| s)
         .filter(|s| s.is_finite() && *s > 1e-12)
         .unwrap_or(0.0);
-    let data_avg = data_api.and_then(|(s, a)| {
-        (s.is_finite() && s > 1e-12 && a.is_finite() && a > 0.0).then_some(a)
-    });
+    let data_avg = data_api
+        .and_then(|(s, a)| (s.is_finite() && s > 1e-12 && a.is_finite() && a > 0.0).then_some(a));
 
     // Data API `size` / `avgPrice` agrees with our resolved `shares` (5% slack for REST vs wallet).
     let data_basis_for_shares = |s: f64| -> Option<f64> {
@@ -2453,9 +2540,11 @@ fn merge_chain_balance(
     // Trade replay can lag on-chain / POST rounding (e.g. buy fill vs USDC-notional estimate).
     // Prefer the larger of replay and spendable+escrow so market SELL can flatten fully.
     let shares = if replay_ok {
-        replay
-            .shares
-            .max(if inventory_fallback > 1e-12 { inventory_fallback } else { 0.0 })
+        replay.shares.max(if inventory_fallback > 1e-12 {
+            inventory_fallback
+        } else {
+            0.0
+        })
     } else if inventory_fallback > 1e-12 {
         inventory_fallback
     } else if data_shares > 1e-12 {
@@ -2577,7 +2666,9 @@ pub fn hydrate_positions_from_trades(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(t.asset_id.as_str());
-        if !(clob_asset_ids_match(aid_fill, up_token_id) || clob_asset_ids_match(aid_fill, down_token_id)) {
+        if !(clob_asset_ids_match(aid_fill, up_token_id)
+            || clob_asset_ids_match(aid_fill, down_token_id))
+        {
             debug!(id = %t.id, aid = %aid_fill, "skip trade: resolved fill asset not in active UP/DOWN pair");
             continue;
         }
@@ -2719,15 +2810,14 @@ pub fn resolve_trailing_sell(
 mod tests {
     use super::*;
 
-    use chrono::Utc;
-    use crate::detection::BidRecommendation;
     use crate::feeds::chainlink::PriceTick;
     use crate::feeds::clob_ws::{BookLevel, BookSnapshot};
     use crate::feeds::user_trade_sync::UserTradeSync;
     use crate::fees::polymarket_crypto_taker_fee_usdc;
     use crate::gamma::ActiveMarket;
-    use crate::market_profile::{MarketProfile, CRYPTO_ASSETS, Timeframe};
+    use crate::market_profile::{MarketProfile, Timeframe, CRYPTO_ASSETS};
     use crate::trading::{ClobMakerOrder, ClobOpenOrder, ClobTrade};
+    use chrono::Utc;
 
     fn test_state() -> AppState {
         AppState::new(5.0, Arc::new(UserTradeSync::new()))
@@ -2736,17 +2826,17 @@ mod tests {
     fn test_market(up: &str, down: &str, cond: &str) -> ActiveMarket {
         ActiveMarket {
             condition_id: cond.into(),
-            question:     "test".into(),
-            slug:         "test".into(),
-            up_token_id:  up.into(),
+            question: "test".into(),
+            slug: "test".into(),
+            up_token_id: up.into(),
             down_token_id: down.into(),
-            tick_size:    "0.01".into(),
-            neg_risk:     false,
+            tick_size: "0.01".into(),
+            neg_risk: false,
             price_to_beat: None,
-            opens_at:     Utc::now(),
-            closes_at:    Utc::now(),
+            opens_at: Utc::now(),
+            closes_at: Utc::now(),
             crypto_price_query_start_utc: String::new(),
-            crypto_price_query_end_utc:   String::new(),
+            crypto_price_query_end_utc: String::new(),
         }
     }
 
@@ -2812,10 +2902,27 @@ mod tests {
             making_amount: None,
             taking_amount: None,
         };
-        let (pu, _, fills) =
-            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (pu, _, fills) = hydrate_positions_from_trades(
+            &[t],
+            up,
+            "222",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
-        assert!(fills.iter().all(|f| f.side == Side::Buy && (f.qty - 10.0).abs() < 1e-6), "fills={:?}", fills);
+        assert!(
+            fills
+                .iter()
+                .all(|f| f.side == Side::Buy && (f.qty - 10.0).abs() < 1e-6),
+            "fills={:?}",
+            fills
+        );
     }
 
     /// Regression: REST can echo trade-level `side` onto the maker leg; restart Fills must stay BUY.
@@ -2843,8 +2950,19 @@ mod tests {
             making_amount: None,
             taking_amount: None,
         };
-        let (_pu, _, fills) =
-            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (_pu, _, fills) = hydrate_positions_from_trades(
+            &[t],
+            up,
+            "222",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].side, Side::Buy, "fills={:?}", fills);
     }
@@ -2886,8 +3004,19 @@ mod tests {
             making_amount: None,
             taking_amount: None,
         };
-        let (pu, pd, fills) =
-            hydrate_positions_from_trades(&[t], up, down, 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (pu, pd, fills) = hydrate_positions_from_trades(
+            &[t],
+            up,
+            down,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert_eq!(fills.len(), 1, "fills={:?}", fills);
         let f = &fills[0];
         assert_eq!(f.outcome, Outcome::Down, "fills={:?}", fills);
@@ -2999,7 +3128,17 @@ mod tests {
             taking_amount: None,
         };
         let (_pu, pd, fills) = hydrate_positions_from_trades(
-            &[t], up, down, 0.0, 0.0, 0.0, 0.0, None, None, &[], Some(api),
+            &[t],
+            up,
+            down,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            Some(api),
         );
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].outcome, Outcome::Down);
@@ -3034,8 +3173,19 @@ mod tests {
             making_amount: None,
             taking_amount: None,
         };
-        let (pu, _, fills) =
-            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (pu, _, fills) = hydrate_positions_from_trades(
+            &[t],
+            up,
+            "222",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert_eq!(fills.len(), 1);
         assert!((fills[0].qty - 50.0).abs() < 1e-9, "fills={:?}", fills);
         assert!((pu.shares - 50.0).abs() < 1e-9, "pu={:?}", pu);
@@ -3065,8 +3215,19 @@ mod tests {
             making_amount: None,
             taking_amount: None,
         };
-        let (_, _, fills) =
-            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (_, _, fills) = hydrate_positions_from_trades(
+            &[t],
+            up,
+            "222",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         let f = &fills[0];
         assert!((f.qty - 4.0).abs() < 1e-9);
         assert!((f.price - 0.48).abs() < 1e-9);
@@ -3090,11 +3251,32 @@ mod tests {
             making_amount: Some("5.40".into()),
             taking_amount: Some("10".into()),
         };
-        let (pu, _, fills) =
-            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (pu, _, fills) = hydrate_positions_from_trades(
+            &[t],
+            up,
+            "222",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
-        assert!((pu.avg_entry - 0.54).abs() < 1e-6, "avg_entry={}", pu.avg_entry);
-        assert!(fills.iter().all(|f| (f.qty - 10.0).abs() < 1e-6 && (f.price - 0.54).abs() < 1e-6), "fills={:?}", fills);
+        assert!(
+            (pu.avg_entry - 0.54).abs() < 1e-6,
+            "avg_entry={}",
+            pu.avg_entry
+        );
+        assert!(
+            fills
+                .iter()
+                .all(|f| (f.qty - 10.0).abs() < 1e-6 && (f.price - 0.54).abs() < 1e-6),
+            "fills={:?}",
+            fills
+        );
     }
 
     #[test]
@@ -3134,8 +3316,19 @@ mod tests {
             trade("a", up, "BUY", "10", "0.5", "1000"),
             trade("b", up, "BUY", "10", "0.6", "2000"),
         ];
-        let (pu, pd, fills) =
-            hydrate_positions_from_trades(&trades, up, down, 20.0, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (pu, pd, fills) = hydrate_positions_from_trades(
+            &trades,
+            up,
+            down,
+            20.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert!((pu.shares - 20.0).abs() < 1e-6);
         // VWAP of USDC cost/share incl. crypto taker fees on each BUY.
         let c1 = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
@@ -3154,8 +3347,19 @@ mod tests {
             trade_with_status("ok", up, "BUY", "10", "0.5", "1000", Some("CONFIRMED")),
             trade_with_status("bad", up, "BUY", "99", "0.5", "2000", Some("FAILED")),
         ];
-        let (pu, _, fills) =
-            hydrate_positions_from_trades(&trades, up, down, 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (pu, _, fills) = hydrate_positions_from_trades(
+            &trades,
+            up,
+            down,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].clob_trade_id, Some("ok".into()));
@@ -3166,8 +3370,14 @@ mod tests {
         let mut state = test_state();
         state.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "1".into(),
-            bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
-            asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
+            bids: vec![BookLevel {
+                price: 0.5,
+                size: 1000.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.51,
+                size: 1000.0,
+            }],
         }));
         state.position_up.shares = 7.25;
         // $1 ticket → would be 2 shares via USDC/bid; we still exit the full 7.25 sh.
@@ -3182,8 +3392,14 @@ mod tests {
         let mut state = test_state();
         state.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "1".into(),
-            bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
-            asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
+            bids: vec![BookLevel {
+                price: 0.5,
+                size: 1000.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.51,
+                size: 1000.0,
+            }],
         }));
         state.position_up = Position::default();
         let (shares, _, _) =
@@ -3196,8 +3412,14 @@ mod tests {
         let mut state = test_state();
         state.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "1".into(),
-            bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
-            asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
+            bids: vec![BookLevel {
+                price: 0.5,
+                size: 1000.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.51,
+                size: 1000.0,
+            }],
         }));
         state.position_up.shares = 10.0;
         state.fills.push_back(Fill {
@@ -3219,8 +3441,14 @@ mod tests {
         let mut state = test_state();
         state.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "1".into(),
-            bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
-            asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
+            bids: vec![BookLevel {
+                price: 0.5,
+                size: 1000.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.51,
+                size: 1000.0,
+            }],
         }));
         state.position_up.shares = 10.0;
         state.fak_net_up = 10.11;
@@ -3236,15 +3464,26 @@ mod tests {
             trade("a", up, "BUY", "10", "0.5", "1000"),
             trade("b", up, "SELL", "4", "0.7", "2000"),
         ];
-        let (pu, _, fills) =
-            hydrate_positions_from_trades(&trades, up, "222", 6.0, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (pu, _, fills) = hydrate_positions_from_trades(
+            &trades,
+            up,
+            "222",
+            6.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert!((pu.shares - 6.0).abs() < 1e-6);
         let buy_cost = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
         let expect_avg = buy_cost / 10.0;
         assert!((pu.avg_entry - expect_avg).abs() < 1e-6);
         let sell_fill = fills.iter().find(|f| f.side == Side::Sell).unwrap();
-        let expect_realized = 4.0f64.mul_add(0.7, -polymarket_crypto_taker_fee_usdc(4.0, 0.7))
-            - 4.0 * expect_avg;
+        let expect_realized =
+            4.0f64.mul_add(0.7, -polymarket_crypto_taker_fee_usdc(4.0, 0.7)) - 4.0 * expect_avg;
         assert!((sell_fill.realized - expect_realized).abs() < 1e-6);
     }
 
@@ -3254,8 +3493,19 @@ mod tests {
         let up = "111";
         let trades = vec![trade("a", up, "BUY", "10", "0.5", "1000")];
         let spendable = 4.0;
-        let (pu, _, _) =
-            hydrate_positions_from_trades(&trades, up, "222", spendable, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (pu, _, _) = hydrate_positions_from_trades(
+            &trades,
+            up,
+            "222",
+            spendable,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert!((pu.shares - 10.0).abs() < 1e-6);
         let buy_cost = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
         assert!((pu.avg_entry - buy_cost / 10.0).abs() < 1e-6);
@@ -3267,8 +3517,19 @@ mod tests {
         let up = "111";
         let trades = vec![trade("a", up, "BUY", "10", "0.5", "1000")];
         let chain = 10.09;
-        let (pu, _, _) =
-            hydrate_positions_from_trades(&trades, up, "222", chain, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (pu, _, _) = hydrate_positions_from_trades(
+            &trades,
+            up,
+            "222",
+            chain,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert!((pu.shares - 10.09).abs() < 1e-6);
     }
 
@@ -3276,8 +3537,19 @@ mod tests {
     fn hydrate_falls_back_to_balance_when_no_trades() {
         let up = "111";
         let trades: Vec<ClobTrade> = vec![];
-        let (pu, pd, _) =
-            hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0, 0.0, 0.0, None, None, &[], None);
+        let (pu, pd, _) = hydrate_positions_from_trades(
+            &trades,
+            up,
+            "222",
+            3.5,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert!((pu.shares - 3.5).abs() < 1e-6);
         assert!(pd.shares.abs() < 1e-9);
     }
@@ -3288,8 +3560,19 @@ mod tests {
         let up = "111";
         let trades: Vec<ClobTrade> = vec![];
         let data = Some((3.5, 0.62));
-        let (pu, _, _) =
-            hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0, 0.0, 0.0, data, None, &[], None);
+        let (pu, _, _) = hydrate_positions_from_trades(
+            &trades,
+            up,
+            "222",
+            3.5,
+            0.0,
+            0.0,
+            0.0,
+            data,
+            None,
+            &[],
+            None,
+        );
         assert!((pu.shares - 3.5).abs() < 1e-6);
         assert!((pu.avg_entry - 0.62).abs() < 1e-9);
     }
@@ -3302,7 +3585,17 @@ mod tests {
         let chain = 20.0_f64;
         let data = Some((20.0, 0.58));
         let (pu, _, _) = hydrate_positions_from_trades(
-            &trades, up, "222", chain, 0.0, 0.0, 0.0, data, None, &[], None,
+            &trades,
+            up,
+            "222",
+            chain,
+            0.0,
+            0.0,
+            0.0,
+            data,
+            None,
+            &[],
+            None,
         );
         assert!((pu.shares - 20.0).abs() < 1e-6);
         assert!((pu.avg_entry - 0.58).abs() < 1e-9);
@@ -3324,8 +3617,19 @@ mod tests {
         let (escrow_u, escrow_d) = escrow_sell_shares_from_clob_orders(&rows, up, "222");
         assert!((escrow_u - 12.0).abs() < 1e-9);
         assert!(escrow_d.abs() < 1e-9);
-        let (pu, pd, _) =
-            hydrate_positions_from_trades(&trades, up, "222", 0.0, 0.0, escrow_u, escrow_d, None, None, &[], None);
+        let (pu, pd, _) = hydrate_positions_from_trades(
+            &trades,
+            up,
+            "222",
+            0.0,
+            0.0,
+            escrow_u,
+            escrow_d,
+            None,
+            None,
+            &[],
+            None,
+        );
         assert!((pu.shares - 12.0).abs() < 1e-6);
         assert!(pd.shares.abs() < 1e-9);
     }
@@ -3381,19 +3685,25 @@ mod tests {
         let m_new = test_market("NEW_UP", "NEW_DOWN", "0xc1");
         s.market = Some(m_new.clone());
         s.apply(AppEvent::RequestTrailingArm {
-            outcome:          Outcome::Up,
-            entry_price:      0.5,
+            outcome: Outcome::Up,
+            entry_price: 0.5,
             plan_sell_shares: 10.0,
-            token_id:         "OLD_UP".into(),
-            trail_bps:        100,
-            activation_bps:   0,
-            market:           m_old,
+            token_id: "OLD_UP".into(),
+            trail_bps: 100,
+            activation_bps: 0,
+            market: m_old,
         })
         .await;
         let b_old = BookSnapshot {
             asset_id: "OLD_UP".into(),
-            bids:     vec![BookLevel { price: 0.49, size: 10.0 }],
-            asks:     vec![BookLevel { price: 0.51, size: 10.0 }],
+            bids: vec![BookLevel {
+                price: 0.49,
+                size: 10.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.51,
+                size: 10.0,
+            }],
         };
         s.apply(AppEvent::Book(b_old)).await;
         assert!(
@@ -3402,8 +3712,14 @@ mod tests {
         );
         let b_new = BookSnapshot {
             asset_id: "NEW_UP".into(),
-            bids:     vec![BookLevel { price: 0.40, size: 5.0 }],
-            asks:     vec![BookLevel { price: 0.42, size: 5.0 }],
+            bids: vec![BookLevel {
+                price: 0.40,
+                size: 5.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.42,
+                size: 5.0,
+            }],
         };
         s.apply(AppEvent::Book(b_new)).await;
         assert!(
@@ -3420,30 +3736,34 @@ mod tests {
         let m = test_market("UP_M", "DOWN_M", "0xmerge1");
         s.market = Some(m.clone());
         s.apply(AppEvent::RequestTrailingArm {
-            outcome:          Outcome::Up,
-            entry_price:      0.50,
+            outcome: Outcome::Up,
+            entry_price: 0.50,
             plan_sell_shares: 10.0,
-            token_id:         "UP_M".into(),
-            trail_bps:        100,
-            activation_bps:   500,
-            market:           m.clone(),
+            token_id: "UP_M".into(),
+            trail_bps: 100,
+            activation_bps: 500,
+            market: m.clone(),
         })
         .await;
         s.apply(AppEvent::RequestTrailingArm {
-            outcome:          Outcome::Up,
-            entry_price:      0.60,
+            outcome: Outcome::Up,
+            entry_price: 0.60,
             plan_sell_shares: 5.0,
-            token_id:         "UP_M".into(),
-            trail_bps:        100,
-            activation_bps:   500,
-            market:           m.clone(),
+            token_id: "UP_M".into(),
+            trail_bps: 100,
+            activation_bps: 500,
+            market: m.clone(),
         })
         .await;
         let p = s
             .pending_trail_arms
             .get("UP_M")
             .expect("merged pending trail");
-        assert!((p.plan_sell_shares - 15.0).abs() < 1e-9, "plan={}", p.plan_sell_shares);
+        assert!(
+            (p.plan_sell_shares - 15.0).abs() < 1e-9,
+            "plan={}",
+            p.plan_sell_shares
+        );
         let want_entry = (10.0 * 0.50 + 5.0 * 0.60) / 15.0;
         assert!((p.entry_price - want_entry).abs() < 1e-9);
     }
@@ -3456,17 +3776,23 @@ mod tests {
         s.market = Some(m.clone());
         s.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "U_MER".into(),
-            bids:     vec![BookLevel { price: 0.52, size: 100.0 }],
-            asks:     vec![BookLevel { price: 0.54, size: 100.0 }],
+            bids: vec![BookLevel {
+                price: 0.52,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.54,
+                size: 100.0,
+            }],
         }));
         s.apply(AppEvent::RequestTrailingArm {
-            outcome:          Outcome::Up,
-            entry_price:      0.50,
+            outcome: Outcome::Up,
+            entry_price: 0.50,
             plan_sell_shares: 10.0,
-            token_id:         "U_MER".into(),
-            trail_bps:        200,
-            activation_bps:   0,
-            market:           m.clone(),
+            token_id: "U_MER".into(),
+            trail_bps: 200,
+            activation_bps: 0,
+            market: m.clone(),
         })
         .await;
         assert!(
@@ -3476,24 +3802,37 @@ mod tests {
         assert!((s.trailing["U_MER"].plan_sell_shares - 10.0).abs() < 1e-9);
 
         s.apply(AppEvent::RequestTrailingArm {
-            outcome:          Outcome::Up,
-            entry_price:      0.55,
+            outcome: Outcome::Up,
+            entry_price: 0.55,
             plan_sell_shares: 5.0,
-            token_id:         "U_MER".into(),
-            trail_bps:        200,
-            activation_bps:   0,
-            market:           m.clone(),
+            token_id: "U_MER".into(),
+            trail_bps: 200,
+            activation_bps: 0,
+            market: m.clone(),
         })
         .await;
         s.apply(AppEvent::Book(BookSnapshot {
             asset_id: "U_MER".into(),
-            bids:     vec![BookLevel { price: 0.56, size: 100.0 }],
-            asks:     vec![BookLevel { price: 0.58, size: 100.0 }],
+            bids: vec![BookLevel {
+                price: 0.56,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.58,
+                size: 100.0,
+            }],
         }))
         .await;
 
-        let sess = s.trailing.get("U_MER").expect("session after second promote");
-        assert!((sess.plan_sell_shares - 15.0).abs() < 1e-9, "plan={}", sess.plan_sell_shares);
+        let sess = s
+            .trailing
+            .get("U_MER")
+            .expect("session after second promote");
+        assert!(
+            (sess.plan_sell_shares - 15.0).abs() < 1e-9,
+            "plan={}",
+            sess.plan_sell_shares
+        );
     }
 
     /// CLOB book `asset_id` may be `0x…` while the armed session key is decimal — the same logical token.
@@ -3506,17 +3845,23 @@ mod tests {
         s.market = Some(m.clone());
         s.book_up = Some(Arc::new(BookSnapshot {
             asset_id: tid_hex.into(),
-            bids:     vec![BookLevel { price: 0.52, size: 100.0 }],
-            asks:     vec![BookLevel { price: 0.54, size: 100.0 }],
+            bids: vec![BookLevel {
+                price: 0.52,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.54,
+                size: 100.0,
+            }],
         }));
         s.apply(AppEvent::RequestTrailingArm {
-            outcome:          Outcome::Up,
-            entry_price:      0.50,
+            outcome: Outcome::Up,
+            entry_price: 0.50,
             plan_sell_shares: 10.0,
-            token_id:         tid_decimal.into(),
-            trail_bps:        200,
-            activation_bps:   0,
-            market:           m,
+            token_id: tid_decimal.into(),
+            trail_bps: 200,
+            activation_bps: 0,
+            market: m,
         })
         .await;
         assert!(
@@ -3525,8 +3870,14 @@ mod tests {
         );
         let b = BookSnapshot {
             asset_id: tid_hex.into(),
-            bids:     vec![BookLevel { price: 0.90, size: 10.0 }],
-            asks:     vec![BookLevel { price: 0.92, size: 10.0 }],
+            bids: vec![BookLevel {
+                price: 0.90,
+                size: 10.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.92,
+                size: 10.0,
+            }],
         };
         s.apply(AppEvent::Book(b)).await;
         let sess = s.trailing.get(tid_decimal).expect("session");
@@ -3542,72 +3893,14 @@ mod tests {
         let mut s = test_state();
         s.status_line = "New market: test".into();
         s.apply(AppEvent::PositionsLoaded {
-            position_up:         Position::default(),
-            position_down:       Position::default(),
-            fills_bootstrap:      vec![],
+            position_up: Position::default(),
+            position_down: Position::default(),
+            fills_bootstrap: vec![],
             refresh_status_line: true,
         })
         .await;
 
         assert_eq!(s.status_line, "No active CLOB positions on this market");
-    }
-
-    #[tokio::test]
-    async fn stale_detection_worker_result_is_ignored() {
-        let mut s = test_state();
-        s.detection_seq = 2;
-        let signal = BidSignal {
-            recommendation: BidRecommendation::MakerUp,
-            fair_probability: 0.80,
-            markov_probability: 0.75,
-            context_probability: 0.85,
-            market_probability: 0.60,
-            delta: 0.20,
-            expected_value: 0.20,
-            kelly_fraction: 0.20,
-            no_delta: -0.20,
-            no_expected_value: -0.20,
-            no_kelly_fraction: 0.0,
-        };
-        s.apply(AppEvent::DetectionSignalReady(crate::detection::DetectionJobResult {
-            seq: 1,
-            market_slug: None,
-            best: Some((DetectionOutcome::Up, signal)),
-        }))
-        .await;
-
-        assert!(s.detection_signal.is_none());
-    }
-
-    #[tokio::test]
-    async fn detection_prior_survives_market_roll() {
-        let mut s = test_state();
-        let m1 = test_market("UP1", "DOWN1", "0xprior1");
-        let m2 = test_market("UP2", "DOWN2", "0xprior2");
-        s.market = Some(m1.clone());
-        s.book_up = Some(Arc::new(BookSnapshot {
-            asset_id: "UP1".into(),
-            bids:     vec![BookLevel { price: 0.40, size: 100.0 }],
-            asks:     vec![BookLevel { price: 0.42, size: 100.0 }],
-        }));
-        s.record_detection_mid(Outcome::Up);
-        s.book_up = Some(Arc::new(BookSnapshot {
-            asset_id: "UP1".into(),
-            bids:     vec![BookLevel { price: 0.55, size: 100.0 }],
-            asks:     vec![BookLevel { price: 0.57, size: 100.0 }],
-        }));
-        s.record_detection_mid(Outcome::Up);
-        assert_eq!(s.detection_up_prior.total_transitions(), 1);
-
-        s.apply(AppEvent::MarketRoll {
-            market: m2,
-            buy_trail_bps: 0,
-            buy_trail_activation_bps: 0,
-        })
-        .await;
-
-        assert_eq!(s.detection_up_prior.total_transitions(), 1);
-        assert!(s.detection_up_history.is_empty());
     }
 
     #[tokio::test]
@@ -3641,8 +3934,14 @@ mod tests {
         .await;
         s.apply(AppEvent::Book(BookSnapshot {
             asset_id: "UP_DATA".into(),
-            bids: vec![BookLevel { price: 0.56, size: 10.0 }],
-            asks: vec![BookLevel { price: 0.58, size: 12.0 }],
+            bids: vec![BookLevel {
+                price: 0.56,
+                size: 10.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.58,
+                size: 12.0,
+            }],
         }))
         .await;
         s.apply(AppEvent::MarketRoll {
@@ -3652,7 +3951,10 @@ mod tests {
         })
         .await;
 
-        let sample = s.detection_completed_windows.back().expect("completed window");
+        let sample = s
+            .detection_completed_windows
+            .back()
+            .expect("completed window");
         assert_eq!(sample.asset_label, "BTC");
         assert_eq!(sample.timeframe_label, "5m");
         assert_eq!(sample.market_slug, "btc-updown-5m-old");
@@ -3668,6 +3970,54 @@ mod tests {
         assert!((sample.up_series[0].mid.unwrap() - 0.57).abs() < 1e-12);
         assert!(sample.up_series[0].rel_secs >= 0);
         assert!(sample.up_series[0].secs_to_close <= 0);
+    }
+
+    #[tokio::test]
+    async fn detection_status_uses_window_bid_decision() {
+        let mut s = test_state();
+        let now = Utc::now();
+        let mut m = test_market("UP_DECIDE", "DOWN_DECIDE", "0xdecide");
+        m.price_to_beat = Some(100.0);
+        m.opens_at = now - chrono::Duration::seconds(240);
+        m.closes_at = now + chrono::Duration::seconds(60);
+        s.apply(AppEvent::MarketRoll {
+            market: m,
+            buy_trail_bps: 0,
+            buy_trail_activation_bps: 0,
+        })
+        .await;
+        s.apply(AppEvent::Price(PriceTick {
+            price: 101.0,
+            timestamp_ms: now.timestamp_millis() as u64,
+        }))
+        .await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_DECIDE".into(),
+            bids: vec![BookLevel {
+                price: 0.56,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.60,
+                size: 80.0,
+            }],
+        }))
+        .await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "DOWN_DECIDE".into(),
+            bids: vec![BookLevel {
+                price: 0.36,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.40,
+                size: 80.0,
+            }],
+        }))
+        .await;
+
+        let line = s.detection_status_line();
+        assert!(line.contains("UP BID @ 0.57"), "{line}");
     }
 
     #[tokio::test]
@@ -3688,12 +4038,17 @@ mod tests {
         .await;
         s.apply(AppEvent::Book(BookSnapshot {
             asset_id: "UP_OFF".into(),
-            bids: vec![BookLevel { price: 0.51, size: 10.0 }],
-            asks: vec![BookLevel { price: 0.53, size: 10.0 }],
+            bids: vec![BookLevel {
+                price: 0.51,
+                size: 10.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.53,
+                size: 10.0,
+            }],
         }))
         .await;
 
-        assert!(s.take_detection_job().is_none());
         assert!(s.detection_current_window.is_none());
         assert!(s.detection_status_line().is_empty());
     }
@@ -3708,25 +4063,31 @@ mod tests {
         s.market = Some(m.clone());
         s.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "UPL".into(),
-            bids:     vec![BookLevel { price: 0.52, size: 100.0 }],
-            asks:     vec![BookLevel { price: 0.54, size: 100.0 }],
+            bids: vec![BookLevel {
+                price: 0.52,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.54,
+                size: 100.0,
+            }],
         }));
         s.position_up = Position::default();
         s.apply(AppEvent::RequestTrailingArm {
-            outcome:          Outcome::Up,
-            entry_price:      0.50,
+            outcome: Outcome::Up,
+            entry_price: 0.50,
             plan_sell_shares: 8.0,
-            token_id:         "UPL".into(),
-            trail_bps:        200,
-            activation_bps:   0,
-            market:           m.clone(),
+            token_id: "UPL".into(),
+            trail_bps: 200,
+            activation_bps: 0,
+            market: m.clone(),
         })
         .await;
         assert!(s.trailing.contains_key("UPL"));
         s.apply(AppEvent::PositionsLoaded {
-            position_up:         Position::default(),
-            position_down:       Position::default(),
-            fills_bootstrap:      vec![],
+            position_up: Position::default(),
+            position_down: Position::default(),
+            fills_bootstrap: vec![],
             refresh_status_line: false,
         })
         .await;
@@ -3746,11 +4107,20 @@ mod tests {
         s.buy_trail_activation_bps = 10_000;
         s.book_up = Some(Arc::new(BookSnapshot {
             asset_id: "RH1".into(),
-            bids:     vec![BookLevel { price: 0.60, size: 100.0 }],
-            asks:     vec![BookLevel { price: 0.62, size: 100.0 }],
+            bids: vec![BookLevel {
+                price: 0.60,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.62,
+                size: 100.0,
+            }],
         }));
         s.apply(AppEvent::PositionsLoaded {
-            position_up:   Position { shares: 10.0, avg_entry: 0.55 },
+            position_up: Position {
+                shares: 10.0,
+                avg_entry: 0.55,
+            },
             position_down: Position::default(),
             fills_bootstrap: vec![],
             refresh_status_line: false,

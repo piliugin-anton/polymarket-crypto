@@ -89,7 +89,10 @@ fn build_sdk_config() -> Result<Config> {
 }
 
 /// Same outer loop as RTDS: wait for symbol, connect, reconnect on failure or symbol change.
-pub fn spawn(tx: mpsc::Sender<PriceTick>, mut symbol_rx: watch::Receiver<String>) -> tokio::task::JoinHandle<()> {
+pub fn spawn(
+    tx: mpsc::Sender<PriceTick>,
+    mut symbol_rx: watch::Receiver<String>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             if symbol_rx.borrow().is_empty() {
@@ -129,7 +132,10 @@ async fn run_once(
     let mut stream = Stream::new(&cfg, vec![feed_id])
         .await
         .context("Data Streams Stream::new")?;
-    stream.listen().await.context("Data Streams listen (WS handshake)")?;
+    stream
+        .listen()
+        .await
+        .context("Data Streams listen (WS handshake)")?;
 
     loop {
         tokio::select! {

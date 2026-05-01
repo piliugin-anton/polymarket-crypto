@@ -26,8 +26,16 @@ pub fn consolidate_tp_want_shares(
     had_resting_sells: bool,
 ) -> f64 {
     if had_resting_sells {
-        let old = if sell_rem_pre.is_finite() { sell_rem_pre.max(0.0) } else { 0.0 };
-        let new = if buy_ack_qty.is_finite() { buy_ack_qty.max(0.0) } else { 0.0 };
+        let old = if sell_rem_pre.is_finite() {
+            sell_rem_pre.max(0.0)
+        } else {
+            0.0
+        };
+        let new = if buy_ack_qty.is_finite() {
+            buy_ack_qty.max(0.0)
+        } else {
+            0.0
+        };
         old + new
     } else {
         let mut want = if position_shares.is_finite() {
@@ -175,10 +183,7 @@ mod tests {
     fn outcomes_two_sells_up_triggers_merge() {
         let up = "111";
         let down = "222";
-        let rows = vec![
-            sell_row("1", up, "5", "0"),
-            sell_row("2", up, "7", "0"),
-        ];
+        let rows = vec![sell_row("1", up, "5", "0"), sell_row("2", up, "7", "0")];
         assert_eq!(
             outcomes_with_duplicate_resting_sells(&rows, up, down),
             vec![Outcome::Up]

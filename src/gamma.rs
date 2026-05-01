@@ -35,9 +35,7 @@ use url::Url;
 use chrono_tz::America::New_York;
 
 use crate::config::{GAMMA_HOST, POLYMARKET_CRYPTO_PRICE_URL};
-use crate::market_profile::{
-    build_daily_event_slug, MarketProfile, Timeframe, CRYPTO_ASSETS,
-};
+use crate::market_profile::{build_daily_event_slug, MarketProfile, Timeframe, CRYPTO_ASSETS};
 
 /// Five-minute window length in seconds (matches Polymarket BTC 5m slugs).
 pub const BTC_5M_WINDOW_SEC: i64 = 300;
@@ -62,19 +60,19 @@ fn gamma_tick_f64_to_string(v: f64) -> String {
 #[derive(Debug, Clone)]
 pub struct ActiveMarket {
     #[allow(dead_code)]
-    pub condition_id:   String,
-    pub question:       String,
-    pub slug:           String,
-    pub up_token_id:    String,
-    pub down_token_id:  String,
-    pub tick_size:      String,   // e.g. "0.01" — CLOB rounding (`ROUNDING_CONFIG`)
-    pub neg_risk:       bool,
-    pub price_to_beat:  Option<f64>, // Polymarket crypto-price API, else description, else RTDS latch in app
-    pub opens_at:       DateTime<Utc>,
-    pub closes_at:      DateTime<Utc>,
+    pub condition_id: String,
+    pub question: String,
+    pub slug: String,
+    pub up_token_id: String,
+    pub down_token_id: String,
+    pub tick_size: String, // e.g. "0.01" — CLOB rounding (`ROUNDING_CONFIG`)
+    pub neg_risk: bool,
+    pub price_to_beat: Option<f64>, // Polymarket crypto-price API, else description, else RTDS latch in app
+    pub opens_at: DateTime<Utc>,
+    pub closes_at: DateTime<Utc>,
     /// UTC `Z` strings passed as `eventStartTime` / `endDate` to Polymarket crypto-price (debug / TUI).
     pub crypto_price_query_start_utc: String,
-    pub crypto_price_query_end_utc:   String,
+    pub crypto_price_query_end_utc: String,
 }
 
 /// Signed CLOB `expiration` (UTC unix seconds) for a **GTD** limit that should stop resting at
@@ -92,7 +90,9 @@ pub fn clob_gtd_expiration_secs_at_window_end(window_end: DateTime<Utc>) -> Resu
         .timestamp()
         .checked_add(60)
         .filter(|&s| s > now.timestamp())
-        .ok_or_else(|| anyhow!("could not compute Polymarket GTD expiration (time overflow or past)"))?;
+        .ok_or_else(|| {
+            anyhow!("could not compute Polymarket GTD expiration (time overflow or past)")
+        })?;
     Ok(signed as u64)
 }
 
@@ -104,12 +104,14 @@ pub fn clob_gtd_expiration_secs_at_window_end(window_end: DateTime<Utc>) -> Resu
 struct RawEvent {
     #[serde(default)]
     #[allow(dead_code)]
-    title:     String,
+    title: String,
     #[serde(default)]
     #[allow(dead_code)]
-    slug:      String,
-    #[serde(default, rename = "startDate")] start_date: Option<String>,
-    #[serde(default, rename = "endDate")]   end_date:   Option<String>,
+    slug: String,
+    #[serde(default, rename = "startDate")]
+    start_date: Option<String>,
+    #[serde(default, rename = "endDate")]
+    end_date: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     markets: Vec<RawMarket>,
@@ -123,20 +125,32 @@ struct CryptoPriceResponse {
 
 #[derive(Debug, Deserialize)]
 struct RawMarket {
-    #[serde(rename = "conditionId")] condition_id: String,
-    #[serde(default)] question: String,
-    #[serde(default)] slug:     String,
+    #[serde(rename = "conditionId")]
+    condition_id: String,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    slug: String,
     /// Newline-separated JSON array `["tokenIdUp","tokenIdDown"]`.
-    #[serde(default, rename = "clobTokenIds")] clob_token_ids: String,
-    #[serde(default)] outcomes:       String, // e.g. `["Up","Down"]`
-    #[serde(default, rename = "orderPriceMinTickSize")] tick_size_f: Option<f64>,
-    #[serde(default, rename = "negRisk")] neg_risk: bool,
-    #[serde(default)] description:    String,
-    #[serde(default, rename = "startDate")] start_date: Option<String>,
-    #[serde(default, rename = "endDate")]   end_date:   Option<String>,
+    #[serde(default, rename = "clobTokenIds")]
+    clob_token_ids: String,
+    #[serde(default)]
+    outcomes: String, // e.g. `["Up","Down"]`
+    #[serde(default, rename = "orderPriceMinTickSize")]
+    tick_size_f: Option<f64>,
+    #[serde(default, rename = "negRisk")]
+    neg_risk: bool,
+    #[serde(default)]
+    description: String,
+    #[serde(default, rename = "startDate")]
+    start_date: Option<String>,
+    #[serde(default, rename = "endDate")]
+    end_date: Option<String>,
     /// Trading-window start on slug responses (preferred over `startDate` when present).
-    #[serde(default, rename = "eventStartTime")] event_start_time: Option<String>,
-    #[serde(default)] closed: bool,
+    #[serde(default, rename = "eventStartTime")]
+    event_start_time: Option<String>,
+    #[serde(default)]
+    closed: bool,
 }
 
 pub struct GammaClient {
@@ -154,7 +168,7 @@ impl GammaClient {
     #[allow(dead_code)]
     pub async fn find_current_btc_5m(&self) -> Result<ActiveMarket> {
         let p = MarketProfile {
-            asset:     CRYPTO_ASSETS[0].clone(),
+            asset: CRYPTO_ASSETS[0].clone(),
             timeframe: Timeframe::M5,
         };
         self.find_current_updown(&p).await
@@ -183,7 +197,9 @@ impl GammaClient {
         let mut candidates: Vec<RawMarket> = Vec::new();
         for off in [0, step, -step, 2 * step, -2 * step] {
             let ts = base + off;
-            let Some(slug) = profile.rolling_slug_for_window_start(ts) else { continue; };
+            let Some(slug) = profile.rolling_slug_for_window_start(ts) else {
+                continue;
+            };
             let url = format!("{GAMMA_HOST}/markets/slug/{slug}");
             debug!(%url, "gamma: fetch market by slug");
 
@@ -226,15 +242,18 @@ impl GammaClient {
         let market = candidates
             .iter()
             .find(|m| {
-                match (gamma_market_window_start(m), parse_ts(m.end_date.as_deref())) {
+                match (
+                    gamma_market_window_start(m),
+                    parse_ts(m.end_date.as_deref()),
+                ) {
                     (Some(s), Some(c)) => s <= now && now < c,
                     _ => false,
                 }
             })
             .or_else(|| {
-                candidates.iter().find(|m| {
-                    gamma_market_window_start(m).is_some_and(|s| s >= now)
-                })
+                candidates
+                    .iter()
+                    .find(|m| gamma_market_window_start(m).is_some_and(|s| s >= now))
             })
             .ok_or_else(|| {
                 anyhow!(
@@ -244,7 +263,8 @@ impl GammaClient {
                 )
             })?;
 
-        self.active_market_from_raw_with_crypto(market, profile).await
+        self.active_market_from_raw_with_crypto(market, profile)
+            .await
     }
 
     /// `GET /markets/slug/…-updown-…- {window_start_ts}` — for fast roll polling.
@@ -252,7 +272,7 @@ impl GammaClient {
     pub async fn try_fetch_rolling_by_window_start_ts(
         &self,
         window_start_ts: i64,
-        profile:         &MarketProfile,
+        profile: &MarketProfile,
     ) -> Result<Option<ActiveMarket>> {
         if !profile.is_rolling() {
             bail!("not a rolling profile");
@@ -285,7 +305,9 @@ impl GammaClient {
             return Ok(None);
         }
 
-        self.active_market_from_raw_with_crypto(&m, profile).await.map(Some)
+        self.active_market_from_raw_with_crypto(&m, profile)
+            .await
+            .map(Some)
     }
 
     /// Calendar-day markets in ET: `bitcoin-up-or-down-on-april-22-2026` etc.
@@ -303,13 +325,15 @@ impl GammaClient {
             }
             d += chrono::Duration::days(1);
         }
-        anyhow::bail!("no open daily up/down market (tried a few days from {today} for this asset)");
+        anyhow::bail!(
+            "no open daily up/down market (tried a few days from {today} for this asset)"
+        );
     }
 
     /// Next calendar day in ET after the previous market's end — poll for the next `…-on-mmm-d-yyyy` slug.
     pub async fn try_fetch_next_daily_by_previous_close(
         &self,
-        profile:             &MarketProfile,
+        profile: &MarketProfile,
         last_window_end_utc: DateTime<Utc>,
     ) -> Result<Option<ActiveMarket>> {
         if profile.timeframe != Timeframe::D1 {
@@ -321,7 +345,10 @@ impl GammaClient {
             let d = start_date + chrono::Duration::days(add);
             let slug = build_daily_event_slug(profile.asset.daily_event_prefix, d);
             if let Some(m) = self.fetch_open_raw_market_by_slug(&slug).await? {
-                return self.active_market_from_raw_with_crypto(&m, profile).await.map(Some);
+                return self
+                    .active_market_from_raw_with_crypto(&m, profile)
+                    .await
+                    .map(Some);
             }
         }
         Ok(None)
@@ -352,7 +379,7 @@ impl GammaClient {
 
     async fn active_market_from_raw_with_crypto(
         &self,
-        market:  &RawMarket,
+        market: &RawMarket,
         profile: &MarketProfile,
     ) -> Result<ActiveMarket> {
         let mut m = active_market_from_raw_market(market, None)?;
@@ -384,10 +411,10 @@ impl GammaClient {
     /// `GET /api/crypto/crypto-price` — `openPrice` for the window.
     async fn fetch_polymarket_open_price(
         &self,
-        symbol:        &str,
-        event_start:   &str,
-        end_date:      &str,
-        variant:       &str,
+        symbol: &str,
+        event_start: &str,
+        end_date: &str,
+        variant: &str,
     ) -> Option<f64> {
         let mut u = Url::parse(POLYMARKET_CRYPTO_PRICE_URL).expect("POLYMARKET_CRYPTO_PRICE_URL");
         u.query_pairs_mut()
@@ -395,7 +422,10 @@ impl GammaClient {
             .append_pair("eventStartTime", event_start)
             .append_pair("variant", variant)
             .append_pair("endDate", end_date);
-        let res = self.http.get(u.as_str()).send()
+        let res = self
+            .http
+            .get(u.as_str())
+            .send()
             .await
             .map_err(|e| {
                 debug!(error = %e, url = %u, "polymarket crypto-price request failed");
@@ -412,10 +442,14 @@ impl GammaClient {
             return None;
         }
 
-        let body: CryptoPriceResponse = res.json().await.map_err(|e| {
-            debug!(error = %e, "polymarket crypto-price decode failed");
-            e
-        }).ok()?;
+        let body: CryptoPriceResponse = res
+            .json()
+            .await
+            .map_err(|e| {
+                debug!(error = %e, "polymarket crypto-price decode failed");
+                e
+            })
+            .ok()?;
 
         if let Some(p) = body.open_price {
             debug!(
@@ -437,9 +471,9 @@ fn format_crypto_price_query_time(utc: DateTime<Utc>) -> String {
 
 /// Rolling windows: prefer slug tail `{prefix}-updown-{5m|15m}-{unix}`; else floor `opens_at` to the step grid.
 fn utc_rolling_window_bounds(
-    slug:     &str,
+    slug: &str,
     opens_at: DateTime<Utc>,
-    profile:  &MarketProfile,
+    profile: &MarketProfile,
 ) -> (DateTime<Utc>, DateTime<Utc>) {
     let step = profile
         .timeframe
@@ -470,18 +504,17 @@ fn floor_utc_to_step(t: DateTime<Utc>, step: i64) -> DateTime<Utc> {
 
 /// Earliest usable window start for filtering `/markets/slug` rows.
 fn gamma_market_window_start(m: &RawMarket) -> Option<DateTime<Utc>> {
-    parse_ts(m.event_start_time.as_deref())
-        .or_else(|| parse_ts(m.start_date.as_deref()))
+    parse_ts(m.event_start_time.as_deref()).or_else(|| parse_ts(m.start_date.as_deref()))
 }
 
 fn active_market_from_raw_market(m: &RawMarket, event: Option<&RawEvent>) -> Result<ActiveMarket> {
-    let token_ids: Vec<String> = serde_json::from_str(&m.clob_token_ids)
-        .context("parsing clobTokenIds")?;
+    let token_ids: Vec<String> =
+        serde_json::from_str(&m.clob_token_ids).context("parsing clobTokenIds")?;
     if token_ids.len() < 2 {
         return Err(anyhow!("expected 2 token ids, got {}", token_ids.len()));
     }
-    let outcomes: Vec<String> = serde_json::from_str(&m.outcomes)
-        .unwrap_or_else(|_| vec!["Up".into(), "Down".into()]);
+    let outcomes: Vec<String> =
+        serde_json::from_str(&m.outcomes).unwrap_or_else(|_| vec!["Up".into(), "Down".into()]);
 
     let (u0, d0) = if outcomes
         .first()
@@ -496,7 +529,7 @@ fn active_market_from_raw_market(m: &RawMarket, event: Option<&RawEvent>) -> Res
     let down_token_id = canonical_clob_token_id(d0).into_owned();
 
     let price_to_beat = extract_price_to_beat(&m.description); // overridden in find_current_btc_5m when API returns openPrice
-    // Canonical tick strings for `ROUNDING_CONFIG` parity (avoid `0.001 → "0.00"` with `:.2`).
+                                                               // Canonical tick strings for `ROUNDING_CONFIG` parity (avoid `0.001 → "0.00"` with `:.2`).
     let tick_size = match m.tick_size_f {
         Some(v) if (v - 0.1).abs() < 1e-6 => "0.1".into(),
         Some(v) if (v - 0.01).abs() < 1e-7 => "0.01".into(),
@@ -516,22 +549,24 @@ fn active_market_from_raw_market(m: &RawMarket, event: Option<&RawEvent>) -> Res
 
     Ok(ActiveMarket {
         condition_id: m.condition_id.clone(),
-        question:     m.question.clone(),
-        slug:         m.slug.clone(),
+        question: m.question.clone(),
+        slug: m.slug.clone(),
         up_token_id,
         down_token_id,
         tick_size,
-        neg_risk:    m.neg_risk,
+        neg_risk: m.neg_risk,
         price_to_beat,
         opens_at,
         closes_at,
         crypto_price_query_start_utc: String::new(),
-        crypto_price_query_end_utc:   String::new(),
+        crypto_price_query_end_utc: String::new(),
     })
 }
 
 impl Default for GammaClient {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_ts(s: Option<&str>) -> Option<DateTime<Utc>> {

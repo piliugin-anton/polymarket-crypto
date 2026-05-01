@@ -94,8 +94,7 @@ pub async fn fetch_svm_deposit_address(
     if !status.is_success() {
         anyhow::bail!("bridge deposit HTTP {status}: {text}");
     }
-    let parsed: DepositResponse =
-        serde_json::from_str(&text).context("bridge deposit JSON")?;
+    let parsed: DepositResponse = serde_json::from_str(&text).context("bridge deposit JSON")?;
     let svm = parsed.address.svm.trim().to_string();
     if svm.is_empty() {
         anyhow::bail!("bridge deposit: empty svm address");

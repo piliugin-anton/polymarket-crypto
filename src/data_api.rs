@@ -39,7 +39,8 @@ pub struct DataPosition {
     #[serde(default, rename = "avgPrice")]
     pub avg_price: f64,
     #[serde(rename = "outcomeIndex", default)]
-    #[allow(dead_code)] // deserialized from API; redeem uses adapters that read balances on-chain
+    #[allow(dead_code)]
+    // deserialized from API; redeem uses adapters that read balances on-chain
     pub outcome_index: u32,
     #[serde(rename = "negativeRisk", default)]
     pub negative_risk: bool,
@@ -68,11 +69,19 @@ pub async fn fetch_redeemable_positions(
         let url = format!(
             "{DATA_API_HOST}/positions?user={user:#x}&limit={POSITIONS_PAGE}&offset={offset}&redeemable=true&sizeThreshold=0",
         );
-        let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+        let resp = http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
         let txt = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("data-api GET /positions failed: {} — {}", status, txt.trim());
+            anyhow::bail!(
+                "data-api GET /positions failed: {} — {}",
+                status,
+                txt.trim()
+            );
         }
         let batch: Vec<DataPosition> = serde_json::from_str(&txt)
             .with_context(|| format!("decode /positions: {}", txt.trim()))?;
@@ -108,11 +117,19 @@ pub async fn fetch_positions_for_market(
     let url = format!(
         "{DATA_API_HOST}/positions?user={user:#x}&market={market_condition_id}&sizeThreshold=0&limit=500",
     );
-    let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     let txt = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("data-api GET /positions (market) failed: {} — {}", status, txt.trim());
+        anyhow::bail!(
+            "data-api GET /positions (market) failed: {} — {}",
+            status,
+            txt.trim()
+        );
     }
     let batch: Vec<DataPosition> = serde_json::from_str(&txt)
         .with_context(|| format!("decode /positions (market): {}", txt.trim()))?;
@@ -153,7 +170,7 @@ pub const HOLDERS_REQUEST_LIMIT: u32 = 5;
 
 #[derive(Debug, Clone, Deserialize)]
 struct MetaHolder {
-    token:   String,
+    token: String,
     holders: Vec<HolderRow>,
 }
 
@@ -162,7 +179,7 @@ struct HolderRow {
     #[serde(default, rename = "proxyWallet")]
     proxy_wallet: String,
     #[serde(default)]
-    amount:         f64,
+    amount: f64,
 }
 
 /// `GET /holders?...&limit=[`HOLDERS_REQUEST_LIMIT`]` — sentiment sums with **per-wallet** netting:
@@ -178,10 +195,13 @@ pub async fn fetch_top_holders_amount_sums(
 
     let url = format!(
         "{DATA_API_HOST}/holders?market={}&limit={}",
-        market_condition_id,
-        HOLDERS_REQUEST_LIMIT
+        market_condition_id, HOLDERS_REQUEST_LIMIT
     );
-    let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     let txt = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -194,11 +214,19 @@ pub async fn fetch_top_holders_amount_sums(
     let mut by_wallet_down: HashMap<String, f64> = HashMap::new();
     for block in &meta {
         let is_up = clob_asset_ids_match(&block.token, up_token_id);
-        let is_down = if is_up { false } else { clob_asset_ids_match(&block.token, down_token_id) };
+        let is_down = if is_up {
+            false
+        } else {
+            clob_asset_ids_match(&block.token, down_token_id)
+        };
         if !is_up && !is_down {
             continue;
         }
-        let side = if is_up { &mut by_wallet_up } else { &mut by_wallet_down };
+        let side = if is_up {
+            &mut by_wallet_up
+        } else {
+            &mut by_wallet_down
+        };
         for h in &block.holders {
             if !h.amount.is_finite() || h.amount < 0.0 {
                 continue;

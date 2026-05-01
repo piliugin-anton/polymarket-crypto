@@ -109,12 +109,7 @@ pub struct TrailingStop {
 }
 
 impl TrailingStop {
-    pub fn new(
-        side: Side,
-        entry_price: f64,
-        spec: TrailSpec,
-        activation: Activation,
-    ) -> Self {
+    pub fn new(side: Side, entry_price: f64, spec: TrailSpec, activation: Activation) -> Self {
         let best = to_tick(entry_price);
         let (initial_best, initial_stop) = if matches!(activation, Activation::Immediate) {
             let s = Self::stop_tick_for_best(side, &spec, best);
@@ -236,12 +231,7 @@ impl TrailingStop {
             }
             if self
                 .best_tick
-                .compare_exchange_weak(
-                    best,
-                    price_tick,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange_weak(best, price_tick, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 let candidate = Self::stop_tick_for_best(self.side, &self.spec, price_tick);
@@ -254,12 +244,7 @@ impl TrailingStop {
                     }
                     if self
                         .stop_tick
-                        .compare_exchange_weak(
-                            cur,
-                            candidate,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
+                        .compare_exchange_weak(cur, candidate, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
                         new_stop = Some(candidate);
@@ -300,19 +285,35 @@ impl TrailingStop {
         }
     }
 
-    pub fn side(&self) -> Side { self.side }
-    pub fn entry_price(&self) -> f64 { self.entry_price }
+    pub fn side(&self) -> Side {
+        self.side
+    }
+    pub fn entry_price(&self) -> f64 {
+        self.entry_price
+    }
 
     pub fn stop_price(&self) -> Option<f64> {
         let t = self.stop_tick.load(Ordering::Acquire);
-        if t == UNSET { None } else { Some(from_tick(t)) }
+        if t == UNSET {
+            None
+        } else {
+            Some(from_tick(t))
+        }
     }
     pub fn best_price(&self) -> Option<f64> {
         let t = self.best_tick.load(Ordering::Acquire);
-        if t == UNSET { None } else { Some(from_tick(t)) }
+        if t == UNSET {
+            None
+        } else {
+            Some(from_tick(t))
+        }
     }
-    pub fn is_armed(&self) -> bool { self.armed.load(Ordering::Acquire) }
-    pub fn is_triggered(&self) -> bool { self.triggered.load(Ordering::Acquire) }
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+    pub fn is_triggered(&self) -> bool {
+        self.triggered.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
@@ -321,7 +322,11 @@ mod tests {
 
     /// Expected `stop_price` when `best` prints at `at_price` (0.01 grid).
     fn want_stop_at(side: Side, spec: TrailSpec, at_price: f64) -> f64 {
-        from_tick(TrailingStop::stop_tick_for_best(side, &spec, to_tick(at_price)))
+        from_tick(TrailingStop::stop_tick_for_best(
+            side,
+            &spec,
+            to_tick(at_price),
+        ))
     }
 
     fn approx_eq(a: f64, b: f64) -> bool {
@@ -428,7 +433,10 @@ mod tests {
         );
         // Gap straight through the stop.
         match ts.on_price(95.0) {
-            TickOutcome::Triggered { trigger_price, stop_price } => {
+            TickOutcome::Triggered {
+                trigger_price,
+                stop_price,
+            } => {
                 assert!(approx_eq(trigger_price, 95.0));
                 assert!(approx_eq(stop_price, 98.0));
             }
@@ -461,7 +469,12 @@ mod tests {
         match ts.on_price(peak) {
             TickOutcome::Trailed { new_stop } => {
                 let want = want_stop_at(Side::Long, TrailSpec::Percent(pct), peak);
-                assert!(approx_eq_frac(new_stop, want), "got {} want {}", new_stop, want);
+                assert!(
+                    approx_eq_frac(new_stop, want),
+                    "got {} want {}",
+                    new_stop,
+                    want
+                );
             }
             o => panic!("expected Trailed, got {:?}", o),
         }
@@ -482,7 +495,10 @@ mod tests {
         let breach = 0.64;
         assert!(breach < new_stop);
         match ts.on_price(breach) {
-            TickOutcome::Triggered { trigger_price, stop_price } => {
+            TickOutcome::Triggered {
+                trigger_price,
+                stop_price,
+            } => {
                 assert!(approx_eq_frac(trigger_price, breach));
                 assert!(approx_eq_frac(stop_price, new_stop));
             }
@@ -612,11 +628,7 @@ mod tests {
         assert!(entry - arm_price > need - 1e-12);
         match ts.on_price(arm_price) {
             TickOutcome::Armed { stop_price } => {
-                let want = want_stop_at(
-                    Side::Short,
-                    TrailSpec::Absolute(0.015),
-                    arm_price,
-                );
+                let want = want_stop_at(Side::Short, TrailSpec::Absolute(0.015), arm_price);
                 assert!(approx_eq_frac(stop_price, want));
             }
             o => panic!("expected Armed, got {:?}", o),
@@ -635,7 +647,10 @@ mod tests {
         );
         let want_stop = entry - abs;
         match ts.on_price(0.02) {
-            TickOutcome::Triggered { trigger_price, stop_price } => {
+            TickOutcome::Triggered {
+                trigger_price,
+                stop_price,
+            } => {
                 assert!(approx_eq_frac(trigger_price, 0.02));
                 assert!(approx_eq_frac(stop_price, want_stop));
             }
@@ -655,7 +670,10 @@ mod tests {
         );
         let want_stop = entry + abs;
         match ts.on_price(0.97) {
-            TickOutcome::Triggered { trigger_price, stop_price } => {
+            TickOutcome::Triggered {
+                trigger_price,
+                stop_price,
+            } => {
                 assert!(approx_eq_frac(trigger_price, 0.97));
                 assert!(approx_eq_frac(stop_price, want_stop));
             }

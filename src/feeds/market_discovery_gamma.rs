@@ -7,9 +7,9 @@
 //! day and poll that slug at 1 Hz.
 //! [`GammaClient`] is behind [`tokio::sync::Mutex`] so only one Gamma request runs at a time.
 
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
-use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{info, warn};
 
@@ -26,16 +26,18 @@ const PRICE_TO_BEAT_EPS_USD: f64 = 0.5;
 fn price_to_beat_close(a: Option<f64>, b: Option<f64>) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(x), Some(y)) if x.is_finite() && y.is_finite() => (x - y).abs() <= PRICE_TO_BEAT_EPS_USD,
+        (Some(x), Some(y)) if x.is_finite() && y.is_finite() => {
+            (x - y).abs() <= PRICE_TO_BEAT_EPS_USD
+        }
         _ => false,
     }
 }
 
 async fn apply_resolved_market(
-    m:            gamma::ActiveMarket,
+    m: gamma::ActiveMarket,
     last_emitted: &mut Option<(String, Option<f64>)>,
-    market_tx:    &mpsc::Sender<gamma::ActiveMarket>,
-    app_tx:       &mpsc::Sender<AppEvent>,
+    market_tx: &mpsc::Sender<gamma::ActiveMarket>,
+    app_tx: &mpsc::Sender<AppEvent>,
 ) -> bool {
     let key = (m.slug.clone(), m.price_to_beat);
     let full_roll = match last_emitted {
@@ -53,10 +55,9 @@ async fn apply_resolved_market(
         return true;
     }
 
-    if last_emitted
-        .as_ref()
-        .is_some_and(|(s, p)| s.as_str() == m.slug.as_str() && price_to_beat_close(*p, m.price_to_beat))
-    {
+    if last_emitted.as_ref().is_some_and(|(s, p)| {
+        s.as_str() == m.slug.as_str() && price_to_beat_close(*p, m.price_to_beat)
+    }) {
         return true;
     }
 
@@ -78,12 +79,12 @@ async fn apply_resolved_market(
 }
 
 async fn try_roll_market(
-    gamma:           &Mutex<GammaClient>,
-    tx:              &mpsc::Sender<AppEvent>,
-    market_tx:       &mpsc::Sender<gamma::ActiveMarket>,
-    last_emitted:    &mut Option<(String, Option<f64>)>,
+    gamma: &Mutex<GammaClient>,
+    tx: &mpsc::Sender<AppEvent>,
+    market_tx: &mpsc::Sender<gamma::ActiveMarket>,
+    last_emitted: &mut Option<(String, Option<f64>)>,
     last_window_end: &mut Option<DateTime<Utc>>,
-    profile:         &MarketProfile,
+    profile: &MarketProfile,
 ) -> bool {
     let after_close = last_window_end.is_some_and(|end| Utc::now() >= end);
 
@@ -108,9 +109,7 @@ async fn try_roll_market(
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                         Err(e) => {
-                            let _ = tx
-                                .send(AppEvent::OrderErr(format!("gamma: {e}")))
-                                .await;
+                            let _ = tx.send(AppEvent::OrderErr(format!("gamma: {e}"))).await;
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
@@ -132,9 +131,7 @@ async fn try_roll_market(
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                         Err(e) => {
-                            let _ = tx
-                                .send(AppEvent::OrderErr(format!("gamma: {e}")))
-                                .await;
+                            let _ = tx.send(AppEvent::OrderErr(format!("gamma: {e}"))).await;
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
@@ -154,18 +151,13 @@ async fn try_roll_market(
             apply_resolved_market(m, last_emitted, market_tx, tx).await
         }
         Err(e) => {
-            let _ = tx
-                .send(AppEvent::OrderErr(format!("gamma: {e}")))
-                .await;
+            let _ = tx.send(AppEvent::OrderErr(format!("gamma: {e}"))).await;
             true
         }
     }
 }
 
-fn poll_delay_after_tick(
-    last_window_end: Option<DateTime<Utc>>,
-    in_window_secs: u64,
-) -> Duration {
+fn poll_delay_after_tick(last_window_end: Option<DateTime<Utc>>, in_window_secs: u64) -> Duration {
     let now = Utc::now();
     let Some(end) = last_window_end else {
         return Duration::from_secs(in_window_secs);
@@ -173,9 +165,7 @@ fn poll_delay_after_tick(
     if now >= end {
         return Duration::ZERO;
     }
-    let until_close = (end - now)
-        .to_std()
-        .unwrap_or(Duration::ZERO);
+    let until_close = (end - now).to_std().unwrap_or(Duration::ZERO);
     let regular = Duration::from_secs(in_window_secs);
     std::cmp::min(until_close, regular)
 }
@@ -183,8 +173,8 @@ fn poll_delay_after_tick(
 /// `profile_rx` tracks the wizard’s current [`MarketProfile`] (asset + timeframe). Each
 /// `StartTrading` updates the watch so switching 5m ↔ 15m re-runs Gamma against the new grid.
 pub fn spawn(
-    tx:         mpsc::Sender<AppEvent>,
-    market_tx:  mpsc::Sender<gamma::ActiveMarket>,
+    tx: mpsc::Sender<AppEvent>,
+    market_tx: mpsc::Sender<gamma::ActiveMarket>,
     mut profile_rx: watch::Receiver<Arc<MarketProfile>>,
 ) {
     tokio::spawn(async move {

@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
-use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome, UiPhase, MIN_LIMIT_ORDER_SHARES};
+use crate::app::{
+    AppState, DepositModalPhase, InputMode, LimitField, Outcome, UiPhase, MIN_LIMIT_ORDER_SHARES,
+};
 use crate::market_profile::{MarketProfile, Timeframe};
 use crate::trading::Side;
 
@@ -16,9 +18,18 @@ pub enum Action {
     None,
     Quit,
     /// Market: USDC notional (BUY spend). SELL dumps full tracked position; USDC only if position is 0.
-    PlaceMarket { outcome: Outcome, side: Side, size_usdc: f64 },
+    PlaceMarket {
+        outcome: Outcome,
+        side: Side,
+        size_usdc: f64,
+    },
     /// Limit: BUY size = USDC notional; SELL size = **shares**.
-    PlaceLimit  { outcome: Outcome, side: Side, price: f64, size_usdc: f64 },
+    PlaceLimit {
+        outcome: Outcome,
+        side: Side,
+        price: f64,
+        size_usdc: f64,
+    },
     CancelAll,
     ForceMarketRoll,
     /// Hint for claiming resolved positions (Data API claimable positive). Redeem is on-chain / Portfolio, not CLOB HTTP.
@@ -62,7 +73,9 @@ fn normalize_terminal_key_event(k: KeyEvent) -> KeyEvent {
 pub fn handle_key(state: &mut AppState, k: KeyEvent) -> Action {
     let k = normalize_terminal_key_event(k);
     // Ctrl-C / Ctrl-Q always quits
-    if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('q')) {
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('q'))
+    {
         return Action::Quit;
     }
 
@@ -75,16 +88,24 @@ pub fn handle_key(state: &mut AppState, k: KeyEvent) -> Action {
     }
 
     match state.input_mode {
-        InputMode::Normal    => normal_mode(state, k),
-        InputMode::EditSize  => edit_size_mode(state, k),
-        InputMode::LimitModal { outcome, side, field } => limit_mode(state, k, outcome, side, field),
+        InputMode::Normal => normal_mode(state, k),
+        InputMode::EditSize => edit_size_mode(state, k),
+        InputMode::LimitModal {
+            outcome,
+            side,
+            field,
+        } => limit_mode(state, k, outcome, side, field),
     }
 }
 
 /// Leave the trading screen and show the wizard’s 5m / 15m time-window list for the current asset.
 fn go_to_wizard_timeframe(state: &mut AppState) {
     if let Some(ref profile) = state.market_profile {
-        if let Some(i) = state.wizard_rows.iter().position(|r| r.asset == profile.asset) {
+        if let Some(i) = state
+            .wizard_rows
+            .iter()
+            .position(|r| r.asset == profile.asset)
+        {
             state.wizard_list_idx = i;
         }
         state.wizard_tf_idx = match profile.timeframe {
@@ -111,10 +132,26 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
             Action::None
         }
         // Quick market: WASD-style — W/S buy UP/DOWN, A/D sell UP/DOWN
-        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'w') => Action::PlaceMarket { outcome: Outcome::Up,   side: Side::Buy,  size_usdc: size },
-        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => Action::PlaceMarket { outcome: Outcome::Down, side: Side::Buy,  size_usdc: size },
-        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'a') => Action::PlaceMarket { outcome: Outcome::Up,   side: Side::Sell, size_usdc: size },
-        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'d') => Action::PlaceMarket { outcome: Outcome::Down, side: Side::Sell, size_usdc: size },
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'w') => Action::PlaceMarket {
+            outcome: Outcome::Up,
+            side: Side::Buy,
+            size_usdc: size,
+        },
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => Action::PlaceMarket {
+            outcome: Outcome::Down,
+            side: Side::Buy,
+            size_usdc: size,
+        },
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'a') => Action::PlaceMarket {
+            outcome: Outcome::Up,
+            side: Side::Sell,
+            size_usdc: size,
+        },
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'d') => Action::PlaceMarket {
+            outcome: Outcome::Down,
+            side: Side::Sell,
+            size_usdc: size,
+        },
 
         // Cancel all
         KeyCode::Char('c') => Action::CancelAll,
@@ -124,7 +161,9 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
             state.limit_price_input.clear();
             state.limit_size_input = state.size_input.clone();
             state.input_mode = InputMode::LimitModal {
-                outcome: Outcome::Up, side: Side::Buy, field: LimitField::Price,
+                outcome: Outcome::Up,
+                side: Side::Buy,
+                field: LimitField::Price,
             };
             Action::None
         }
@@ -155,7 +194,9 @@ fn handle_wizard_key(state: &mut AppState, k: KeyEvent) -> Action {
     if k.kind == KeyEventKind::Repeat {
         return Action::None;
     }
-    if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('q')) {
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('q'))
+    {
         return Action::Quit;
     }
     if matches!(k.code, KeyCode::Char('q')) {
@@ -214,7 +255,10 @@ fn handle_wizard_key(state: &mut AppState, k: KeyEvent) -> Action {
                         0 => Timeframe::M5,
                         _ => Timeframe::M15,
                     };
-                    let p = Arc::new(MarketProfile { asset, timeframe: tf });
+                    let p = Arc::new(MarketProfile {
+                        asset,
+                        timeframe: tf,
+                    });
                     return Action::StartTrading(p);
                 }
                 _ => {}
@@ -263,67 +307,95 @@ fn edit_size_mode(state: &mut AppState, k: KeyEvent) -> Action {
             state.input_mode = InputMode::Normal;
             return Action::Claim;
         }
-        KeyCode::Backspace => { state.size_input.pop(); }
+        KeyCode::Backspace => {
+            state.size_input.pop();
+        }
         KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
-            if state.size_input.len() < 10 { state.size_input.push(c); }
+            if state.size_input.len() < 10 {
+                state.size_input.push(c);
+            }
         }
         _ => {}
     }
     Action::None
 }
 
-fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, field: LimitField)
-    -> Action
-{
+fn limit_mode(
+    state: &mut AppState,
+    k: KeyEvent,
+    outcome: Outcome,
+    side: Side,
+    field: LimitField,
+) -> Action {
     match k.code {
         KeyCode::Char('x') | KeyCode::Char('X') => {
             state.input_mode = InputMode::Normal;
             Action::Claim
         }
-        KeyCode::Esc => { state.input_mode = InputMode::Normal; Action::None }
+        KeyCode::Esc => {
+            state.input_mode = InputMode::Normal;
+            Action::None
+        }
         // Same quick keys as normal mode: w/s buy UP/DOWN, a/d sell UP/DOWN
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'w') => {
             state.input_mode = InputMode::LimitModal {
-                outcome: Outcome::Up, side: Side::Buy, field,
+                outcome: Outcome::Up,
+                side: Side::Buy,
+                field,
             };
             Action::None
         }
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => {
             state.input_mode = InputMode::LimitModal {
-                outcome: Outcome::Down, side: Side::Buy, field,
+                outcome: Outcome::Down,
+                side: Side::Buy,
+                field,
             };
             Action::None
         }
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'a') => {
             state.input_mode = InputMode::LimitModal {
-                outcome: Outcome::Up, side: Side::Sell, field,
+                outcome: Outcome::Up,
+                side: Side::Sell,
+                field,
             };
             Action::None
         }
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'d') => {
             state.input_mode = InputMode::LimitModal {
-                outcome: Outcome::Down, side: Side::Sell, field,
+                outcome: Outcome::Down,
+                side: Side::Sell,
+                field,
             };
             Action::None
         }
         KeyCode::Tab => {
             state.input_mode = InputMode::LimitModal {
-                outcome, side,
-                field: match field { LimitField::Price => LimitField::Size, LimitField::Size => LimitField::Price },
+                outcome,
+                side,
+                field: match field {
+                    LimitField::Price => LimitField::Size,
+                    LimitField::Size => LimitField::Price,
+                },
             };
             Action::None
         }
         // Flip side/outcome with arrows so you don't have to close & reopen the modal
         KeyCode::Left | KeyCode::Right => {
             state.input_mode = InputMode::LimitModal {
-                outcome: outcome.opposite(), side, field,
+                outcome: outcome.opposite(),
+                side,
+                field,
             };
             Action::None
         }
         KeyCode::Up | KeyCode::Down => {
             state.input_mode = InputMode::LimitModal {
                 outcome,
-                side: match side { Side::Buy => Side::Sell, Side::Sell => Side::Buy },
+                side: match side {
+                    Side::Buy => Side::Sell,
+                    Side::Sell => Side::Buy,
+                },
                 field,
             };
             Action::None
@@ -333,7 +405,7 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
                 return Action::None;
             }
             let price = state.limit_price_input.parse::<f64>();
-            let size  = state.limit_size_input.parse::<f64>();
+            let size = state.limit_size_input.parse::<f64>();
             match (price, size) {
                 (Ok(p), Ok(sz)) if (0.01..=0.99).contains(&p) && sz > 0.0 => {
                     let shares = match side {
@@ -348,7 +420,12 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
                         return Action::None;
                     }
                     state.input_mode = InputMode::Normal;
-                    Action::PlaceLimit { outcome, side, price: p, size_usdc: sz }
+                    Action::PlaceLimit {
+                        outcome,
+                        side,
+                        price: p,
+                        size_usdc: sz,
+                    }
                 }
                 _ => {
                     state.status_line = "limit: need price ∈ (0.01, 0.99) and size > 0".into();
@@ -359,7 +436,7 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
         KeyCode::Backspace => {
             let buf = match field {
                 LimitField::Price => &mut state.limit_price_input,
-                LimitField::Size  => &mut state.limit_size_input,
+                LimitField::Size => &mut state.limit_size_input,
             };
             buf.pop();
             Action::None
@@ -367,9 +444,11 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
         KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
             let buf = match field {
                 LimitField::Price => &mut state.limit_price_input,
-                LimitField::Size  => &mut state.limit_size_input,
+                LimitField::Size => &mut state.limit_size_input,
             };
-            if buf.len() < 10 { buf.push(c); }
+            if buf.len() < 10 {
+                buf.push(c);
+            }
             Action::None
         }
         _ => Action::None,
@@ -403,7 +482,11 @@ mod tests {
         );
         assert!(matches!(
             handle_key(&mut state, ev),
-            Action::PlaceMarket { outcome: Outcome::Up, side: Side::Buy, .. }
+            Action::PlaceMarket {
+                outcome: Outcome::Up,
+                side: Side::Buy,
+                ..
+            }
         ));
     }
 
@@ -418,14 +501,19 @@ mod tests {
         );
         assert!(matches!(
             handle_key(&mut state, ev),
-            Action::PlaceMarket { outcome: Outcome::Up, side: Side::Sell, .. }
+            Action::PlaceMarket {
+                outcome: Outcome::Up,
+                side: Side::Sell,
+                ..
+            }
         ));
     }
 
     #[test]
     fn normal_mode_ignores_key_repeat() {
         let mut state = test_state();
-        let ev = KeyEvent::new_with_kind(KeyCode::Char('w'), KeyModifiers::NONE, KeyEventKind::Repeat);
+        let ev =
+            KeyEvent::new_with_kind(KeyCode::Char('w'), KeyModifiers::NONE, KeyEventKind::Repeat);
         assert!(matches!(handle_key(&mut state, ev), Action::None));
     }
 
