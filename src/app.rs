@@ -934,25 +934,26 @@ impl AppState {
                 live,
             )
         };
-        if bid > entry_px {
-            let sh = live.min(plan);
-            if sh > 1e-9 {
-                if !self.trailing_sell_queued_or_in_flight(&token_id) {
-                    self.pending_trailing_sells.push_back(TrailingExit {
-                        token_id,
-                        market,
-                        outcome,
-                        sell_shares: sh,
-                    });
-                }
-                self.status_line = format!(
-                    "trailing: {} tripped (bid {bid:.2} > entry {entry_px:.2}) — SELL {sh:.2} sh",
-                    outcome.as_str()
-                );
+        // Always queue on trip: the trail already decided to exit. A legacy `mid > entry` gate
+        // became wrong when the feed switched from mid to best bid — bid at the stop is often
+        // ≤ entry even for profitable round-trips (spread), which suppressed all SELLs.
+        let sh = live.min(plan);
+        if sh > 1e-9 {
+            if !self.trailing_sell_queued_or_in_flight(&token_id) {
+                self.pending_trailing_sells.push_back(TrailingExit {
+                    token_id,
+                    market,
+                    outcome,
+                    sell_shares: sh,
+                });
             }
+            self.status_line = format!(
+                "trailing: {} tripped (bid {bid:.2}, entry {entry_px:.2}) — SELL {sh:.2} sh",
+                outcome.as_str()
+            );
         } else {
             self.status_line = format!(
-                "trailing: {} tripped (bid {bid:.2} ≤ entry {entry_px:.2}) — no auto SELL",
+                "trailing: {} tripped (bid {bid:.2}, entry {entry_px:.2}) — no shares to SELL",
                 outcome.as_str()
             );
         }
