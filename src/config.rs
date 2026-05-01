@@ -70,10 +70,6 @@ pub struct Config {
     /// limit buys arm the same trail when the fill arrives on the user channel as a **maker** leg
     /// (`MARKET_BUY_TRAIL_BPS` + values from the last market roll).
     pub market_buy_trail_bps: u32,
-    /// Enables the Markov/context detection indicator and its in-memory collectors.
-    pub detection_enabled: bool,
-    /// When `detection_enabled`, run sampling + `decide_window_bid` on a Tokio task (see `main.rs`).
-    pub detection_spawn_worker: bool,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,
     /// Address paired with the relayer API key (same screen in Polymarket settings).
@@ -135,16 +131,6 @@ impl Config {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
 
-        let detection_enabled = std::env::var("DETECTION_ENABLED")
-            .ok()
-            .and_then(|s| parse_env_bool(&s))
-            .unwrap_or(true);
-
-        let detection_spawn_worker = std::env::var("DETECTION_SPAWN_WORKER")
-            .ok()
-            .and_then(|s| parse_env_bool(&s))
-            .unwrap_or(false);
-
         let relayer_api_key = std::env::var("POLYMARKET_RELAYER_API_KEY")
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -182,8 +168,6 @@ impl Config {
             market_sell_slippage_bps,
             market_buy_take_profit_bps,
             market_buy_trail_bps,
-            detection_enabled,
-            detection_spawn_worker,
             relayer_api_key,
             relayer_api_key_address,
             polygon_rpc_url,
@@ -191,6 +175,7 @@ impl Config {
     }
 }
 
+#[cfg(test)]
 fn parse_env_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),

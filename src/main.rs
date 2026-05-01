@@ -19,8 +19,6 @@ mod balances;
 mod bridge_deposit;
 mod config;
 mod data_api;
-mod detection;
-mod detection_runtime;
 mod events;
 mod feeds;
 mod fees;
@@ -1054,25 +1052,6 @@ async fn main() -> Result<()> {
     // Shared event channel — generous buffer so bursts from the book WS don't drop
     let (tx, mut rx) = mpsc::channel::<AppEvent>(2048);
 
-    // Optional detection worker: heavy window sampling + `decide_window_bid` off the feed path.
-    let detection_cmd_tx = if cfg.detection_enabled && cfg.detection_spawn_worker {
-        let (dtx, mut drx) = mpsc::channel::<crate::detection_runtime::DetectionCmd>(512);
-        let tx_det = tx.clone();
-        tokio::spawn(async move {
-            use crate::detection_runtime::DetectionRuntime;
-            let mut rt = DetectionRuntime::new();
-            while let Some(cmd) = drx.recv().await {
-                rt.apply(cmd);
-                let _ = tx_det.try_send(AppEvent::DetectionUpdate {
-                    signal: rt.last_signal(),
-                });
-            }
-        });
-        Some(dtx)
-    } else {
-        None
-    };
-
     let (rtds_sym_tx, rtds_sym_rx) = watch::channel(String::new());
 
     // Wizard: load Gamma /series (5m) metadata for the asset list.
@@ -1580,12 +1559,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
 
-    let mut state = AppState::new_with_detection(
-        cfg.default_size_usdc,
-        user_trade_sync.clone(),
-        cfg.detection_enabled,
-        detection_cmd_tx,
-    );
+    let mut state = AppState::new(cfg.default_size_usdc, user_trade_sync.clone());
     let mut discovery_spawned = false;
     let _ = user_bundle_tx.send(build_user_ws_bundle(&state));
     send_book_watch_if_changed(&state, &book_token_tx);

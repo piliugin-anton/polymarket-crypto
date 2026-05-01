@@ -15,9 +15,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
-
-use crate::detection::{BidDecision, BidSkipReason};
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
 use crate::fees::polymarket_crypto_taker_fee_usdc;
 use crate::gamma::ActiveMarket;
@@ -30,24 +27,6 @@ use crate::trading::{
 };
 use crate::trailing_stop::{Activation, Side as TrailSide, TickOutcome, TrailSpec, TrailingStop};
 use tracing::debug;
-
-pub use crate::detection_runtime::{
-    DetectionCmd, DetectionMarketSnap, DetectionRuntime, DetectionSignalView,
-};
-
-enum DetectionEngine {
-    Inline(DetectionRuntime),
-    Remote(mpsc::Sender<DetectionCmd>),
-}
-
-impl std::fmt::Debug for DetectionEngine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Inline(_) => f.write_str("Inline"),
-            Self::Remote(_) => f.write_str("Remote"),
-        }
-    }
-}
 
 /// Minimum outcome shares for a limit (GTD) order — enforced in the UI before submit.
 pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
@@ -217,10 +196,6 @@ pub enum AppEvent {
         token_id: String,
         success: bool,
         error: Option<String>,
-    },
-    /// Async detection worker finished recompute — merge without blocking the feed path.
-    DetectionUpdate {
-        signal: Option<DetectionSignalView>,
     },
 }
 
@@ -515,10 +490,6 @@ pub struct AppState {
 
     /// Pre-computed from CLOB mid + top-holder sums; updated on Book and TopHoldersSentiment events.
     pub cached_sentiment: SentimentDir,
-    pub detection_enabled: bool,
-    /// Book/context bid decision for the active rolling market (inline or async worker).
-    pub detection_signal: Option<DetectionSignalView>,
-    detection_engine: Option<DetectionEngine>,
     /// Updated once per second in the Tick handler; avoids `Utc::now()` in the draw path.
     pub cached_countdown_secs: Option<i64>,
     /// `”{asset}/USD”` label, set once on StartTrading.
@@ -548,29 +519,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    #[cfg(test)]
     pub fn new(
         default_size_usdc: f64,
         user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>,
     ) -> Self {
-        Self::new_with_detection(default_size_usdc, user_trade_sync, true, None)
-    }
-
-    pub fn new_with_detection(
-        default_size_usdc: f64,
-        user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>,
-        detection_enabled: bool,
-        detection_cmd_tx: Option<mpsc::Sender<DetectionCmd>>,
-    ) -> Self {
-        let detection_engine = if detection_enabled {
-            if let Some(tx) = detection_cmd_tx {
-                Some(DetectionEngine::Remote(tx))
-            } else {
-                Some(DetectionEngine::Inline(DetectionRuntime::new()))
-            }
-        } else {
-            None
-        };
         Self {
             ui_phase: UiPhase::WizardLoading,
             wizard_rows: Vec::new(),
@@ -604,9 +556,6 @@ impl AppState {
             top_holders_up_sum: None,
             top_holders_down_sum: None,
             cached_sentiment: SentimentDir::Unknown,
-            detection_enabled,
-            detection_signal: None,
-            detection_engine,
             cached_countdown_secs: None,
             cached_pair_label: "\u{2014}/USD".to_string(), // "—/USD"
             user_trade_sync,
@@ -1209,62 +1158,6 @@ impl AppState {
         };
     }
 
-    /// Call only when [`Self::detection_enabled`] — avoids building [`DetectionCmd`] (e.g. full book clone).
-    #[inline]
-    fn detection_dispatch(&mut self, cmd: DetectionCmd) {
-        match &mut self.detection_engine {
-            Some(DetectionEngine::Inline(rt)) => {
-                rt.apply(cmd);
-                self.detection_signal = rt.last_signal();
-            }
-            Some(DetectionEngine::Remote(tx)) => {
-                let _ = tx.try_send(cmd);
-            }
-            None => {}
-        }
-    }
-
-    pub fn detection_status_line(&self) -> String {
-        if !self.detection_enabled {
-            return String::new();
-        }
-        match &self.detection_signal {
-            Some(view) => format!("Detection: {}", detection_decision_label(view)),
-            None => "Detection: waiting for spot + UP/DOWN books".to_string(),
-        }
-    }
-
-    #[cfg(test)]
-    fn detection_inline_engine(&self) -> Option<&DetectionRuntime> {
-        match &self.detection_engine {
-            Some(DetectionEngine::Inline(rt)) => Some(rt),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn detection_current_window(
-        &self,
-    ) -> Option<&crate::detection_runtime::DetectionWindowSample> {
-        self.detection_inline_engine()
-            .and_then(|rt| rt.current_window())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn detection_completed_windows(
-        &self,
-    ) -> Option<&VecDeque<crate::detection_runtime::DetectionWindowSample>> {
-        self.detection_inline_engine()
-            .map(|rt| rt.completed_windows())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn detection_resolution_prior_total_observations(&self) -> u32 {
-        self.detection_inline_engine()
-            .map(|rt| rt.resolution_prior_total_observations())
-            .unwrap_or(0)
-    }
-
     // ── Mutations ───────────────────────────────────────────────────
     pub async fn apply(&mut self, ev: AppEvent) {
         match ev {
@@ -1294,25 +1187,16 @@ impl AppState {
                         }
                     }
                 }
-                if self.detection_enabled {
-                    self.detection_dispatch(DetectionCmd::SpotAndBeat {
-                        spot: p.price,
-                        price_to_beat: self.price_to_beat(),
-                    });
-                }
             }
             AppEvent::Book(mut b) => {
                 b.asset_id = canonical_clob_token_id(&b.asset_id).into_owned();
                 let id_for_trail = b.asset_id.clone();
                 let snap = Arc::new(b);
-                let mut detection_outcome = None;
                 if let Some(m) = &self.market {
                     if clob_asset_ids_match(snap.asset_id.as_str(), m.up_token_id.as_str()) {
                         self.book_up = Some(Arc::clone(&snap));
-                        detection_outcome = Some(Outcome::Up);
                     } else if clob_asset_ids_match(snap.asset_id.as_str(), m.down_token_id.as_str()) {
                         self.book_down = Some(Arc::clone(&snap));
-                        detection_outcome = Some(Outcome::Down);
                     }
                 }
                 // Use the cached sorted watch list — binary search, no HashSet allocation.
@@ -1335,26 +1219,12 @@ impl AppState {
                     self.apply_trailing_book_tick(id_for_trail.as_str(), bid);
                 }
                 self.recompute_sentiment();
-                if self.detection_enabled {
-                    if let Some(outcome) = detection_outcome {
-                        self.detection_dispatch(DetectionCmd::Book {
-                            is_up: matches!(outcome, Outcome::Up),
-                            book: (*snap).clone(),
-                        });
-                    }
-                }
             }
             AppEvent::MarketRoll {
                 market,
                 buy_trail_bps,
                 buy_trail_activation_bps,
             } => {
-                let m_snap = DetectionMarketSnap::from(&market);
-                let (asset_label, timeframe_label) = self
-                    .market_profile
-                    .as_ref()
-                    .map(|p| (p.asset.label.to_string(), p.timeframe.label().to_string()))
-                    .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
                 // Close any positions from the previous market — they'll resolve
                 // via Polymarket and show up as realized once winnings redeem.
                 // We keep realized_pnl but zero out live positions for the new market.
@@ -1379,15 +1249,7 @@ impl AppState {
                 self.top_holders_down_sum = None;
                 self.watched_books.clear();
                 self.cached_sentiment = SentimentDir::Unknown;
-                self.detection_signal = None;
                 self.cached_countdown_secs = None;
-                if self.detection_enabled {
-                    self.detection_dispatch(DetectionCmd::MarketRolled {
-                        market: m_snap,
-                        asset_label,
-                        timeframe_label,
-                    });
-                }
             }
             AppEvent::PriceToBeatRefresh {
                 slug,
@@ -1398,11 +1260,6 @@ impl AppState {
                         if let Some(ptb) = price_to_beat {
                             m.price_to_beat = Some(ptb);
                             self.latched_price_to_beat = None;
-                            if self.detection_enabled {
-                                self.detection_dispatch(DetectionCmd::SetPriceToBeat(
-                                    self.price_to_beat(),
-                                ));
-                            }
                         }
                     }
                 }
@@ -1754,13 +1611,9 @@ impl AppState {
                 self.status_line = "Waiting for market data…".into();
                 self.cached_pair_label = format!("{}/USD", p.asset.label);
                 self.cached_sentiment = SentimentDir::Unknown;
-                self.detection_signal = None;
                 self.cached_countdown_secs = None;
                 self.buy_trail_bps = 0;
                 self.buy_trail_activation_bps = 0;
-                if self.detection_enabled {
-                    self.detection_dispatch(DetectionCmd::Clear);
-                }
             }
             AppEvent::RunTakeProfitAfterMarketBuy { .. } => {
                 // Dispatched from `main::apply_app_event` (needs `TradingClient`); no UI state change here.
@@ -1844,11 +1697,6 @@ impl AppState {
                     self.trailing.remove(&k);
                 }
             }
-            AppEvent::DetectionUpdate { signal } => {
-                if self.detection_enabled {
-                    self.detection_signal = signal;
-                }
-            }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }
         self.cached_book_watch_tokens = collect_book_watch_token_ids(self);
@@ -1859,50 +1707,6 @@ fn side_str(s: Side) -> &'static str {
     match s {
         Side::Buy => "BUY",
         Side::Sell => "SELL",
-    }
-}
-
-fn detection_decision_label(view: &DetectionSignalView) -> String {
-    match &view.decision {
-        BidDecision::Bid {
-            bid_price,
-            fair_probability,
-            expected_value,
-            edge,
-            ..
-        } => format!(
-            "{} BID @ {:.2} fair {:.0}% edge {:+.1}% EV {:+.3}",
-            view.outcome.as_str(),
-            *bid_price,
-            *fair_probability * 100.0,
-            *edge * 100.0,
-            *expected_value
-        ),
-        BidDecision::Skip {
-            reason,
-            best_fair_probability,
-            ..
-        } => {
-            let reason = match reason {
-                BidSkipReason::BadInput => "bad input",
-                BidSkipReason::TooLate => "too late",
-                BidSkipReason::NoBook => "waiting for book",
-                BidSkipReason::SpreadTooWide => "spread too wide",
-                BidSkipReason::QueueTooThin => "queue too thin",
-                BidSkipReason::BookImbalance => "book imbalance",
-                BidSkipReason::NoPositiveEdge => "no edge",
-            };
-            if let Some(p) = best_fair_probability {
-                format!(
-                    "{} skip: {} (best fair {:.0}%)",
-                    view.outcome.as_str(),
-                    reason,
-                    *p * 100.0
-                )
-            } else {
-                format!("skip: {reason}")
-            }
-        }
     }
 }
 
@@ -2670,13 +2474,10 @@ pub fn resolve_trailing_sell(
 mod tests {
     use super::*;
 
-    use crate::detection::DetectionOutcome;
-    use crate::feeds::chainlink::PriceTick;
     use crate::feeds::clob_ws::{BookLevel, BookSnapshot};
     use crate::feeds::user_trade_sync::UserTradeSync;
     use crate::fees::polymarket_crypto_taker_fee_usdc;
     use crate::gamma::ActiveMarket;
-    use crate::market_profile::{MarketProfile, Timeframe, CRYPTO_ASSETS};
     use crate::trading::{ClobMakerOrder, ClobOpenOrder, ClobTrade};
     use chrono::Utc;
 
@@ -3762,157 +3563,6 @@ mod tests {
         .await;
 
         assert_eq!(s.status_line, "No active CLOB positions on this market");
-    }
-
-    #[tokio::test]
-    async fn detection_window_dataset_collects_completed_market() {
-        let mut s = test_state();
-        s.market_profile = Some(Arc::new(MarketProfile {
-            asset: CRYPTO_ASSETS[0].clone(),
-            timeframe: Timeframe::M5,
-        }));
-        let now = Utc::now();
-        let mut m1 = test_market("UP_DATA", "DOWN_DATA", "0xdata1");
-        m1.slug = "btc-updown-5m-old".into();
-        m1.price_to_beat = Some(100.0);
-        m1.opens_at = now - chrono::Duration::seconds(301);
-        m1.closes_at = now - chrono::Duration::seconds(1);
-        let mut m2 = test_market("UP_NEXT", "DOWN_NEXT", "0xdata2");
-        m2.slug = "btc-updown-5m-new".into();
-        m2.opens_at = now;
-        m2.closes_at = now + chrono::Duration::seconds(300);
-
-        s.apply(AppEvent::MarketRoll {
-            market: m1,
-            buy_trail_bps: 0,
-            buy_trail_activation_bps: 0,
-        })
-        .await;
-        s.apply(AppEvent::Price(PriceTick {
-            price: 101.0,
-            timestamp_ms: now.timestamp_millis() as u64,
-        }))
-        .await;
-        s.apply(AppEvent::Book(BookSnapshot {
-            asset_id: "UP_DATA".into(),
-            bids: vec![BookLevel {
-                price: 0.56,
-                size: 10.0,
-            }],
-            asks: vec![BookLevel {
-                price: 0.58,
-                size: 12.0,
-            }],
-        }))
-        .await;
-        s.apply(AppEvent::MarketRoll {
-            market: m2,
-            buy_trail_bps: 0,
-            buy_trail_activation_bps: 0,
-        })
-        .await;
-
-        let sample = s
-            .detection_completed_windows()
-            .expect("inline detection")
-            .back()
-            .expect("completed window");
-        assert_eq!(sample.asset_label, "BTC");
-        assert_eq!(sample.timeframe_label, "5m");
-        assert_eq!(sample.market_slug, "btc-updown-5m-old");
-        assert_eq!(sample.price_to_beat, Some(100.0));
-        assert_eq!(sample.close_spot, Some(101.0));
-        assert_eq!(sample.resolved, Some(DetectionOutcome::Up));
-        assert_eq!(sample.spot_series.len(), 1);
-        assert_eq!(sample.spot_series[0].price, 101.0);
-        assert_eq!(s.detection_resolution_prior_total_observations(), 1);
-        assert_eq!(sample.up_series.len(), 1);
-        assert_eq!(sample.up_series[0].bid, Some(0.56));
-        assert_eq!(sample.up_series[0].ask, Some(0.58));
-        assert!((sample.up_series[0].mid.unwrap() - 0.57).abs() < 1e-12);
-        assert!(sample.up_series[0].rel_secs >= 0);
-        assert!(sample.up_series[0].secs_to_close <= 0);
-    }
-
-    #[tokio::test]
-    async fn detection_status_uses_window_bid_decision() {
-        let mut s = test_state();
-        let now = Utc::now();
-        let mut m = test_market("UP_DECIDE", "DOWN_DECIDE", "0xdecide");
-        m.price_to_beat = Some(100.0);
-        m.opens_at = now - chrono::Duration::seconds(240);
-        m.closes_at = now + chrono::Duration::seconds(60);
-        s.apply(AppEvent::MarketRoll {
-            market: m,
-            buy_trail_bps: 0,
-            buy_trail_activation_bps: 0,
-        })
-        .await;
-        s.apply(AppEvent::Price(PriceTick {
-            price: 101.0,
-            timestamp_ms: now.timestamp_millis() as u64,
-        }))
-        .await;
-        s.apply(AppEvent::Book(BookSnapshot {
-            asset_id: "UP_DECIDE".into(),
-            bids: vec![BookLevel {
-                price: 0.56,
-                size: 100.0,
-            }],
-            asks: vec![BookLevel {
-                price: 0.60,
-                size: 80.0,
-            }],
-        }))
-        .await;
-        s.apply(AppEvent::Book(BookSnapshot {
-            asset_id: "DOWN_DECIDE".into(),
-            bids: vec![BookLevel {
-                price: 0.36,
-                size: 100.0,
-            }],
-            asks: vec![BookLevel {
-                price: 0.40,
-                size: 80.0,
-            }],
-        }))
-        .await;
-
-        let line = s.detection_status_line();
-        assert!(line.contains("UP BID @ 0.57"), "{line}");
-    }
-
-    #[tokio::test]
-    async fn detection_disabled_does_not_queue_jobs_or_collect_windows() {
-        let mut s = AppState::new_with_detection(5.0, Arc::new(UserTradeSync::new()), false, None);
-        let mut m = test_market("UP_OFF", "DOWN_OFF", "0xoff");
-        m.price_to_beat = Some(100.0);
-        s.apply(AppEvent::MarketRoll {
-            market: m,
-            buy_trail_bps: 0,
-            buy_trail_activation_bps: 0,
-        })
-        .await;
-        s.apply(AppEvent::Price(PriceTick {
-            price: 101.0,
-            timestamp_ms: Utc::now().timestamp_millis() as u64,
-        }))
-        .await;
-        s.apply(AppEvent::Book(BookSnapshot {
-            asset_id: "UP_OFF".into(),
-            bids: vec![BookLevel {
-                price: 0.51,
-                size: 10.0,
-            }],
-            asks: vec![BookLevel {
-                price: 0.53,
-                size: 10.0,
-            }],
-        }))
-        .await;
-
-        assert!(s.detection_current_window().is_none());
-        assert!(s.detection_status_line().is_empty());
     }
 
     /// REST replay shows a flat book — drop armed / pending trails so we never FAK-sell air.

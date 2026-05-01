@@ -6,7 +6,7 @@
 //! │   Order book        │   Positions                         │
 //! ├─ Open orders (8 lines, same as Fills) ────────────────────┤
 //! ├─ Fills (8 lines) ─────────────────────────────────────────┤
-//! ├─ Help / status (3 rows) ──────────────────────────────────┤
+//! ├─ Help / status (key row + border) ─────────────────────────┤
 //! └────────────────────────────────────────────────────────────┘
 
 use ratatui::{
@@ -24,7 +24,8 @@ use crate::market_profile::Timeframe;
 
 const SPACES: &str = "                                "; // 32 spaces — wider than any balance panel
 const HELP_KEYS_LINES: u16 = 1;
-const HELP_DETECTION_LINES: u16 = 1;
+/// Key row + rounded block border (top + bottom).
+const HELP_BLOCK_HEIGHT: u16 = HELP_KEYS_LINES + 2;
 
 pub fn draw(f: &mut Frame, s: &AppState) {
     let now = Instant::now();
@@ -44,7 +45,7 @@ pub fn draw(f: &mut Frame, s: &AppState) {
         Constraint::Min(8), // main — book + positions (less vertical space than before)
         Constraint::Length(8), // open orders
         Constraint::Length(8), // fills
-        Constraint::Length(help_block_height(s)), // help
+        Constraint::Length(HELP_BLOCK_HEIGHT), // help
     ])
     .split(area);
 
@@ -70,16 +71,6 @@ pub fn draw(f: &mut Frame, s: &AppState) {
             draw_order_error_toast(f, area, t.message.as_str());
         }
     }
-}
-
-fn help_block_height(s: &AppState) -> u16 {
-    let content = HELP_KEYS_LINES
-        + if s.detection_enabled {
-            HELP_DETECTION_LINES
-        } else {
-            0
-        };
-    content + 2 // rounded border consumes top/bottom rows
 }
 
 // ── Header (BTC left, Balance right) ────────────────────────────────
@@ -666,21 +657,10 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         key("q", "quit"),
     ]);
 
-    let mut lines = vec![keys];
-    if s.detection_enabled {
-        lines.push(Line::from(vec![
-            Span::styled("↳ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                truncate(&s.detection_status_line(), 120),
-                Style::default().fg(Color::Cyan),
-            ),
-        ]));
-    }
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
-    let p = Paragraph::new(lines).block(block);
+    let p = Paragraph::new(keys).block(block);
     f.render_widget(p, area);
 }
 
@@ -1246,23 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn help_block_height_tracks_detection_flag() {
-        let enabled = AppState::new_with_detection(
-            5.0,
-            std::sync::Arc::new(crate::feeds::user_trade_sync::UserTradeSync::new()),
-            true,
-            None,
-        );
-        let disabled = AppState::new_with_detection(
-            5.0,
-            std::sync::Arc::new(crate::feeds::user_trade_sync::UserTradeSync::new()),
-            false,
-            None,
-        );
-        assert_eq!(
-            help_block_height(&enabled),
-            HELP_KEYS_LINES + HELP_DETECTION_LINES + 2
-        );
-        assert_eq!(help_block_height(&disabled), HELP_KEYS_LINES + 2);
+    fn help_block_height_matches_layout() {
+        assert_eq!(HELP_BLOCK_HEIGHT, HELP_KEYS_LINES + 2);
     }
 }
