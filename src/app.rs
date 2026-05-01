@@ -1594,6 +1594,21 @@ fn hydrate_apply_position_fill(
     (pos.apply_fill(side, qty, price), price)
 }
 
+/// `GET /data/trades` sometimes copies top-level trade [`ClobTrade::side`] (taker) into
+/// `maker_orders[].side` for the user's leg. On one outcome token the resting maker and the
+/// aggressor must be on opposite sides — if they parse equal, trust inversion of the trade `side`
+/// ([L2 MakerOrder.side](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
+fn rest_maker_side_sanitize_taker_echo(taker_side: Side, resolved: Side) -> Side {
+    if resolved == taker_side {
+        match taker_side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        }
+    } else {
+        resolved
+    }
+}
+
 /// Side, shares, and price **for the authenticated user** on this `GET /data/trades` row.
 ///
 /// When you are **MAKER**, your fill is [`ClobMakerOrder::matched_amount`] on the leg for this
@@ -1626,6 +1641,7 @@ fn rest_trade_user_fill(t: &ClobTrade) -> Option<(Side, f64, f64)> {
                 Side::Buy => Side::Sell,
                 Side::Sell => Side::Buy,
             });
+        let side = rest_maker_side_sanitize_taker_echo(taker_side, side);
         let amt = leg.matched_amount.trim();
         let qty = amt.parse::<f64>().ok()?;
         if !qty.is_finite() || qty <= 0.0 {
@@ -2128,6 +2144,36 @@ mod tests {
             hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
         assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
         assert!(fills.iter().all(|f| f.side == Side::Buy && (f.qty - 10.0).abs() < 1e-6), "fills={:?}", fills);
+    }
+
+    /// Regression: REST can echo trade-level `side` onto the maker leg; restart Fills must stay BUY.
+    #[test]
+    fn hydrate_maker_when_leg_side_echoes_taker_uses_opposite() {
+        let up = "111";
+        let t = ClobTrade {
+            id: "1".into(),
+            asset_id: up.to_string(),
+            side: "SELL".into(),
+            size: "100".into(),
+            price: "0.55".into(),
+            match_time: "0".into(),
+            status: Some("MINED".into()),
+            taker_order_id: Some("0xt".into()),
+            maker_orders: vec![ClobMakerOrder {
+                order_id: "0xmine".into(),
+                matched_amount: "10".into(),
+                asset_id: Some(up.to_string()),
+                side: Some("SELL".into()),
+                price: Some("0.55".into()),
+            }],
+            trader_side: Some("MAKER".into()),
+            making_amount: None,
+            taking_amount: None,
+        };
+        let (_pu, _, fills) =
+            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].side, Side::Buy, "fills={:?}", fills);
     }
 
     #[test]

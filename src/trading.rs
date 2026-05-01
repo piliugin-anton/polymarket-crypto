@@ -560,6 +560,11 @@ pub struct UserChannelTradeFill {
 /// for your leg). When the open-order ledger no longer contains your `order_id` (fill already
 /// removed the row) but several maker legs remain, we pick the unique row whose `owner` matches.
 ///
+/// `order_side_by_norm_id`: snapshot of [`ClobOpenOrder::side`] keyed by [`norm_order_id_key`],
+/// taken **before** applying `order` events in the same WS batch as this `trade`. Prefer this over
+/// `maker_orders[].side` when present — user-channel examples omit leg `side`, and leg `side` can
+/// disagree with the order you placed ([user channel](https://docs.polymarket.com/market-data/websocket/user-channel)).
+///
 /// Accepts trade statuses **`MINED`** and **`CONFIRMED`** only ([`clob_trade_status_counts_as_fill`]).
 /// Same `id` dedupes later WS deliveries. Returns `None` for `MATCHED` / `FAILED` / `RETRYING` /
 /// unknown / missing status, missing `trader_side`, or **maker** with multiple legs and no disambiguation.
@@ -567,6 +572,7 @@ pub fn try_parse_user_channel_trade(
     v: &serde_json::Value,
     known_user_order_keys: &HashSet<String>,
     ws_owner_api_key: Option<&str>,
+    order_side_by_norm_id: &HashMap<String, Side>,
 ) -> Option<UserChannelTradeFill> {
     let et = v
         .get("event_type")
@@ -596,9 +602,8 @@ pub fn try_parse_user_channel_trade(
         return None;
     }
     // Top-level `side` is the **taker's** side on this trade (Polymarket user-channel + L2 `Trade`).
-    // For **maker** fills, prefer `maker_orders[].side` on the user's leg — it is the maker order's
-    // side ([L2 Trade.MakerOrder](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)); only
-    // fall back to inverting the taker side when `side` is missing on the leg (older payloads).
+    // For **maker** fills, [`order_side_by_norm_id`] (open-order snapshot) wins, then
+    // `maker_orders[].side`, then invert taker ([L2 MakerOrder.side](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
     let taker_side = parse_clob_side_str(v.get("side").and_then(|s| s.as_str())?)?;
     let top_price: f64 = v.get("price").and_then(|s| s.as_str())?.parse().ok()?;
     if !top_price.is_finite() || top_price <= 0.0 {
@@ -690,17 +695,20 @@ pub fn try_parse_user_channel_trade(
         }
         (tid, q, top_asset_id.clone(), top_price, None)
     };
-    let side = if is_maker {
-        leg_maker_side
-            .as_deref()
-            .and_then(parse_clob_side_str)
-            .unwrap_or_else(|| match taker_side {
-                Side::Buy => Side::Sell,
-                Side::Sell => Side::Buy,
-            })
-    } else {
-        taker_side
-    };
+    let nk_leg = norm_order_id_key(&order_leg_id);
+    let side = order_side_by_norm_id.get(&nk_leg).copied().unwrap_or_else(|| {
+        if is_maker {
+            leg_maker_side
+                .as_deref()
+                .and_then(parse_clob_side_str)
+                .unwrap_or_else(|| match taker_side {
+                    Side::Buy => Side::Sell,
+                    Side::Sell => Side::Buy,
+                })
+        } else {
+            taker_side
+        }
+    });
     if order_leg_id.is_empty() {
         return None;
     }
@@ -870,7 +878,11 @@ impl FillWaitRegistry {
 mod user_channel_trade_parse_tests {
     use super::{norm_order_id_key, try_parse_user_channel_trade, Side};
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    fn empty_ledger_sides() -> HashMap<String, Side> {
+        HashMap::new()
+    }
 
     fn trade_two_makers() -> serde_json::Value {
         json!({
@@ -895,7 +907,7 @@ mod user_channel_trade_parse_tests {
         let v = trade_two_makers();
         let mut ks = HashSet::new();
         ks.insert(norm_order_id_key("0xmine"));
-        let f = try_parse_user_channel_trade(&v, &ks, None).unwrap();
+        let f = try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).unwrap();
         assert_eq!(f.order_leg_id, "0xmine");
         assert!((f.qty - 2.5).abs() < 1e-9);
         assert_eq!(f.asset_id, "TOKEN_LEG");
@@ -907,7 +919,7 @@ mod user_channel_trade_parse_tests {
     fn maker_two_legs_without_ledger_match_is_ambiguous() {
         let v = trade_two_makers();
         let ks = HashSet::new();
-        assert!(try_parse_user_channel_trade(&v, &ks, None).is_none());
+        assert!(try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).is_none());
     }
 
     #[test]
@@ -925,7 +937,7 @@ mod user_channel_trade_parse_tests {
             ]
         });
         let ks = HashSet::new();
-        let f = try_parse_user_channel_trade(&v, &ks, None).unwrap();
+        let f = try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).unwrap();
         assert_eq!(f.order_leg_id, "0xsolo");
         assert!((f.qty - 3.0).abs() < 1e-9);
         assert_eq!(f.side, Side::Buy);
@@ -937,7 +949,7 @@ mod user_channel_trade_parse_tests {
         v.as_object_mut().unwrap().insert("status".into(), json!("MINED"));
         let mut ks = HashSet::new();
         ks.insert(norm_order_id_key("0xmine"));
-        let f = try_parse_user_channel_trade(&v, &ks, None).unwrap();
+        let f = try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).unwrap();
         assert_eq!(f.order_leg_id, "0xmine");
     }
 
@@ -947,7 +959,7 @@ mod user_channel_trade_parse_tests {
         v.as_object_mut().unwrap().insert("status".into(), json!("MATCHED"));
         let mut ks = HashSet::new();
         ks.insert(norm_order_id_key("0xmine"));
-        assert!(try_parse_user_channel_trade(&v, &ks, None).is_none());
+        assert!(try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).is_none());
     }
 
     #[test]
@@ -956,7 +968,7 @@ mod user_channel_trade_parse_tests {
         v.as_object_mut().unwrap().insert("status".into(), json!("FAILED"));
         let mut ks = HashSet::new();
         ks.insert(norm_order_id_key("0xmine"));
-        assert!(try_parse_user_channel_trade(&v, &ks, None).is_none());
+        assert!(try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).is_none());
     }
 
     #[test]
@@ -965,7 +977,7 @@ mod user_channel_trade_parse_tests {
         v.as_object_mut().unwrap().insert("status".into(), json!("RETRYING"));
         let mut ks = HashSet::new();
         ks.insert(norm_order_id_key("0xmine"));
-        assert!(try_parse_user_channel_trade(&v, &ks, None).is_none());
+        assert!(try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).is_none());
     }
 
     #[test]
@@ -987,7 +999,7 @@ mod user_channel_trade_parse_tests {
             ]
         });
         let ks = HashSet::new();
-        let f = try_parse_user_channel_trade(&v, &ks, Some(my_key)).unwrap();
+        let f = try_parse_user_channel_trade(&v, &ks, Some(my_key), &empty_ledger_sides()).unwrap();
         assert_eq!(f.order_leg_id, "0xb");
         assert!((f.qty - 7.0).abs() < 1e-9);
         assert_eq!(f.asset_id, "LEG_B");
@@ -1011,7 +1023,36 @@ mod user_channel_trade_parse_tests {
             ]
         });
         let ks = HashSet::new();
-        let f = try_parse_user_channel_trade(&v, &ks, None).unwrap();
+        let f = try_parse_user_channel_trade(&v, &ks, None, &empty_ledger_sides()).unwrap();
+        assert_eq!(f.side, Side::Buy);
+    }
+
+    /// Snapshot from [`ClobOpenOrder::side`] wins over a wrong `maker_orders[].side` on the same leg.
+    #[test]
+    fn maker_fill_prefers_ledger_side_over_mismatched_maker_leg() {
+        let v = json!({
+            "event_type": "trade",
+            "id": "t-ledger-buy",
+            "status": "CONFIRMED",
+            "asset_id": "TOK_UP",
+            "side": "BUY",
+            "price": "0.52",
+            "trader_side": "MAKER",
+            "taker_order_id": "0xtaker",
+            "maker_orders": [
+                {
+                    "order_id": "0xmybuy",
+                    "matched_amount": "10",
+                    "price": "0.52",
+                    "side": "SELL"
+                }
+            ]
+        });
+        let mut ks = HashSet::new();
+        ks.insert(norm_order_id_key("0xmybuy"));
+        let mut ledger_sides = HashMap::new();
+        ledger_sides.insert(norm_order_id_key("0xmybuy"), Side::Buy);
+        let f = try_parse_user_channel_trade(&v, &ks, None, &ledger_sides).unwrap();
         assert_eq!(f.side, Side::Buy);
     }
 }

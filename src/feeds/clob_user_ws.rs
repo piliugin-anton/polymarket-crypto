@@ -31,8 +31,9 @@ use crate::config::CLOB_WS_USER_URL;
 use crate::feeds::user_trade_sync::UserTradeSync;
 use crate::net;
 use crate::trading::{
-    canonical_clob_token_id, clob_asset_ids_match, parse_user_channel_values,
-    try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, TradingClient, norm_order_id_key,
+    canonical_clob_token_id, clob_asset_ids_match, parse_clob_side_str, parse_user_channel_values,
+    try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, Side, TradingClient,
+    norm_order_id_key,
 };
 
 type UserWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -134,6 +135,21 @@ impl UserOpenOrdersLedger {
     pub async fn normalized_order_keys(&self) -> HashSet<String> {
         let g = self.inner.lock().await;
         g.by_id.keys().cloned().collect()
+    }
+
+    /// `norm_order_id_key(order.id)` → side from the last known open-order row (WS + REST).
+    ///
+    /// Snapshot this **before** [`Self::apply_order_values`] in the same WS batch as a `trade`:
+    /// a full fill removes the order from the ledger, but we still need the placed side for fills
+    /// when `maker_orders[].side` is missing or disagrees with what you submitted (see
+    /// [Polymarket user-channel `trade`](https://docs.polymarket.com/market-data/websocket/user-channel)
+    /// — official examples omit `side` on maker legs).
+    pub async fn snapshot_order_side_by_norm_id(&self) -> HashMap<String, Side> {
+        let g = self.inner.lock().await;
+        g.by_id
+            .iter()
+            .filter_map(|(k, o)| parse_clob_side_str(&o.side).map(|s| (k.clone(), s)))
+            .collect()
     }
 
     /// Same source as [`Self::snapshot_clob_orders`], formatted for the Open Orders panel.
@@ -538,8 +554,10 @@ async fn run_session(
                     logged_first = true;
                 }
                 let values = parse_user_channel_values(&txt);
-                // Apply `order` events first so the ledger contains our resting ids before we match
-                // `trade` → `maker_orders` to the correct leg ([user channel](https://docs.polymarket.com/market-data/websocket/user-channel)).
+                // Side for fills: snapshot **before** `order` updates — a full fill removes the resting
+                // row, and `maker_orders[].side` is often absent or can disagree with the placed order
+                // ([user channel](https://docs.polymarket.com/market-data/websocket/user-channel)).
+                let order_sides_snapshot = open_ledger.snapshot_order_side_by_norm_id().await;
                 let orders_update = open_ledger.apply_order_values(&values).await;
                 let known_order_keys = open_ledger.normalized_order_keys().await;
                 registry.dispatch_trades_in_values(&values).await;
@@ -550,6 +568,7 @@ async fn run_session(
                             v,
                             &known_order_keys,
                             Some(creds.api_key.as_str()),
+                            &order_sides_snapshot,
                         ) {
                             let Some(outcome) = resolve_trade_outcome(&bundle, &f.asset_id) else {
                                 continue;
