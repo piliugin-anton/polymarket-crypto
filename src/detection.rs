@@ -23,13 +23,14 @@ impl DetectionOutcome {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
-pub struct DetectionContext {
-    pub outcome: DetectionOutcome,
-    pub spot_price: f64,
-    pub price_to_beat: f64,
-    pub elapsed_secs: i64,
-    pub window_secs: i64,
+struct DetectionContext {
+    outcome: DetectionOutcome,
+    spot_price: f64,
+    price_to_beat: f64,
+    elapsed_secs: i64,
+    window_secs: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -421,6 +422,7 @@ fn fair_probability_for_outcome(
     }
 }
 
+#[cfg(test)]
 fn contextual_resolution_probability(
     ctx: &DetectionContext,
     resolution_prior: Option<&ResolutionPrior>,
