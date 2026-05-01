@@ -1530,8 +1530,25 @@ fn trim_fills_to_cap(fills: &mut VecDeque<Fill>, cap: usize) {
     }
 }
 
-/// Which [`ClobMakerOrder`] row describes **this** REST trade row (`asset_id` + maker role).
-fn maker_leg_for_trade_row(t: &ClobTrade) -> Option<&ClobMakerOrder> {
+/// Effective outcome-token id for one [`ClobMakerOrder`] leg (falls back to trade-level [`ClobTrade::asset_id`]).
+fn eff_maker_leg_asset<'a>(t: &'a ClobTrade, mo: &'a ClobMakerOrder) -> &'a str {
+    mo.asset_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(t.asset_id.as_str())
+}
+
+/// Picks the authenticated user's maker leg when `GET /data/trades` includes **multiple**
+/// `maker_orders` (same aggregate match). The first leg matching only top-level `asset_id` can be
+/// another participant on the **other** outcome token; we narrow by the UI market's UP/DOWN ids
+/// and, when still ambiguous, prefer the **unique** leg whose token differs from top-level
+/// `asset_id` (observed when the row's `asset_id` is one outcome but the user's fill is on the sibling).
+fn maker_leg_for_trade_row<'a>(
+    t: &'a ClobTrade,
+    up_token_id: &str,
+    down_token_id: &str,
+) -> Option<&'a ClobMakerOrder> {
     let is_maker = matches!(
         t.trader_side
             .as_deref()
@@ -1542,16 +1559,58 @@ fn maker_leg_for_trade_row(t: &ClobTrade) -> Option<&ClobMakerOrder> {
     if !is_maker {
         return None;
     }
-    for mo in &t.maker_orders {
-        let aid = mo.asset_id.as_deref().filter(|s| !s.is_empty());
-        if aid.is_some_and(|a| clob_asset_ids_match(a, &t.asset_id)) {
+
+    let in_market = |aid: &str| {
+        clob_asset_ids_match(aid, up_token_id) || clob_asset_ids_match(aid, down_token_id)
+    };
+
+    let candidates: Vec<&ClobMakerOrder> = t
+        .maker_orders
+        .iter()
+        .filter(|mo| in_market(eff_maker_leg_asset(t, mo)))
+        .collect();
+
+    if candidates.is_empty() {
+        for mo in &t.maker_orders {
+            if clob_asset_ids_match(eff_maker_leg_asset(t, mo), t.asset_id.as_str()) {
+                return Some(mo);
+            }
+        }
+        if t.maker_orders.len() == 1 {
+            return t.maker_orders.first();
+        }
+        return None;
+    }
+
+    if candidates.len() == 1 {
+        return Some(candidates[0]);
+    }
+
+    let top = t.asset_id.as_str();
+    let off_top: Vec<&ClobMakerOrder> = candidates
+        .iter()
+        .copied()
+        .filter(|mo| !clob_asset_ids_match(eff_maker_leg_asset(t, mo), top))
+        .collect();
+    if off_top.len() == 1 {
+        return Some(off_top[0]);
+    }
+
+    let on_top: Vec<&ClobMakerOrder> = candidates
+        .iter()
+        .copied()
+        .filter(|mo| clob_asset_ids_match(eff_maker_leg_asset(t, mo), top))
+        .collect();
+    if on_top.len() == 1 {
+        return Some(on_top[0]);
+    }
+
+    for mo in candidates.iter().copied() {
+        if clob_asset_ids_match(eff_maker_leg_asset(t, mo), top) {
             return Some(mo);
         }
     }
-    if t.maker_orders.len() == 1 {
-        return t.maker_orders.first();
-    }
-    None
+    candidates.first().copied()
 }
 
 /// Taker (or role unknown) row, not the maker leg.
@@ -1615,7 +1674,12 @@ fn rest_maker_side_sanitize_taker_echo(taker_side: Side, resolved: Side) -> Side
 /// [`ClobTrade::asset_id`], not top-level `size`. When you are **TAKER**, prefer `takingAmount` /
 /// `makingAmount` (same as [`PostOrderResponse`]) for share count; `size` alone can disagree.
 /// ([L2 getTrades](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
-fn rest_trade_user_fill(t: &ClobTrade) -> Option<(Side, f64, f64)> {
+/// When `Some`, use that string (leg token) for [`Outcome`] mapping instead of top-level [`ClobTrade::asset_id`].
+fn rest_trade_user_fill(
+    t: &ClobTrade,
+    up_token_id: &str,
+    down_token_id: &str,
+) -> Option<(Side, f64, f64, Option<String>)> {
     let taker_side = parse_clob_side(&t.side)?;
     let Ok(price_top) = t.price.parse::<f64>() else {
         return None;
@@ -1629,11 +1693,11 @@ fn rest_trade_user_fill(t: &ClobTrade) -> Option<(Side, f64, f64)> {
 
     if !is_maker {
         let qty = taker_trade_fill_shares(t, taker_side)?;
-        return Some((taker_side, qty, price_top));
+        return Some((taker_side, qty, price_top, None));
     }
 
-    if let Some(leg) = maker_leg_for_trade_row(t) {
-        let side = leg
+    if let Some(leg) = maker_leg_for_trade_row(t, up_token_id, down_token_id) {
+        let side_from_leg = leg
             .side
             .as_deref()
             .and_then(parse_clob_side)
@@ -1641,7 +1705,12 @@ fn rest_trade_user_fill(t: &ClobTrade) -> Option<(Side, f64, f64)> {
                 Side::Buy => Side::Sell,
                 Side::Sell => Side::Buy,
             });
-        let side = rest_maker_side_sanitize_taker_echo(taker_side, side);
+        let eff_a = eff_maker_leg_asset(t, leg);
+        let side = if clob_asset_ids_match(eff_a, t.asset_id.as_str()) {
+            rest_maker_side_sanitize_taker_echo(taker_side, side_from_leg)
+        } else {
+            side_from_leg
+        };
         let amt = leg.matched_amount.trim();
         let qty = amt.parse::<f64>().ok()?;
         if !qty.is_finite() || qty <= 0.0 {
@@ -1651,7 +1720,8 @@ fn rest_trade_user_fill(t: &ClobTrade) -> Option<(Side, f64, f64)> {
             Some(p) if p.is_finite() && p > 0.0 => p,
             _ => price_top,
         };
-        return Some((side, qty, px));
+        let eff = eff_maker_leg_asset(t, leg).to_string();
+        return Some((side, qty, px, Some(eff)));
     }
 
     // Legacy / sparse payloads: no maker leg — fall back to inverted taker + top `size` (best effort).
@@ -1663,7 +1733,7 @@ fn rest_trade_user_fill(t: &ClobTrade) -> Option<(Side, f64, f64)> {
         Side::Buy => Side::Sell,
         Side::Sell => Side::Buy,
     };
-    Some((side, qty, price_top))
+    Some((side, qty, price_top, None))
 }
 
 fn parse_trade_timestamp(s: &str) -> DateTime<Utc> {
@@ -1876,6 +1946,29 @@ fn merge_chain_balance(
     Position { shares, avg_entry }
 }
 
+/// `true` if this trade row involves the active market's UP or DOWN token (top-level and/or maker legs).
+fn trade_touches_market_tokens(t: &ClobTrade, up_token_id: &str, down_token_id: &str) -> bool {
+    if clob_asset_ids_match(t.asset_id.as_str(), up_token_id)
+        || clob_asset_ids_match(t.asset_id.as_str(), down_token_id)
+    {
+        return true;
+    }
+    let is_maker = matches!(
+        t.trader_side
+            .as_deref()
+            .map(|s| s.trim().to_ascii_uppercase())
+            .as_deref(),
+        Some("MAKER") | Some("M")
+    );
+    if !is_maker {
+        return false;
+    }
+    t.maker_orders.iter().any(|mo| {
+        let a = eff_maker_leg_asset(t, mo);
+        clob_asset_ids_match(a, up_token_id) || clob_asset_ids_match(a, down_token_id)
+    })
+}
+
 /// Replay Polymarket `GET /data/trades` for the active market to recover VWAP entries and fills.
 #[allow(clippy::too_many_arguments)]
 pub fn hydrate_positions_from_trades(
@@ -1894,8 +1987,7 @@ pub fn hydrate_positions_from_trades(
         .filter(|t| {
             t.is_valid_fill()
                 && t.trader_side.is_some()
-                && (clob_asset_ids_match(&t.asset_id, up_token_id)
-                    || clob_asset_ids_match(&t.asset_id, down_token_id))
+                && trade_touches_market_tokens(t, up_token_id, down_token_id)
         })
         .map(|t| (parse_trade_timestamp(&t.match_time), t.id.as_str(), t))
         .collect();
@@ -1906,18 +1998,27 @@ pub fn hydrate_positions_from_trades(
     let mut fills_chrono: Vec<Fill> = Vec::new();
 
     for (_, _, t) in indexed {
-        let outcome = if clob_asset_ids_match(&t.asset_id, up_token_id) {
-            Outcome::Up
-        } else {
-            Outcome::Down
-        };
-        let Some((side, qty, price)) = rest_trade_user_fill(t) else {
+        let Some((side, qty, price, fill_asset)) = rest_trade_user_fill(t, up_token_id, down_token_id) else {
             debug!(id = %t.id, side = %t.side, "skip trade: bad side/qty/price for REST row");
             continue;
         };
         if !qty.is_finite() || qty <= 0.0 || !price.is_finite() {
             continue;
         }
+        let aid_fill = fill_asset
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(t.asset_id.as_str());
+        if !(clob_asset_ids_match(aid_fill, up_token_id) || clob_asset_ids_match(aid_fill, down_token_id)) {
+            debug!(id = %t.id, aid = %aid_fill, "skip trade: resolved fill asset not in active UP/DOWN pair");
+            continue;
+        }
+        let outcome = if clob_asset_ids_match(aid_fill, up_token_id) {
+            Outcome::Up
+        } else {
+            Outcome::Down
+        };
         let ts = parse_trade_timestamp(&t.match_time);
         let (realized, fill_price) = match outcome {
             Outcome::Up => hydrate_apply_position_fill(&mut up, t, side, qty, price),
@@ -2174,6 +2275,52 @@ mod tests {
             hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].side, Side::Buy, "fills={:?}", fills);
+    }
+
+    /// Regression (runtime logs): several `maker_orders` on one match; top `asset_id` is UP but the
+    /// user's maker leg is on DOWN — must not take the first UP leg.
+    #[test]
+    fn hydrate_maker_multi_leg_picks_user_leg_off_top_asset_when_unique() {
+        let up = "111";
+        let down = "222";
+        let t = ClobTrade {
+            id: "m1".into(),
+            asset_id: up.to_string(),
+            side: "BUY".into(),
+            size: "100".into(),
+            price: "0.55".into(),
+            match_time: "0".into(),
+            status: Some("MINED".into()),
+            taker_order_id: Some("0xtaker".into()),
+            maker_orders: vec![
+                ClobMakerOrder {
+                    order_id: "0xother_up".into(),
+                    matched_amount: "5".into(),
+                    asset_id: Some(up.to_string()),
+                    side: Some("SELL".into()),
+                    price: Some("0.55".into()),
+                },
+                ClobMakerOrder {
+                    order_id: "0xuser_dn".into(),
+                    matched_amount: "5".into(),
+                    asset_id: Some(down.to_string()),
+                    side: Some("BUY".into()),
+                    price: Some("0.45".into()),
+                },
+            ],
+            trader_side: Some("MAKER".into()),
+            making_amount: None,
+            taking_amount: None,
+        };
+        let (pu, pd, fills) =
+            hydrate_positions_from_trades(&[t], up, down, 0.0, 0.0, 0.0, 0.0, None, None);
+        assert_eq!(fills.len(), 1, "fills={:?}", fills);
+        let f = &fills[0];
+        assert_eq!(f.outcome, Outcome::Down, "fills={:?}", fills);
+        assert_eq!(f.side, Side::Buy);
+        assert!((f.qty - 5.0).abs() < 1e-9);
+        assert!((pd.shares - 5.0).abs() < 1e-9, "pd={:?}", pd);
+        assert!(pu.shares.abs() < 1e-9, "pu={:?}", pu);
     }
 
     #[test]
