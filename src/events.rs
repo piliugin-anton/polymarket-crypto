@@ -353,7 +353,7 @@ fn edit_price_mode(state: &mut AppState, k: KeyEvent) -> Action {
     match k.code {
         KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') | KeyCode::Esc => {
             if state.price_input.parse::<f64>().is_err() {
-                state.price_input = "0.50".to_string();
+                state.price_input = format!("{:.2}", state.default_price);
             }
             state.input_mode = InputMode::Normal;
         }
@@ -516,7 +516,7 @@ mod tests {
     use crate::feeds::user_trade_sync::UserTradeSync;
 
     fn test_state() -> AppState {
-        let mut s = AppState::new(5.0, Arc::new(UserTradeSync::new()));
+        let mut s = AppState::new(5.0, 0.50, Arc::new(UserTradeSync::new()));
         s.ui_phase = UiPhase::Trading;
         s
     }

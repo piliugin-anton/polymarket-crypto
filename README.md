@@ -113,6 +113,7 @@ The only required fields to start:
 | `POLYMARKET_SIG_TYPE` | `2` for Gnosis Safe (default), `0` for plain EOA |
 | `POLYGON_RPC_URL` | Polygon HTTPS endpoint for balance reads |
 | `DEFAULT_SIZE_USDC` | Default order size in USDC (e.g. `5.0`) |
+| `DEFAULT_PRICE` | Default limit price for `[`/`]` quick-limit keys and the `l` modal pre-fill (0.01–0.99, default `0.50`) |
 
 Optional but useful:
 
