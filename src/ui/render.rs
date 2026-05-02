@@ -667,8 +667,6 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         sep(),
         key("x", "redeem all"),
         sep(),
-        key("f", "SOL USDC dep"),
-        sep(),
         key("Esc", "timeframe"),
         sep(),
         key("q", "quit"),
