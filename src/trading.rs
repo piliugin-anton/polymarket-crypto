@@ -10,7 +10,7 @@
 //! every order-posting request is authed with L2 (HMAC-SHA256 over
 //! `timestamp + method + path + body` using the base64-decoded `secret`).
 
-use alloy_primitives::{hex, Address, B256, U256};
+use alloy_primitives::{b256, hex, Address, B256, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{eip712_domain, sol, Eip712Domain, SolStruct};
@@ -31,6 +31,11 @@ use crate::config::{
     Config, CLOB_HOST, CTF_EXCHANGE_V1, CTF_EXCHANGE_V2, NEG_RISK_CTF_EXCHANGE_V1,
     NEG_RISK_CTF_EXCHANGE_V2, POLYGON_CHAIN_ID,
 };
+
+/// Polymarket [order attribution](https://docs.polymarket.com/trading/orders/attribution) — `bytes32`
+/// builder code (`order.builder` in CLOB V2). Profile: [polymarket.com/settings?tab=builder](https://polymarket.com/settings?tab=builder).
+pub const BUILDER_CODE: B256 =
+    b256!("0x7f727cce14152689c5ff8ac08a434724dd6c568f5c5d368577c5bfc391d8bc39");
 
 // ── EIP-712 Order structs (CLOB V1 vs V2) ───────────────────────────
 // EIP-712 `encodeType` must use the literal name **`Order`** (Polymarket `primaryType: "Order"`).
@@ -2265,7 +2270,7 @@ impl TradingClient {
                         signatureType: self.config.sig_type as u8,
                         timestamp: ts_u256,
                         metadata: B256::ZERO,
-                        builder: B256::ZERO,
+                        builder: BUILDER_CODE,
                     };
                     let dom = domain_v2(verifying_addr);
                     let hash = order.eip712_signing_hash(&dom);
@@ -2323,7 +2328,7 @@ impl TradingClient {
                             signature: sig_hex,
                             timestamp: ts_ms.to_string(),
                             metadata: ZERO32.into(),
-                            builder: ZERO32.into(),
+                            builder: format!("{:#x}", BUILDER_CODE),
                         },
                         owner: &creds.api_key,
                         order_type: order_type.as_str(),
