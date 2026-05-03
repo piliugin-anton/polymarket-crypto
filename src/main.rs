@@ -1559,7 +1559,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
 
-    let mut state = AppState::new(cfg.default_size_usdc, user_trade_sync.clone());
+    let mut state = AppState::new(cfg.default_size_usdc, cfg.default_price, user_trade_sync.clone());
     let mut discovery_spawned = false;
     let _ = user_bundle_tx.send(build_user_ws_bundle(&state));
     send_book_watch_if_changed(&state, &book_token_tx);

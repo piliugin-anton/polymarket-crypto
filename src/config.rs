@@ -55,6 +55,8 @@ pub struct Config {
     pub sig_type: SignatureType,
     /// Default USDC ticket for **market BUY** (`DEFAULT_SIZE_USDC`). Market SELL uses full in-app position when known.
     pub default_size_usdc: f64,
+    /// Default limit price for `[`/`]` quick-limit keys and the `l` modal pre-fill (`DEFAULT_PRICE`, 0.01–0.99).
+    pub default_price: f64,
     /// Max fill slippage for market **buy** FAK orders (basis points; widens buy ceiling vs best ask).
     pub market_buy_slippage_bps: u32,
     /// Max fill slippage for market **sell** FAK orders (basis points; widens sell floor vs best bid).
@@ -105,6 +107,12 @@ impl Config {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(5.0);
+
+        let default_price = std::env::var("DEFAULT_PRICE")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|p| (0.01..=0.99).contains(p))
+            .unwrap_or(0.50);
 
         // Per-side slippage; `MARKET_SLIPPAGE_BPS` sets both when the specific var is unset (legacy).
         let legacy_slippage_bps = std::env::var("MARKET_SLIPPAGE_BPS")
@@ -164,6 +172,7 @@ impl Config {
             signer_address,
             sig_type,
             default_size_usdc,
+            default_price,
             market_buy_slippage_bps,
             market_sell_slippage_bps,
             market_buy_take_profit_bps,

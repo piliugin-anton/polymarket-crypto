@@ -345,6 +345,7 @@ pub struct Fill {
 pub enum InputMode {
     Normal,
     EditSize,
+    EditPrice,
     LimitModal {
         outcome: Outcome,
         side: Side,
@@ -472,7 +473,9 @@ pub struct AppState {
     latched_price_to_beat: Option<f64>,
 
     pub default_size_usdc: f64,
+    pub default_price: f64,
     pub size_input: String, // buffer while editing size
+    pub price_input: String, // buffer while editing default price
     pub limit_price_input: String,
     pub limit_size_input: String,
 
@@ -521,6 +524,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         default_size_usdc: f64,
+        default_price: f64,
         user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>,
     ) -> Self {
         Self {
@@ -547,7 +551,9 @@ impl AppState {
             collateral_claimable_usdc: None,
             latched_price_to_beat: None,
             default_size_usdc,
+            default_price,
             size_input: format!("{default_size_usdc:.2}"),
+            price_input: format!("{default_price:.2}"),
             limit_price_input: String::new(),
             limit_size_input: String::new(),
             input_mode: InputMode::Normal,
@@ -901,6 +907,14 @@ impl AppState {
 
     pub fn current_size(&self) -> f64 {
         self.size_input.parse().unwrap_or(self.default_size_usdc)
+    }
+
+    pub fn current_price(&self) -> f64 {
+        self.price_input
+            .parse::<f64>()
+            .ok()
+            .filter(|p| (0.01..=0.99).contains(p))
+            .unwrap_or(self.default_price)
     }
 
     /// Drop a trailing plan when the user (or the exchange) reduces position via a SELL fill.
@@ -2487,7 +2501,7 @@ mod tests {
     use chrono::Utc;
 
     fn test_state() -> AppState {
-        AppState::new(5.0, Arc::new(UserTradeSync::new()))
+        AppState::new(5.0, 0.50, Arc::new(UserTradeSync::new()))
     }
 
     fn test_market(up: &str, down: &str, cond: &str) -> ActiveMarket {

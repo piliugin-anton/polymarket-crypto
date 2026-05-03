@@ -113,6 +113,7 @@ The only required fields to start:
 | `POLYMARKET_SIG_TYPE` | `2` for Gnosis Safe (default), `0` for plain EOA |
 | `POLYGON_RPC_URL` | Polygon HTTPS endpoint for balance reads |
 | `DEFAULT_SIZE_USDC` | Default order size in USDC (e.g. `5.0`) |
+| `DEFAULT_PRICE` | Default limit price for `[`/`]` quick-limit keys and the `l` modal pre-fill (0.01–0.99, default `0.50`) |
 
 Optional but useful:
 
@@ -147,16 +148,28 @@ You'll then land on the trading screen. Press **`q`** or **Ctrl-C** to exit; **`
 |---|---|
 | `w` / `s` | Market **BUY** UP / DOWN (FAK at best ask) |
 | `a` / `d` | Market **SELL** UP / DOWN (FAK at best bid) |
-| `l` | Open limit-order modal |
+| `l` | Open limit-order modal (pre-fills default price) |
+| `[` | Quick limit **BUY UP** GTD — default size & price |
+| `]` | Quick limit **BUY DOWN** GTD — default size & price |
 | `c` | Cancel ALL open orders |
 | `x` / `X` | Redeem all resolved positions (requires relayer key) |
 | `e` | Edit default ticket size |
+| `p` | Edit default limit price |
 | `f` | Fetch Solana USDC deposit address + QR code |
 | `r` | Force-refresh active market |
 | `Esc` | Return to timeframe picker |
 | `q` / Ctrl-C | Quit |
 
 Holding a key down does **not** fire repeated orders — key repeat is ignored.
+
+### Default size and price
+
+The status bar shows two editable defaults used by quick-trade keys and as pre-filled values when opening the limit modal:
+
+- **`e`** — edit **size** (USDC budget, shown in yellow)
+- **`p`** — edit **price** (limit price 0.01–0.99, shown in cyan; default `0.50`)
+
+Type digits and `.`, then `Enter` or `Esc` to confirm. Invalid input reverts to the previous value.
 
 ### Limit-order modal (`l`)
 
