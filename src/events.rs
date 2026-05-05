@@ -34,6 +34,8 @@ pub enum Action {
     ForceMarketRoll,
     /// Hint for claiming resolved positions (Data API claimable positive). Redeem is on-chain / Portfolio, not CLOB HTTP.
     Claim,
+    /// Deposit wallet: relayer `WALLET` batch (pUSD + CTF approvals for V2 exchanges). `POLYMARKET_SIG_TYPE=3` + relayer API key.
+    DepositWalletApprovals,
     /// `POST` Polymarket Bridge `/deposit` for `POLYMARKET_FUNDER` → Solana address + QR.
     FetchSolanaDeposit,
     /// After wizard: `main` dispatches `AppEvent::StartTrading` and spawns RTDS + Gamma.
@@ -208,6 +210,9 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
 
         // CTF redeem via relayer (Safe) — see `spawn_claim` + `redeem`
         KeyCode::Char('x') | KeyCode::Char('X') => Action::Claim,
+
+        // Deposit wallet trading approvals — relayer `WALLET` batch (see `deposit_wallet_approvals`)
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'b') => Action::DepositWalletApprovals,
 
         // Polymarket Bridge — Solana USDC deposit address + QR
         KeyCode::Char('f') => {

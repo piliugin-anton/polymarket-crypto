@@ -26,13 +26,69 @@ pub struct RelayerTransactionRow {
     pub transaction_hash: Option<String>,
 }
 
-fn normalize_relayer_base(url: &str) -> String {
+pub(crate) fn normalize_relayer_base(url: &str) -> String {
     let u = url.trim();
     if u.ends_with('/') {
         u[..u.len() - 1].to_string()
     } else {
         u.to_string()
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct NonceResponse {
+    nonce: String,
+}
+
+/// `GET /nonce?address=…&type=WALLET` — current nonce for deposit-wallet `WALLET` batches.
+pub async fn relayer_wallet_nonce(
+    http: &Client,
+    relayer_base_url: &str,
+    owner: Address,
+) -> Result<String> {
+    let base = normalize_relayer_base(relayer_base_url);
+    let url = format!("{base}/nonce?address={owner:#x}&type=WALLET");
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .context("GET relayer /nonce (WALLET)")?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("relayer GET /nonce (WALLET): HTTP {} — {}", status, txt.trim());
+    }
+    let n: NonceResponse =
+        serde_json::from_str(&txt).with_context(|| format!("decode /nonce: {}", txt.trim()))?;
+    Ok(n.nonce)
+}
+
+/// `POST /submit` with arbitrary JSON body (relayer API key headers).
+pub async fn submit_relayer_json(
+    http: &Client,
+    relayer_base_url: &str,
+    relayer_api_key: &str,
+    relayer_api_key_address: Address,
+    body: &serde_json::Value,
+) -> Result<RelayerSubmitResponse> {
+    let url = format!("{}{SUBMIT_PATH}", normalize_relayer_base(relayer_base_url));
+    let resp = http
+        .post(&url)
+        .header("RELAYER_API_KEY", relayer_api_key)
+        .header(
+            "RELAYER_API_KEY_ADDRESS",
+            format!("{relayer_api_key_address:#x}"),
+        )
+        .json(body)
+        .send()
+        .await
+        .context("POST relayer /submit")?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("relayer POST /submit: HTTP {} — {}", status, txt.trim());
+    }
+    serde_json::from_str(&txt).with_context(|| format!("decode /submit JSON: {}", txt.trim()))
 }
 
 #[derive(serde::Serialize)]
@@ -60,25 +116,15 @@ pub async fn submit_wallet_create(
     relayer_api_key: &str,
     relayer_api_key_address: Address,
 ) -> Result<RelayerSubmitResponse> {
-    let body = wallet_create_body(owner, factory);
-    let url = format!("{}{SUBMIT_PATH}", normalize_relayer_base(relayer_base_url));
-    let resp = http
-        .post(&url)
-        .header("RELAYER_API_KEY", relayer_api_key)
-        .header(
-            "RELAYER_API_KEY_ADDRESS",
-            format!("{relayer_api_key_address:#x}"),
-        )
-        .json(&body)
-        .send()
-        .await
-        .context("POST relayer /submit")?;
-    let status = resp.status();
-    let txt = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("relayer POST /submit: HTTP {} — {}", status, txt.trim());
-    }
-    serde_json::from_str(&txt).with_context(|| format!("decode /submit JSON: {}", txt.trim()))
+    let body = serde_json::to_value(wallet_create_body(owner, factory)).context("encode WALLET-CREATE")?;
+    submit_relayer_json(
+        http,
+        relayer_base_url,
+        relayer_api_key,
+        relayer_api_key_address,
+        &body,
+    )
+    .await
 }
 
 pub async fn get_transaction_rows(

@@ -123,7 +123,7 @@ Optional but useful:
 | `MARKET_BUY_TRAIL_BPS` | Trailing stop width in bps from peak bid (`0` = off). Applies to **market and limit BUY** when set |
 | `MARKET_BUY_TAKE_PROFIT_BPS` | **Activation**: trail arms when `best_bid ≥ entry × (1 + bps/10_000)` (`0` ≈ arm as soon as bid reaches entry). Also used for auto take-profit **GTD sell after market BUY** when `TRAIL_BPS` is `0` |
 | `MARKET_BUY_SLIPPAGE_BPS` | Slippage cushion for market buys. Default `50` (0.5%) |
-| `POLYMARKET_RELAYER_API_KEY` | Redeem (`x` / `X`, Safe only) and optional **`deploy-wallet`** — same Relayer API key from Settings → API |
+| `POLYMARKET_RELAYER_API_KEY` | Redeem (`x` / `X`, Safe only), **`deploy-wallet`**, and deposit-wallet **approvals** (`b` in TUI when `SIG_TYPE=3`) — same Relayer API key from Settings → API |
 
 ### Deposit wallet (`POLYMARKET_SIG_TYPE=3`)
 
@@ -137,7 +137,7 @@ Polymarket’s **[deposit wallet](https://docs.polymarket.com/trading/deposit-wa
 
    Then set **`POLYMARKET_FUNDER`** to the printed deposit wallet address (the bot checks it matches the deterministic address in [`src/deposit_wallet.rs`](src/deposit_wallet.rs) for your `POLYMARKET_PK`).
 
-2. **Approvals** — use Polymarket’s `WALLET` batch flow (TypeScript examples) if you need on-chain token approvals; this binary only submits the initial `WALLET-CREATE`.
+2. **Approvals** — in the TUI, press **`b`** to submit a relayer **`WALLET`** batch: pUSD `approve` + CTF `setApprovalForAll` for CTF Exchange V2 and Neg-risk Exchange V2 (same relayer API key as `deploy-wallet` / redeem). Then call CLOB balance sync as in the [migration guide](https://docs.polymarket.com/trading/deposit-wallet-migration) (the app refreshes collateral + current market conditional allowances after a successful batch).
 3. Fund **pUSD** to the deposit wallet; EOA balance does not count as CLOB buying power for this mode.
 4. `x` / **CTF redeem** in this app still targets **Gnosis Safe** (`POLYMARKET_SIG_TYPE=2`) only; deposit-wallet redeem needs `WALLET` batches (not implemented here).
 

@@ -21,6 +21,7 @@ mod polymarket_relayer;
 mod config;
 mod deploy_wallet_cmd;
 mod deposit_wallet;
+mod deposit_wallet_approvals;
 mod poly1271;
 mod data_api;
 mod events;
@@ -1867,6 +1868,45 @@ fn forward_order_err(tx: &mpsc::Sender<AppEvent>, msg: String) {
 }
 
 /// Fetch redeemable positions and submit CTF redemption via Polymarket Relayer (Safe) when configured.
+fn spawn_deposit_wallet_approvals(
+    tx: mpsc::Sender<AppEvent>,
+    cfg: Config,
+    trading: Arc<TradingClient>,
+    market_token_ids: Option<(String, String)>,
+) {
+    tokio::spawn(async move {
+        info!("deposit-wallet approvals: task started (key b)");
+        let http = match crate::net::reqwest_client() {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = tx
+                    .send(AppEvent::OrderErrModal(format!("http client: {e:#}")))
+                    .await;
+                return;
+            }
+        };
+        match crate::deposit_wallet_approvals::submit_deposit_wallet_approvals(&cfg, &http).await {
+            Ok(summary) => {
+                let _ = tx.send(AppEvent::StatusInfo(summary)).await;
+                let _ = trading.refresh_collateral_balance_allowance_cache().await;
+                if let Some((up, down)) = market_token_ids {
+                    let _ = trading
+                        .refresh_conditional_balance_allowance_cache(&up)
+                        .await;
+                    let _ = trading
+                        .refresh_conditional_balance_allowance_cache(&down)
+                        .await;
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(AppEvent::OrderErrModal(format!("deposit-wallet approvals: {e:#}")))
+                    .await;
+            }
+        }
+    });
+}
+
 fn spawn_claim(tx: mpsc::Sender<AppEvent>, cfg: Config) {
     tokio::spawn(async move {
         info!("CTF redeem: task started (key x)");
@@ -1927,6 +1967,19 @@ fn dispatch_action(
         Action::ForceMarketRoll => { /* market watcher polls every 10s; r is a no-op for now */ }
         Action::Claim => {
             spawn_claim(tx.clone(), cfg.clone());
+        }
+        Action::DepositWalletApprovals => {
+            spawn_deposit_wallet_approvals(
+                tx.clone(),
+                cfg.clone(),
+                trading.clone(),
+                state.market.as_ref().map(|m| {
+                    (
+                        m.up_token_id.clone(),
+                        m.down_token_id.clone(),
+                    )
+                }),
+            );
         }
         Action::FetchSolanaDeposit => {
             let tx = tx.clone();
