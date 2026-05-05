@@ -28,7 +28,7 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex, RwLock};
 use tracing::debug;
 
 use crate::config::{
-    Config, CLOB_HOST, CTF_EXCHANGE_V1, CTF_EXCHANGE_V2, NEG_RISK_CTF_EXCHANGE_V1,
+    Config, SignatureType, CLOB_HOST, CTF_EXCHANGE_V1, CTF_EXCHANGE_V2, NEG_RISK_CTF_EXCHANGE_V1,
     NEG_RISK_CTF_EXCHANGE_V2, POLYGON_CHAIN_ID,
 };
 
@@ -2107,6 +2107,12 @@ impl TradingClient {
 
             let creds = self.ensure_creds().await?;
             let api_version = self.fetch_clob_order_version().await?;
+            if self.config.sig_type == SignatureType::Poly1271 && api_version != 2 {
+                bail!(
+                    "POLYMARKET_SIG_TYPE=3 (POLY_1271 / deposit wallet) requires CLOB order API version 2; \
+                     GET /version returned {api_version}"
+                );
+            }
             // EIP-712 V1 includes `feeRateBps`; V2 does not — skip `/fee-rate` on the hot path.
             let fee_bps = if api_version == 1 {
                 self.fetch_fee_rate_bps(&args.token_id).await?
@@ -2257,12 +2263,18 @@ impl TradingClient {
                 }
                 2 => {
                     // EIP-712 V2 — `exchangeOrderBuilderV2.ts` + `ctfExchangeV2TypedData.ts`
+                    // `POLY_1271` (type 3): `clob-client-v2` wrapped signature (not raw `Order` EIP-712).
                     let verifying_addr = Address::from_str(verifying_v2)?;
                     let ts_u256 = U256::from(ts_ms as u128);
+                    let signer_addr = if self.config.sig_type == SignatureType::Poly1271 {
+                        self.config.funder
+                    } else {
+                        self.signer.address()
+                    };
                     let order = clob_order_v2::Order {
                         salt: U256::from(salt),
                         maker: self.config.funder,
-                        signer: self.signer.address(),
+                        signer: signer_addr,
                         tokenId: token_id_u256,
                         makerAmount: maker_amount,
                         takerAmount: taker_amount,
@@ -2272,10 +2284,28 @@ impl TradingClient {
                         metadata: B256::ZERO,
                         builder: BUILDER_CODE,
                     };
-                    let dom = domain_v2(verifying_addr);
-                    let hash = order.eip712_signing_hash(&dom);
-                    let sig = self.signer.sign_hash(&hash).await?;
-                    let sig_hex = format!("0x{}", hex::encode(sig.as_bytes()));
+                    let sig_hex = if self.config.sig_type == SignatureType::Poly1271 {
+                        crate::poly1271::sign_poly1271_v2_order(
+                            &self.signer,
+                            verifying_addr,
+                            POLYGON_CHAIN_ID,
+                            self.config.funder,
+                            order.salt,
+                            order.tokenId,
+                            order.makerAmount,
+                            order.takerAmount,
+                            order.side,
+                            order.timestamp,
+                            order.metadata,
+                            order.builder,
+                        )
+                        .await?
+                    } else {
+                        let dom = domain_v2(verifying_addr);
+                        let hash = order.eip712_signing_hash(&dom);
+                        let sig = self.signer.sign_hash(&hash).await?;
+                        format!("0x{}", hex::encode(sig.as_bytes()))
+                    };
 
                     #[derive(Serialize)]
                     struct OrderPayloadV2<'a> {

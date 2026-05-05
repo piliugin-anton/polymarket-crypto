@@ -110,7 +110,7 @@ The only required fields to start:
 |---|---|
 | `POLYMARKET_PK` | Private key of the EOA that signs orders (starts with `0x`) |
 | `POLYMARKET_FUNDER` | Address that holds your USDC — your Gnosis Safe address for most users |
-| `POLYMARKET_SIG_TYPE` | `2` for Gnosis Safe (default), `0` for plain EOA |
+| `POLYMARKET_SIG_TYPE` | `2` Gnosis Safe (default), `0` plain EOA, `3` deposit wallet ([`POLY_1271`](https://docs.polymarket.com/trading/deposit-wallet-migration)) |
 | `POLYGON_RPC_URL` | Polygon HTTPS endpoint for balance reads |
 | `DEFAULT_SIZE_USDC` | Default order size in USDC (e.g. `5.0`) |
 | `DEFAULT_PRICE` | Default limit price for `[`/`]` quick-limit keys and the `l` modal pre-fill (0.01–0.99, default `0.50`) |
@@ -123,7 +123,23 @@ Optional but useful:
 | `MARKET_BUY_TRAIL_BPS` | Trailing stop width in bps from peak bid (`0` = off). Applies to **market and limit BUY** when set |
 | `MARKET_BUY_TAKE_PROFIT_BPS` | **Activation**: trail arms when `best_bid ≥ entry × (1 + bps/10_000)` (`0` ≈ arm as soon as bid reaches entry). Also used for auto take-profit **GTD sell after market BUY** when `TRAIL_BPS` is `0` |
 | `MARKET_BUY_SLIPPAGE_BPS` | Slippage cushion for market buys. Default `50` (0.5%) |
-| `POLYMARKET_RELAYER_API_KEY` | Required for `x` / `X` redeem via Polymarket relayer (Safe only) |
+| `POLYMARKET_RELAYER_API_KEY` | Redeem (`x` / `X`, Safe only) and optional **`deploy-wallet`** — same Relayer API key from Settings → API |
+
+### Deposit wallet (`POLYMARKET_SIG_TYPE=3`)
+
+Polymarket’s **[deposit wallet](https://docs.polymarket.com/trading/deposit-wallet-migration)** flow uses on-chain **`POLY_1271`** signatures and a deterministic proxy address derived from your EOA.
+
+1. Deploy `WALLET-CREATE` once: **`polymarket-crypto deploy-wallet`**. Needs **`POLYMARKET_RELAYER_API_KEY`** + **`POLYMARKET_RELAYER_API_KEY_ADDRESS`** (same as CTF redeem). **`RELAYER_URL`** defaults to production; set it for preprod.
+
+   ```sh
+   polymarket-crypto deploy-wallet
+   ```
+
+   Then set **`POLYMARKET_FUNDER`** to the printed deposit wallet address (the bot checks it matches the deterministic address in [`src/deposit_wallet.rs`](src/deposit_wallet.rs) for your `POLYMARKET_PK`).
+
+2. **Approvals** — use Polymarket’s `WALLET` batch flow (TypeScript examples) if you need on-chain token approvals; this binary only submits the initial `WALLET-CREATE`.
+3. Fund **pUSD** to the deposit wallet; EOA balance does not count as CLOB buying power for this mode.
+4. `x` / **CTF redeem** in this app still targets **Gnosis Safe** (`POLYMARKET_SIG_TYPE=2`) only; deposit-wallet redeem needs `WALLET` batches (not implemented here).
 
 See [`.env.example`](.env.example) for the full list and descriptions.
 

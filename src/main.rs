@@ -17,7 +17,11 @@
 mod app;
 mod balances;
 mod bridge_deposit;
+mod polymarket_relayer;
 mod config;
+mod deploy_wallet_cmd;
+mod deposit_wallet;
+mod poly1271;
 mod data_api;
 mod events;
 mod feeds;
@@ -1020,6 +1024,26 @@ async fn main() -> Result<()> {
     eprintln!("▸ polymarket-crypto — logging to {log_path}");
     eprintln!("▸ if credentials or data don't appear, run: polymarket-crypto debug-auth");
 
+    let args: Vec<String> = std::env::args().collect();
+    // `deploy-wallet` must run before `Config::from_env()` (no `POLYMARKET_FUNDER` yet).
+    match args.get(1).map(String::as_str) {
+        Some("deploy-wallet") => {
+            return deploy_wallet_cmd::run().await;
+        }
+        Some("help") | Some("-h") | Some("--help") => {
+            println!("Usage: polymarket-crypto [SUBCOMMAND]\n");
+            println!("Without a subcommand, launches the interactive TUI.\n");
+            println!("Subcommands:");
+            println!("  debug-auth     Run the CLOB L1 auth flow and dump all intermediate");
+            println!("                 values (useful for debugging 401/403 errors).");
+            println!("  deploy-wallet  Submit WALLET-CREATE; POLYMARKET_PK + POLYMARKET_RELAYER_API_KEY");
+            println!("                 + ADDRESS (same as redeem). RELAYER_URL optional (prod default).");
+            println!("  help           Show this help.");
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let cfg = Config::from_env().context("loading config")?;
     info!(
         signer = %cfg.signer_address,
@@ -1031,20 +1055,10 @@ async fn main() -> Result<()> {
     );
 
     // ── subcommand dispatch (no TUI) ─────────────────────────────────
-    let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("debug-auth") => {
             let t = TradingClient::new(cfg.clone())?;
             return t.debug_auth_flow().await;
-        }
-        Some("help") | Some("-h") | Some("--help") => {
-            println!("Usage: polymarket-crypto [SUBCOMMAND]\n");
-            println!("Without a subcommand, launches the interactive TUI.\n");
-            println!("Subcommands:");
-            println!("  debug-auth    Run the CLOB L1 auth flow and dump all intermediate");
-            println!("                values (useful for debugging 401/403 errors).");
-            println!("  help          Show this help.");
-            return Ok(());
         }
         _ => {}
     }

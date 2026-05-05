@@ -6,6 +6,8 @@ use alloy_primitives::Address;
 use anyhow::{bail, Context, Result};
 use std::str::FromStr;
 
+use crate::deposit_wallet::derive_deposit_wallet_address_polygon;
+
 // ── Polymarket endpoints ────────────────────────────────────────────
 pub const CLOB_HOST: &str = "https://clob.polymarket.com";
 pub const GAMMA_HOST: &str = "https://gamma-api.polymarket.com";
@@ -35,11 +37,14 @@ pub const NEG_RISK_CTF_EXCHANGE_V2: &str = "0xe2222d279d744050d28e00520010520000
 /// * 1 = `POLY_PROXY` — legacy magic/email-based proxy wallet.
 /// * 2 = `POLY_GNOSIS_SAFE` — the current default: your EOA owns a Gnosis Safe that
 ///   holds the USDC. `funder` = safe address, `signer` = EOA address.
+/// * 3 = `POLY_1271` — deposit wallet ([Polymarket migration](https://docs.polymarket.com/trading/deposit-wallet-migration)):
+///   `funder` = deterministic deposit wallet; orders use wrapped EIP-712 (`POLY_1271` signature type).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureType {
     Eoa = 0,
     PolyProxy = 1,
     PolyGnosisSafe = 2,
+    Poly1271 = 3,
 }
 
 /// Runtime configuration — resolved once at startup.
@@ -100,7 +105,8 @@ impl Config {
             "0" => SignatureType::Eoa,
             "1" => SignatureType::PolyProxy,
             "2" => SignatureType::PolyGnosisSafe,
-            other => bail!("POLYMARKET_SIG_TYPE must be 0, 1, or 2 (got {other})"),
+            "3" => SignatureType::Poly1271,
+            other => bail!("POLYMARKET_SIG_TYPE must be 0, 1, 2, or 3 (got {other})"),
         };
 
         let default_size_usdc = std::env::var("DEFAULT_SIZE_USDC")
@@ -158,6 +164,18 @@ impl Config {
             .parse()
             .context("Could not parse POLYMARKET_PK as a private key")?;
         let signer_address = signer.address();
+
+        if sig_type == SignatureType::Poly1271 {
+            let expected = derive_deposit_wallet_address_polygon(signer_address);
+            if funder != expected {
+                bail!(
+                    "POLYMARKET_SIG_TYPE=3 (deposit wallet / POLY_1271) requires POLYMARKET_FUNDER ({:#x}) \
+                     to equal the deterministic deposit wallet for this EOA ({:#x}).",
+                    funder,
+                    expected
+                );
+            }
+        }
 
         if signer_address != funder && sig_type == SignatureType::Eoa {
             bail!(
